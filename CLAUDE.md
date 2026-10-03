@@ -34,27 +34,50 @@ path is unreachable). Detection is a separate upstream epic.
 ## Commands
 
 ```bash
-bash -n bin/mcode-plugin.sh          # syntax check — the only lint here
-./tests/run.sh                       # test suite (once Issue C lands)
-herdr plugin link .                  # load this checkout into herdr
+./tests/run.sh                       # the suite — six cases, exits 0 only if all pass
+./tests/run.sh case-4                # one case
+./tests/run.sh --list                # case names
+bash -n bin/mcode-plugin.sh          # syntax check
+herdr plugin link .                  # load this checkout into herdr (mutates the registry)
 herdr plugin log list --plugin jaaacki.minimax-code
 herdr plugin action invoke jaaacki.minimax-code.minimax-code-start
 ```
 
-No test framework and no `bats` — plain bash, `HERDR_BIN_PATH` pointed at a `tests/fake-herdr`
-stub that logs argv. `shellcheck` is not installed. There is no CI yet.
+No test framework and no `bats` — plain bash. `HERDR_BIN_PATH` is pointed at `tests/fake-herdr`,
+a stub that logs every argv invocation and serves canned JSON, which is the only way to assert
+on the *sequence* of calls a multiplexer plugin makes. `shellcheck` is not installed.
+
+CI runs `jq --version`, `bash -n` and `./tests/run.sh` on `ubuntu-latest` and `macos-latest`.
+
+### How the tests reach the real response shape
+
+`tests/fixtures/*.json` are **captured** herdr 0.9.3 responses, with command, version and date
+recorded in `tests/fixtures/README.md`. The stub always serves the real `pane-split.json` — the
+new pane id is the one value that must never be faked — and the suite derives its expectation
+by querying that fixture with `jq`. For `pane get` / `pane current` a test knob wins over the
+fixture, and the bypass is announced on stderr. No knob is ever silently overridden.
 
 ## Gotchas
 
+- **The new pane id is at `.result.pane.pane_id`** — verified against a captured response, not
+  guessed. Two traps sit next to it: `result.type` is **`pane_info`**, not `pane_split` (the
+  split response is shaped like `pane get`, so never branch on `result.type`), and
+  `.result.pane_id` yields **`null`**. Either trap produces a launch that fails silently.
 - **`herdr plugin link .` mutates the owner's herdr registry.** It is the only way to get herdr
-  to accept the manifest — `herdr plugin` has **no** `validate` subcommand. Confirm before
-  running it; `plugin link` also does **not** run `[[build]]`.
+  to accept the manifest — `herdr plugin` has **no** `validate` subcommand. `plugin link` also
+  does **not** run `[[build]]`.
 - **Env var is `HERDR_PLUGIN_ROOT`, not `HERDR_PLUGIN_DIR`.** `HERDR_PLUGIN_DIR` does not exist.
-  This bug was already shipped once in the scaffold and fixed; do not reintroduce it.
+  This bug shipped once in the scaffold and was fixed; do not reintroduce it. It is mentioned
+  by name in `PLAN.md`, `HANDOFF.md` and this file on purpose — that is the historical record.
 - **`set -euo pipefail` swallows diagnostics on failure.** `out=$("$HERDR" pane split ...)`
   aborts before any stderr message prints. Use `if ! out=$(...); then` so custom errors run.
-- **Never type a command into an unidentified pane.** If the new pane id can't be extracted
-  from the `pane split` response, exit non-zero *before* calling `pane run`.
+- **Never type a command into an unidentified pane.** If the new pane id cannot be extracted,
+  exit non-zero *before* calling `pane run`. An earlier "tolerant" extractor that tried several
+  candidate paths was rejected in review: a wide net is not a safe net, because a decoy field
+  matches *something* and the guard's job gets handed to a guess.
+- `pane run` passes text plus Enter, so the launch target does not need a TTY handshake. The
+  split uses `--no-focus` deliberately: the action is registered for the `pane` context, so
+  stealing focus would send the user's in-flight keystrokes to the brand-new pane.
 - Only the 22 events in `PLUGIN_HOOK_EVENT_KINDS` are hookable (`HANDOFF.md` §5). Unknown
   names are non-fatal but warn in `herdr plugin list --json`. The docs site's event list is
   not authoritative — the herdr source is.
@@ -69,5 +92,9 @@ decisions there are locked and must not be relitigated in an issue or PR.
 
 ## Git flow
 
-Follow the repo's issue → worktree → PR → `dev` → `main` flow (see global CLAUDE.md). No
-issue exists yet for the work in `PLAN.md` — the issues are still to be created per `PLAN.md` §7.
+Follow the repo's issue → worktree → PR → `dev` → `main` flow (see global CLAUDE.md). Epic #1
+tracks the v0.2.0 work; `dev` is the integration branch and `main` is released from it. PRs must
+be green on both CI legs before merge.
+
+Worktrees are created **only** via `flock worktree add --repo <path> --issue <n>` — never by hand,
+because cleanup trusts the recorded ownership.
