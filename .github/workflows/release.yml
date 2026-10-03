@@ -1,0 +1,181 @@
+name: Release
+
+# Triggered by pushing a v* tag. This workflow does NOT create tags or cut
+# releases on its own — tagging is the architect's call at the release gate.
+#
+# The plugin is `herdr-plugin.toml` plus a bash entrypoint. There is no build
+# step and no compiled binary. The tarball below is a *pinned convenience*, not
+# the install path: `herdr plugin install jaaacki/herdr-plugin-minimax-code`
+# clones from the GitHub shorthand and remains the supported way to install.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Narrower than the CI workflow's contents: read. This job creates a release and
+# uploads an asset, so it needs write, and nothing else.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish the pinned tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout the tagged revision
+        uses: actions/checkout@v7
+        with:
+          # Fetch the tag itself so `git archive` can archive the exact commit
+          # that was tagged, not whatever the default branch points at now.
+          fetch-depth: 0
+
+      - name: Build the tarball with git archive
+        id: build
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # ALLOWLIST, not a denylist. `git archive HEAD` with no path list ships
+          # PLAN.md and HANDOFF.md, which are architect-only working notes and
+          # must never reach a distributed artifact. Listing the paths we want
+          # means a future internal note cannot leak by accident.
+          #
+          # The exec bit on bin/mcode-plugin.sh is carried through from git's
+          # tree mode (100755); the verification step below proves it survived.
+          git archive \
+            --format=tar.gz \
+            --output="herdr-plugin-minimax-code-${VERSION}.tar.gz" \
+            "${VERSION}" \
+            herdr-plugin.toml \
+            bin/mcode-plugin.sh \
+            README.md \
+            LICENSE \
+            CLAUDE.md \
+            tests/
+
+          sha256sum "herdr-plugin-minimax-code-${VERSION}.tar.gz" > sha256.txt
+          cut -d' ' -f1 sha256.txt > sha256.parsed
+          echo "sha256=$(cat sha256.parsed)" >> "$GITHUB_OUTPUT"
+          cat sha256.txt
+
+      - name: Verify the artifact before publishing it
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf "herdr-plugin-minimax-code-${VERSION}.tar.gz" -C "$work"
+
+          # 1. Required contents.
+          for f in herdr-plugin.toml bin/mcode-plugin.sh README.md LICENSE CLAUDE.md \
+                   tests/run.sh tests/fake-herdr; do
+            if [ ! -f "$work/$f" ]; then
+              echo "MISSING from artifact: $f" >&2
+              exit 1
+            fi
+          done
+
+          # 2. Architect-only notes must not ship.
+          for f in PLAN.md HANDOFF.md; do
+            if [ -e "$work/$f" ]; then
+              echo "LEAK: $f must not be in the distributed artifact" >&2
+              exit 1
+            fi
+          done
+
+          # 3. The exec bit must survive the archive. A tarball that loses it
+          #    installs a plugin that fails at invocation with a permission
+          #    error, which is exactly the bug class this repo already shipped
+          #    once (see HANDOFF).
+          for f in bin/mcode-plugin.sh tests/run.sh; do
+            if [ ! -x "$work/$f" ]; then
+              echo "EXEC BIT LOST on $f" >&2
+              ls -l "$work/$f" >&2
+              exit 1
+            fi
+          done
+
+          # 4. The entrypoint must parse from the extracted copy.
+          bash -n "$work/bin/mcode-plugin.sh"
+
+          # 5. And the bundled suite must pass from the extracted copy.
+          "$work/tests/run.sh"
+
+          echo "--- artifact contents ---"
+          tar -tvzf "herdr-plugin-minimax-code-${VERSION}.tar.gz"
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sha="$(cut -d' ' -f1 sha256.txt)"
+
+          cat > release-notes.md <<EOF
+          ## What this is
+
+          A **pinned** copy of the plugin at tag \`${VERSION}\`. It is a convenience for
+          anyone who does not want to track \`main\`: the tarball is a fixed, auditable
+          artifact whose contents you can read with \`tar -tzf\` before running anything.
+
+          It is **not** the install path. The supported install is still:
+
+          \`\`\`sh
+          herdr plugin install jaaacki/herdr-plugin-minimax-code
+          \`\`\`
+
+          That clones from the GitHub shorthand and picks up the latest \`main\`. Use the
+          tarball when you want a fixed revision instead.
+
+          There is no build step and no compiled binary. The plugin is
+          \`herdr-plugin.toml\` plus a bash entrypoint (\`bin/mcode-plugin.sh\`), and the
+          tarball is built with \`git archive\`, so its contents are exactly what is
+          committed at this tag — no working-tree drift, no \`.gitignore\`d files.
+
+          ## Verify what you downloaded
+
+          \`\`\`
+          sha256sum herdr-plugin-minimax-code-${VERSION}.tar.gz
+          ${sha}
+          \`\`\`
+
+          ## Install from the tarball
+
+          \`\`\`sh
+          tar -xzf herdr-plugin-minimax-code-${VERSION}.tar.gz
+          herdr plugin link ./  # from the extracted directory
+          \`\`\`
+
+          Then invoke the action from the Herdr action menu, or:
+
+          \`\`\`sh
+          herdr plugin action invoke jaaacki.minimax-code.minimax-code-start
+          \`\`\`
+
+          ## Testing
+
+          The tarball ships the test suite. From the extracted directory:
+
+          \`\`\`sh
+          ./tests/run.sh
+          \`\`\`
+
+          It points \`HERDR_BIN_PATH\` at \`tests/fake-herdr\`, so it needs no running
+          Herdr. It covers the launcher's argv construction and its failure branches.
+          It does **not** exercise Herdr's own action-spawn path, which is only
+          reachable through a live \`herdr plugin action invoke\`.
+          EOF
+
+          gh release create "${VERSION}" \
+            --title "MiniMax Code herdr plugin ${VERSION}" \
+            --notes-file release-notes.md \
+            --generate-notes \
+            "herdr-plugin-minimax-code-${VERSION}.tar.gz" \
+            "sha256.txt"
