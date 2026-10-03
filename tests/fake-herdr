@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# tests/fake-herdr — a stub herdr binary for tests/run.sh.
+#
+# The entrypoint resolves herdr through ${HERDR_BIN_PATH:-herdr}, so pointing that
+# variable at this file is the whole mechanism: no real multiplexer, no sockets,
+# no state. Every call the entrypoint makes is recorded, which is the only way to
+# assert on the *command sequence* a terminal-multiplexer plugin performs.
+#
+# What it does, per invocation:
+#   1. appends one line to $FAKE_HERDR_LOG (TAB-separated argv fields, in order)
+#   2. prints a canned JSON response on stdout, chosen by subcommand
+#   3. exits 0, unless failure injection (below) matches this invocation
+#
+# Response resolution, in order:
+#   a. $FAKE_HERDR_FIXTURES/<name>.json  if that file exists
+#   b. an inline placeholder             (C1 only — see the note below)
+#
+# ---- PLACEHOLDER PROVENANCE — READ THIS -------------------------------------
+# The inline `pane split` response below is INVENTED, not captured. The real
+# response shape is an explicitly unverified fact: PLAN.md §3 refuses to guess
+# the jq path to the new pane id, and issue E captures the real bytes.
+#
+# It is shaped like the two responses that *are* verified (PLAN.md §3, live
+# calls against herdr 0.9.3): `pane get` and `pane current` both return
+# {"result":{"pane":{...}}}. The split placeholder follows that same envelope.
+#
+# This is acceptable in C1 (issue #4) and ONLY in C1. Issue C2 must replace it
+# with the captured response. If you are reading this while C2 is open, that
+# replacement has not happened yet and the suite is still testing a fiction for
+# the split shape — cases 3, 4 and 5, which depend on that shape, are the ones
+# that must wait for it.
+# ---------------------------------------------------------------------------
+#
+# Test-only knobs:
+#   FAKE_HERDR_LOG        file to append the invocation log to (required)
+#   FAKE_HERDR_FIXTURES   fixture directory (default: <repo>/tests/fixtures)
+#   FAKE_HERDR_FAIL       "<subcommand>[:<exit-code>]", e.g. "pane split:1".
+#                         Matched against the first two argv fields, so
+#                         "pane split" fails only the split call. Comma-separated
+#                         for several. Used by issue C2's failure cases; unused in C1.
+#   FAKE_HERDR_CWD        cwd reported by `pane get` (default: see below)
+#   FAKE_HERDR_NEW_PANE   pane id reported by `pane split` (default: see below)
+#   FAKE_HERDR_SRC_PANE   pane id reported by `pane current` (default: see below)
+#
+# The three *_PANE/CWD knobs exist so tests/run.sh can state its expectations and
+# the stub's answer from one value each, instead of two literals that can drift.
+
+set -euo pipefail
+
+# --- invocation log ----------------------------------------------------------
+# One line per invocation, argv fields joined by TAB. TAB rather than a space so
+# an argument containing a space (a --cwd path) stays unambiguously parseable.
+# Refusing to log is a bug in the test, not something to paper over.
+#
+# `--self-check` is introspection: it prints the responses it would serve and
+# touches no log, so it is exempt from the FAKE_HERDR_LOG requirement below.
+if [ "${1:-}" != "--self-check" ]; then
+  if [ -z "${FAKE_HERDR_LOG:-}" ]; then
+    printf 'fake-herdr: FAKE_HERDR_LOG is not set\n' >&2
+    exit 64
+  fi
+  {
+    sep=''
+    for arg in "$@"; do
+      printf '%s%s' "$sep" "$arg"
+      sep=$'\t'
+    done
+    printf '\n'
+  } >>"$FAKE_HERDR_LOG"
+fi
+
+# --- failure injection -------------------------------------------------------
+sub="${1:-} ${2:-}"
+sub="${sub% }"
+if [ -n "${FAKE_HERDR_FAIL:-}" ]; then
+  IFS=',' read -r -a wanted <<<"$FAKE_HERDR_FAIL"
+  for w in "${wanted[@]}"; do
+    [ -z "$w" ] && continue
+    case "$w" in
+      *:*) want_sub="${w%:*}"; want_code="${w##*:}" ;;
+      *)   want_sub="$w"; want_code=1 ;;
+    esac
+    if [ "$sub" = "$want_sub" ]; then
+      printf 'fake-herdr: injected failure for "%s" (exit %s)\n' "$sub" "$want_code" >&2
+      exit "$want_code"
+    fi
+  done
+fi
+
+# --- response resolution -----------------------------------------------------
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fixtures="${FAKE_HERDR_FIXTURES:-$here/fixtures}"
+
+src_pane="${FAKE_HERDR_SRC_PANE:-wZ:p1}"
+new_pane="${FAKE_HERDR_NEW_PANE:-wZ:p2}"
+src_cwd="${FAKE_HERDR_CWD:-$here/..}"
+
+emit() { # emit <fixture-name> <inline-json>
+  local name="$1"
+  local inline="$2"
+  local file="$fixtures/$1.json"
+  if [ -f "$file" ]; then
+    cat -- "$file"
+  else
+    printf '%s\n' "$inline"
+  fi
+}
+
+# The payload for one pane, in the envelope PLAN.md §3 records for `pane get`:
+#   {"result":{"pane":{"pane_id":...,"cwd":...,"tab_id":...,"workspace_id":...}}}
+# The `pane` key is load-bearing: the entrypoint reads `.result.pane.pane_id` and
+# `.result.pane.cwd`, so an envelope that omits it makes the suite assert against
+# a response shape that does not exist. --self-check below enforces that.
+pane_payload() { # pane_payload <pane_id> <cwd>
+  printf '"pane":{"pane_id":"%s","cwd":"%s","tab_id":"wZ:t1","workspace_id":"wZ"}' "$1" "$2"
+}
+
+if [ "${1:-}" = "--self-check" ]; then
+  printf 'pane-get\t%s\n'      "$(emit pane-get     "$(printf '{"result":{%s}}' "$(pane_payload "$src_pane" "$src_cwd")")")"
+  printf 'pane-current\t%s\n'  "$(emit pane-current "$(printf '{"result":{"type":"pane_current",%s}}' "$(pane_payload "$src_pane" "$src_cwd")")")"
+  printf 'pane-split\t%s\n'    "$(emit pane-split   "$(printf '{"result":{%s}}' "$(pane_payload "$new_pane" "$src_cwd")")")"
+  printf 'pane-run\t%s\n'      "$(emit pane-run     '{"result":{"ok":true}}')"
+  exit 0
+fi
+
+case "$sub" in
+  "pane get")
+    # PLAN.md §3: verified live against herdr 0.9.3 on 2026-10-04.
+    emit pane-get "$(printf '{"result":{%s}}' "$(pane_payload "$src_pane" "$src_cwd")")"
+    ;;
+  "pane current")
+    # PLAN.md §3: same envelope, type "pane_current".
+    emit pane-current "$(printf '{"result":{"type":"pane_current",%s}}' "$(pane_payload "$src_pane" "$src_cwd")")"
+    ;;
+  "pane split")
+    # INVENTED placeholder. See the provenance note at the top of this file.
+    emit pane-split "$(printf '{"result":{%s}}' "$(pane_payload "$new_pane" "$src_cwd")")"
+    ;;
+  "pane run")
+    emit pane-run '{"result":{"ok":true}}'
+    ;;
+  *)
+    printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-<none>} ${2:-}" >&2
+    exit 64
+    ;;
+esac
