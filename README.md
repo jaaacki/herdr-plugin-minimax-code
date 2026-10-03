@@ -93,10 +93,87 @@ Things worth knowing:
   deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
   session's permission mode with `/permission` and a prompt becomes reachable, at
   which point the rule can be written from real evidence.
-- **It stops when the pane it watches disappears**, and hands lifecycle authority
-  back with `release-agent` so Herdr's own screen detection can resume.
+- **It stops when the pane it watches disappears**, and calls `release-agent` so a
+  registration it created does not outlive it. Note that `release-agent` only removes a
+  registration made with the *same* `--source`; a mismatched one is a silent no-op. So the
+  watcher's cleanup only covers registrations it made itself — check with
+  `herdr agent list | grep -c <pane-id>` rather than trusting the call.
 - Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
   a real captured screen; the comments record which candidates were rejected and why.
+
+## What Herdr can see about a launched pane
+
+A pane this plugin opened is a first-class Herdr agent. It shows up in
+`herdr agent list`, and once it has a name you can drive it by that name:
+
+```bash
+herdr agent list                 # every agent, including panes this plugin opened
+herdr agent get   <name>         # one agent: pane, tab, cwd, state
+herdr agent read  <name>         # the agent's screen output
+herdr agent wait  <name> --until idle --timeout 5000   # block until a state
+```
+
+`<name>` is the agent's registered name. `wait` takes `--until` (repeatable) and
+`--timeout` **in milliseconds**; without `--timeout` it waits indefinitely, and
+without `--until` it matches `idle`, `done` or `blocked`.
+
+### `agent prompt` and `agent send-keys` do not work — and that is Herdr's ceiling
+
+Both refuse, with the same error:
+
+```console
+$ herdr agent prompt <name> "say ok"
+{"error":{"code":"agent_not_ready","message":"agent <name> is not an active named agent"}}
+
+$ herdr agent send-keys <name> -- Enter
+{"error":{"code":"agent_not_ready","message":"agent <name> is not an active named agent"}}
+```
+
+The message says *active*, and that word is the whole story. Herdr only allows
+`prompt` / `send-keys` against an agent **it** started, via
+`herdr agent start --kind <KIND>`, and that `--kind` enum is a closed list which
+contains no `minimax-code` entry. So there is no Herdr-side handle that would let
+this plugin hand you a promptable agent.
+
+**This is an upstream ceiling, not a bug here, and it will not be filed against
+this plugin.** The agent is genuinely registered and name-addressable — `get`,
+`read` and `wait` all work on it. What is missing is Herdr-side *activation*,
+which only `agent start` can grant.
+
+For genuinely interactive control, attach to the pane instead.
+
+### Resume: wired, not demonstrated
+
+The plugin registers a session identity and a resume command for panes it
+launches, so a Herdr restart has something to resume from. **This has not been
+proven to work end to end** — it has only been shown that Herdr accepts the
+registration, not that a restarted session actually comes back. Treat it as
+unverified, and do not rely on it for work you cannot redo.
+
+To check the current state yourself:
+
+```bash
+herdr agent list | grep -o '"agent_session":{[^}]*}'   # session identity, if any
+herdr pane report-agent-session --help                 # the resume verb
+```
+
+An agent showing `agent_session` has a registered session. One without it has
+none. Panes this plugin opened may legitimately show no `agent_session`.
+
+## Three known ceilings
+
+Encountered in normal use, gathered here so you meet them before you go looking:
+
+1. **No `agent prompt` / `agent send-keys`.** Upstream: `agent start --kind` has
+   no `minimax-code`, so no agent of ours can be *active*. `get` / `read` /
+   `wait` are unaffected. See above.
+2. **Resume is wired but unverified.** The registration is accepted; that it
+   restores a session has not been demonstrated. See above.
+3. **No screen-manifest detection.** `mcode` ships no Herdr manifest, so Herdr
+   cannot detect it from the screen the way it detects `claude`. A local override
+   cannot add one either — an override only changes how an agent id Herdr
+   *already knows* is detected; it cannot introduce a new id. This is precisely
+   why state reporting is the opt-in watcher described above.
 
 ## What it exposes
 

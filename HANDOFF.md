@@ -212,6 +212,57 @@ Recorded so nobody re-derives them wrongly:
   created a real pane with `mcode` running, and each was logged as `failed`. See issue #16.
 - The docs list a `workspace.metadata_updated` and `layout.updated` event, but those are
   **not** in `PLUGIN_HOOK_EVENT_KINDS` and will warn.
+- **A local manifest override only applies to an agent id Herdr already knows. A brand-new id
+  is dropped in silence** — no error, no warning, the agent simply never appears. This is why
+  "add a manifest for `minimax-code` locally" cannot work as a detection strategy: an override
+  can change *how a known agent* is detected, never *which agents exist*.
+- **`herdr pane report-agent` is the only route that can introduce a new agent.** Confirmed by
+  experiment: a pane with no agent becomes one only after `report-agent`. `herdr agent start`
+  cannot do it for us, because `--kind` is a closed enum with no `minimax-code` member.
+- **Herdr's own Claude integration never self-reports state — it reports session identity
+  only, because its state is screen-detected.** `herdr agent explain` on a Claude pane names
+  the rule doing the work:
+  ```
+  $ herdr agent explain <claude-pane>
+  agent: claude
+  state: working
+  manifest: remote:…/agent-detection/remote/claude.toml 2026.09.11.1
+  rule: osc_title_working (region=osc_title priority=1100)
+  evidence: "◑ Grant meaning"
+  ```
+  and on a self-reported agent it refuses outright:
+  ```
+  {"error":{"code":"agent_explain_unavailable","message":"agent target <pane> does not have a
+   detected agent label"}}
+  ```
+  **There is therefore nothing to copy from the Claude integration for state parity.** Its
+  `agent_session` field is identity; its state comes from a manifest rule. We would need our
+  own screen manifest, which is ceiling 3.
+- **`release-agent` DELETES a self-reported registration; it does not hand authority back.**
+  Measured before/after on a self-registered pane: present in `herdr agent list` (count 1),
+  then after `herdr pane release-agent <pane> --source minimax-code --agent mcode` the count is
+  **0** and `herdr agent get <name>` returns `agent_not_found`. It does not revert to
+  screen-detected state, because there is no screen detection to revert to. **A
+  self-reporting integration must not call `release-agent`** expecting the agent to survive as
+  a detected one.
+- **`report-agent` must precede `report-agent-session` when a `resume_argv` is attached.**
+  Called the other way round:
+  ```
+  {"error":{"code":"resume_not_accepted","message":"resume_argv requires the reporter to hold
+   the pane; report its state with pane.report_agent first"}}
+  ```
+  The identical call succeeds once `report-agent` has run. Ordering, not capability.
+- **`herdr agent rename` makes an agent name-addressable but cannot make it *active*.** After
+  registering and renaming, `get` / `read` / `wait` all work by name, while `prompt` and
+  `send-keys` both return `agent_not_ready` — *"is not an active named agent"*. Renaming is
+  not activation; only `agent start` can activate, and its `--kind` enum has no
+  `minimax-code`.
+- **Correction to an earlier line in this file and in `CLAUDE.md`:** the `herdr agent start
+  --kind` enum was recorded as 23 values. Re-counted from `herdr agent start --help` on
+  0.9.3 it has **24** (`pi claude codex gemini cursor devin agy cline omp mastracode
+  opencode copilot kimi kiro droid amp grok hermes kilo qodercli qwen letta maki muse`).
+  The substantive point is unaffected — there is still no `minimax-code` — but the count was
+  wrong.
 
 ## 11. Sources
 
