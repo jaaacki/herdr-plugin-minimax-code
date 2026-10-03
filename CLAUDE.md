@@ -59,6 +59,15 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
 
 ## Gotchas
 
+- **herdr does NOT expand shell variables in a manifest `command` array.** `HERDR_PLUGIN_ROOT`
+  is genuinely present in the action's environment, but
+  `command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "start"]` never runs — the string has a
+  `/` in it, so the OS hunts for a literal directory named `${HERDR_PLUGIN_ROOT}` and returns
+  `ENOENT`. The working form is a shell wrapper: `["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]`.
+  Note TOML escaping — inner quotes are `\"`, and `\$` is invalid TOML that fails identically.
+- **A manifest `command` resolves against the invoking pane's cwd, not the plugin root.** A
+  relative `bin/mcode-plugin.sh` works from the plugin root and fails from anywhere else. Do not
+  "fix" the wrapper above into a relative path.
 - **The new pane id is at `.result.pane.pane_id`** — verified against a captured response, not
   guessed. Two traps sit next to it: `result.type` is **`pane_info`**, not `pane_split` (the
   split response is shaped like `pane get`, so never branch on `result.type`), and
