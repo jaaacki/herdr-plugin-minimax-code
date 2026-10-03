@@ -53,9 +53,25 @@ jobs:
       # rather than assuming: both hosted runners ship it today, but a runner
       # image change should fail loudly here instead of turning into a
       # confusing parse error inside the test suite.
-      - name: Assert jq is present
+      # Record which bash actually ran, so "macOS coverage" is not silently
+      # redefined by a runner-image change. The entrypoint and the test suite
+      # both resolve bash via `#!/usr/bin/env bash`, so this is the interpreter
+      # the rest of the job is exercising.
+      #
+      # /bin/sh is recorded too, and deliberately: the manifest action is a
+      # /bin/sh -c wrapper (the fix for the command-array expansion bug), and
+      # /bin/sh is bash on macOS but dash on Debian/Ubuntu. That is the one part
+      # of the plugin whose shell differs by platform, so the log should say
+      # which shell it was.
+      - name: Record the bash, sh and jq versions
         shell: bash
         run: |
+          bash --version | head -1
+          # Positive identification, because `ls -l` is not enough: on macOS
+          # /bin/sh is a regular file rather than a symlink, so the link target
+          # only shows up on Linux. BASH_VERSION is set if and only if the shell
+          # actually is bash, so this distinguishes bash from dash directly.
+          echo "/bin/sh is: $(/bin/sh -c 'echo ${BASH_VERSION:-not-bash}')"
           command -v jq
           jq --version
 
