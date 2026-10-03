@@ -33,7 +33,15 @@ set -uo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$here/.." && pwd)"
 
+# Resolved to an absolute path. run_session cd's into the sandbox before
+# invoking it, so a relative MCODE_SESSION_BIN would resolve against the sandbox
+# and fail — the override would work when the suite was written and break the
+# moment it was actually used.
 SESSION_BIN="${MCODE_SESSION_BIN:-$repo/bin/mcode-session.sh}"
+case "$SESSION_BIN" in
+  /*) ;;
+  *) SESSION_BIN="$(cd -- "$(dirname -- "$SESSION_BIN")" && pwd)/$(basename -- "$SESSION_BIN")" ;;
+esac
 FAKE_HERDR="$here/fake-herdr"
 STORE_FIXTURE="$here/fixtures/session"
 
@@ -180,6 +188,10 @@ setup_case() {
   export MCODE_HOME="$CASE_DIR/store"
   unset FAKE_HERDR_FAIL FAKE_HERDR_FAULT
   unset MCODE_AGENT_STATE MCODE_RESUME_CMD HERDR_PLUGIN_EVENT_JSON
+  # Running this suite from inside a live pane would otherwise inherit that
+  # pane's id, and the result would depend on where it was launched from rather
+  # than on the case. Each `report` case sets the variable deliberately.
+  unset HERDR_PANE_ID
 }
 
 # `resolve` and `report` both resolve against the *current* working directory,
