@@ -2,7 +2,7 @@ id = "jaaacki.minimax-code"
 name = "MiniMax Code"
 version = "0.2.0"
 min_herdr_version = "0.9.3"
-description = "Start and track MiniMax Code agents from Herdr"
+description = "Start MiniMax Code in a new pane for the active worktree"
 platforms = ["linux", "macos"]
 
 # Actions appear in Herdr's action menu for the given contexts.
