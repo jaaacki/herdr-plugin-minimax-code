@@ -23,10 +23,19 @@ on:
 permissions:
   contents: read
 
+# Superseded PR pushes would otherwise queue a second full matrix run behind the
+# first. Cancelling in progress keeps the signal on the newest commit.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   syntax:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # A hung step otherwise burns six hours of runner time. These steps are
+    # jq --version, bash -n and a stub-driven test suite; 10 minutes is ample.
+    timeout-minutes: 10
     strategy:
       # Report both platforms even if one fails; a macOS-only failure is still
       # information when the plugin ships on linux too.
@@ -54,8 +63,11 @@ jobs:
         shell: bash
         run: bash -n bin/mcode-plugin.sh
 
-      # Stage 2, deferred until issue C2 lands: add the test suite to this same
-      # workflow. Do not create a second workflow file.
-      #   - name: Run the test suite
-      #     shell: bash
-      #     run: ./tests/run.sh
+      # Issue C's suite. It points HERDR_BIN_PATH at tests/fake-herdr, so it
+      # exercises cmd_start's argv construction and failure branches WITHOUT
+      # needing a live herdr. It does NOT cover manifest argv resolution --
+      # that path is only reachable through a real
+      # `herdr plugin action invoke`, and it was broken until issue #16.
+      - name: Run the test suite
+        shell: bash
+        run: ./tests/run.sh
