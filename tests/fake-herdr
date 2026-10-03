@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# tests/fake-herdr — a stub herdr binary for tests/run.sh.
+#
+# The entrypoint resolves herdr through ${HERDR_BIN_PATH:-herdr}, so pointing that
+# variable at this file is the whole mechanism: no real multiplexer, no sockets,
+# no state. Every call the entrypoint makes is recorded, which is the only way to
+# assert on the *command sequence* a terminal-multiplexer plugin performs.
+#
+# What it does, per invocation:
+#   1. appends one line to $FAKE_HERDR_LOG (TAB-separated argv fields, in order)
+#   2. prints a canned JSON response on stdout, chosen by subcommand
+#   3. exits 0, unless failure injection (below) matches this invocation
+#
+# Response resolution, in order:
+#   a. $FAKE_HERDR_FIXTURES/<name>.json  if that file exists
+#   b. an inline placeholder             (C1 only — see the note below)
+#
+# ---- PLACEHOLDER PROVENANCE — READ THIS -------------------------------------
+# The inline responses below are FALLBACKS, not claims. They exist only so this
+# harness runs before issue #7's captured fixtures land, and every one of them is
+# bypassed the moment a real fixture is present — see FIXTURE PRECEDENCE below,
+# which is the authoritative statement of what wins.
+#
+# The shape they imitate is no longer a guess. Issue #7 captured real herdr
+# responses and settled the one fact PLAN.md §3 called explicitly unverified:
+# the new pane id is at `.result.pane.pane_id`, the same envelope as `pane get`.
+# `.result.pane_id` yields `null`. Note also that `result.type` is `pane_info` in
+# the split response, not `pane_split` — which is why nothing in this stub ever
+# branches on `result.type`. Responses are keyed off the argv this stub receives,
+# which is what it logs anyway.
+#
+# If you are reading this and no fixture is being used, the suite is running
+# against a pre-merge fallback. Merge #10 before trusting a result.
+# ---------------------------------------------------------------------------
+#
+# Test-only knobs:
+#   FAKE_HERDR_LOG        file to append the invocation log to (required)
+#   FAKE_HERDR_FIXTURES   fixture directory (default: <repo>/tests/fixtures)
+#   FAKE_HERDR_FAIL       "<subcommand>[:<exit-code>]", e.g. "pane split:1".
+#                         Matched against the first two argv fields, so
+#                         "pane split" fails only the split call. Comma-separated
+#                         for several. Used by issue C2's failure cases; unused in C1.
+#   FAKE_HERDR_CWD        cwd reported by `pane get` (default: see below)
+#   FAKE_HERDR_NEW_PANE   pane id reported by `pane split` (default: see below)
+#   FAKE_HERDR_SRC_PANE   pane id reported by `pane current` (default: see below)
+#
+# The three *_PANE/CWD knobs exist so tests/run.sh can state its expectations and
+# the stub's answer from one value each, instead of two literals that can drift.
+
+set -euo pipefail
+
+# --- invocation log ----------------------------------------------------------
+# One line per invocation, argv fields joined by TAB. TAB rather than a space so
+# an argument containing a space (a --cwd path) stays unambiguously parseable.
+# Refusing to log is a bug in the test, not something to paper over.
+#
+# `--self-check` is introspection: it prints the responses it would serve and
+# touches no log, so it is exempt from the FAKE_HERDR_LOG requirement below.
+if [ "${1:-}" != "--self-check" ]; then
+  if [ -z "${FAKE_HERDR_LOG:-}" ]; then
+    printf 'fake-herdr: FAKE_HERDR_LOG is not set\n' >&2
+    exit 64
+  fi
+  {
+    sep=''
+    for arg in "$@"; do
+      printf '%s%s' "$sep" "$arg"
+      sep=$'\t'
+    done
+    printf '\n'
+  } >>"$FAKE_HERDR_LOG"
+fi
+
+# --- failure injection -------------------------------------------------------
+sub="${1:-} ${2:-}"
+sub="${sub% }"
+if [ -n "${FAKE_HERDR_FAIL:-}" ]; then
+  IFS=',' read -r -a wanted <<<"$FAKE_HERDR_FAIL"
+  for w in "${wanted[@]}"; do
+    [ -z "$w" ] && continue
+    case "$w" in
+      *:*) want_sub="${w%:*}"; want_code="${w##*:}" ;;
+      *)   want_sub="$w"; want_code=1 ;;
+    esac
+    if [ "$sub" = "$want_sub" ]; then
+      printf 'fake-herdr: injected failure for "%s" (exit %s)\n' "$sub" "$want_code" >&2
+      exit "$want_code"
+    fi
+  done
+fi
+
+# --- response resolution -----------------------------------------------------
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fixtures="${FAKE_HERDR_FIXTURES:-$here/fixtures}"
+
+src_pane="${FAKE_HERDR_SRC_PANE:-wZ:p1}"
+new_pane="${FAKE_HERDR_NEW_PANE:-wZ:p2}"
+# Normalised, so a default cwd never leaks a trailing "/.." into a --cwd value.
+src_cwd="${FAKE_HERDR_CWD:-$(cd -- "$here/.." && pwd)}"
+
+# ---- FIXTURE PRECEDENCE — stated deliberately, never silently ---------------
+# `emit` used to prefer a fixture over a knob without saying so. A knob the
+# system ignores quietly is worse than no knob at all: the suite goes on
+# reporting `ok` while asserting about a world it no longer controls. So the
+# precedence is explicit, per response, and says itself out loud:
+#
+#   pane-get, pane-current   The source pane and cwd are dimensions the tests
+#                            own, so an explicitly-set knob WINS and the
+#                            fixture is bypassed with a notice on stderr.
+#   pane-split               The captured fixture ALWAYS wins, knob or not,
+#                            because the new pane id is the one value that must
+#                            never be faked. run.sh derives the expected id by
+#                            querying the fixture rather than hard-coding it, so
+#                            a re-capture cannot silently invalidate anything.
+#
+# `${VAR+x}` tests *set-ness*, not non-emptiness, so an intentionally empty knob
+# is still honoured.
+fixture_for() { # fixture_for <name>; prints the fixture path to use, or fails
+  local name="$1"
+  local file="$fixtures/$name.json"
+  [ -f "$file" ] || return 1
+  case "$name" in
+    pane-split)
+      printf '%s' "$file"
+      return 0
+      ;;
+    pane-get | pane-current)
+      if [ -n "${FAKE_HERDR_CWD+x}" ] || [ -n "${FAKE_HERDR_SRC_PANE+x}" ]; then
+        printf 'fake-herdr: knob set, bypassing %s so the test controls this value\n' \
+          "$file" >&2
+        return 1
+      fi
+      printf '%s' "$file"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+emit() { # emit <fixture-name> <inline-json>
+  local name="$1"
+  local inline="$2"
+  local file
+  if file="$(fixture_for "$name")"; then
+    cat -- "$file"
+  else
+    printf '%s\n' "$inline"
+  fi
+}
+
+# The payload for one pane, in the envelope PLAN.md §3 records for `pane get`:
+#   {"result":{"pane":{"pane_id":...,"cwd":...,"tab_id":...,"workspace_id":...}}}
+# The `pane` key is load-bearing: the entrypoint reads `.result.pane.pane_id` and
+# `.result.pane.cwd`, so an envelope that omits it makes the suite assert against
+# a response shape that does not exist. --self-check below enforces that.
+pane_payload() { # pane_payload <pane_id> <cwd>
+  printf '"pane":{"pane_id":"%s","cwd":"%s","tab_id":"wZ:t1","workspace_id":"wZ"}' "$1" "$2"
+}
+
+if [ "${1:-}" = "--self-check" ]; then
+  printf 'pane-get\t%s\n'      "$(emit pane-get     "$(printf '{"result":{%s}}' "$(pane_payload "$src_pane" "$src_cwd")")")"
+  printf 'pane-current\t%s\n'  "$(emit pane-current "$(printf '{"result":{"type":"pane_current",%s}}' "$(pane_payload "$src_pane" "$src_cwd")")")"
+  printf 'pane-split\t%s\n'    "$(emit pane-split   "$(printf '{"result":{%s}}' "$(pane_payload "$new_pane" "$src_cwd")")")"
+  printf 'pane-run\t%s\n'      "$(emit pane-run     '{"result":{"ok":true}}')"
+  exit 0
+fi
+
+#   pane-split               A `pane split` response whose pane id has been
+#                            blanked, for the case where the split succeeded but
+#                            told us nothing. It bypasses the captured fixture
+#                            on purpose, and says so on stderr, because that is
+#                            the whole point of the case. Derived from the real
+#                            capture with jq when available, so only the one
+#                            field differs from reality.
+split_without_pane_id() { # split_without_pane_id
+  local file="$fixtures/pane-split.json"
+  if [ -f "$file" ] && command -v jq >/dev/null 2>&1; then
+    printf 'fake-herdr: FAKE_HERDR_SPLIT_NO_PANE_ID set, blanking the pane id in %s\n' \
+      "$file" >&2
+    jq '.result.pane.pane_id = ""' "$file" && return 0
+  fi
+  printf 'fake-herdr: FAKE_HERDR_SPLIT_NO_PANE_ID set, serving a pane id-less split response\n' >&2
+  printf '{"result":{"pane":{"cwd":"%s","tab_id":"wZ:t1","workspace_id":"wZ"},"type":"pane_info"}}\n' \
+    "$src_cwd"
+}
+
+case "$sub" in
+  "pane get")
+    # PLAN.md §3: verified live against herdr 0.9.3 on 2026-10-04.
+    emit pane-get "$(printf '{"result":{%s}}' "$(pane_payload "$src_pane" "$src_cwd")")"
+    ;;
+  "pane current")
+    # PLAN.md §3: same envelope, type "pane_current".
+    emit pane-current "$(printf '{"result":{"type":"pane_current",%s}}' "$(pane_payload "$src_pane" "$src_cwd")")"
+    ;;
+  "pane split")
+    if [ -n "${FAKE_HERDR_SPLIT_NO_PANE_ID:-}" ]; then
+      split_without_pane_id
+    else
+      emit pane-split "$(printf '{"result":{%s}}' "$(pane_payload "$new_pane" "$src_cwd")")"
+    fi
+    ;;
+  "pane run")
+    emit pane-run '{"result":{"ok":true}}'
+    ;;
+  *)
+    printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-<none>} ${2:-}" >&2
+    exit 64
+    ;;
+esac
