@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Issue B's cmd_start parses herdr's JSON with jq. Assert it explicitly
       # rather than assuming: both hosted runners ship it today, but a runner
