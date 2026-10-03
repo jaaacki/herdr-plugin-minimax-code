@@ -10,6 +10,7 @@ the manifest to suit the test, this translates the escapes so the *shipped*
 patterns are the ones actually executed. A test that silently rewrites the thing
 it is checking would be worse than no test.
 """
+import hashlib
 import os
 import re
 import sys
@@ -17,15 +18,24 @@ import tomllib
 
 manifest_path, fix_dir = sys.argv[1], sys.argv[2]
 
-# The key sets herdr's own shipped manifests use. Validating against a real one
-# is the point: inventing a plausible key is exactly the failure being guarded.
-REF = "/Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml"
-REF_TOP = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
-REF_RULE = {
-    "id", "state", "priority", "region", "visible_working", "visible_idle",
-    "visible_blocker", "skip_state_update", "regex", "line_regex", "contains",
-    "any", "all", "not",
-}
+# The reference is VENDORED IN THE REPO, not read from one developer's home
+# directory. The first version of this check hardcoded an absolute path into
+# herdr's own manifest cache; it passed on that machine and nowhere else, and CI
+# on both legs failed with a FileNotFoundError naming a home directory.
+REF = os.path.join(fix_dir, "reference-claude.toml")
+# Pin the vendored body, so deriving the allow-list from it is trustworthy.
+# Deriving is what makes the schema check honest -- the previous version loaded
+# this reference and then never read it, comparing against a hand-copied key set
+# that had to be kept in sync by hand. But derivation's failure mode is
+# asymmetric: dropping a key narrows the allow-list and turns the suite red
+# (harmless), while ADDING an invented key widens it and would let an invented
+# key in our manifest pass unchecked, which is the one thing this case exists to
+# catch. The digest makes any edit to the copied rules a loud failure instead.
+# It covers the manifest body only; the leading comment header is ours, so
+# documenting the file cannot break the pin. On an intentional re-vendor, update
+# this constant in the same commit that re-copies the file, after re-deriving
+# the key union as that file's own header instructs.
+REF_SHA256 = "2bb543fefeb1192fec81ceaebc794d11faa6c77453bedb55004519a7e1acf82d"
 VALID_STATES = {"idle", "working", "blocked", "unknown"}
 
 failures = []
@@ -103,16 +113,64 @@ def observed_state(text):
 with open(manifest_path, "rb") as fh:
     doc = tomllib.load(fh)
 
+if not os.path.exists(REF):
+    print(f"FAIL  preflight: the vendored reference manifest {REF} is missing")
+    print("        the schema case derives the allowed keys from a real herdr manifest;")
+    print("        falling back to a remembered key set is the failure this check catches")
+    sys.exit(2)
+ref_text = open(REF, encoding="utf-8").read()
+
+
+def manifest_body(text):
+    """The manifest with our provenance header stripped off.
+
+    Leading `#` and blank lines are ours; everything from the first other line
+    down must be the bytes herdr shipped, or the pin below is meaningless.
+    """
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and (lines[i].startswith("#") or not lines[i].strip()):
+        i += 1
+    return "".join(lines[i:])
+
+
+# Digest BEFORE parsing, so that a tampered file is reported as tampered even
+# when the tampering also broke its TOML. Parse-first would raise a
+# TOMLDecodeError traceback here instead, naming the wrong fault -- the same
+# "clear requirement became a stack trace" fault this preflight exists to fix.
+digest = hashlib.sha256(manifest_body(ref_text).encode("utf-8")).hexdigest()
+if digest != REF_SHA256:
+    print("FAIL  preflight: the vendored reference manifest does not match its pinned digest")
+    print(f"        expected {REF_SHA256}")
+    print(f"        actual   {digest}")
+    print("        the copied rules must stay byte-identical to the herdr manifest they came")
+    print("        from; if you re-vendored it on purpose, update REF_SHA256 in the same commit")
+    sys.exit(2)
+
 with open(REF, "rb") as fh:
     ref = tomllib.load(fh)
+
+ref_rules = ref.get("rules") or []
+# An empty allow-list would not be a stricter check, it would be a broken one:
+# without this guard the comparisons below would pass vacuously. Refuse, loudly.
+if not ref_rules:
+    print(f"FAIL  preflight: {REF} declares no rules, so it cannot define a key set")
+    sys.exit(2)
+
+# The specification is the file's own keys, not a copy of them.
+REF_TOP = set(ref)                       # includes "rules": that is a real key
+REF_RULE = {k for r in ref_rules for k in r}
 
 # --- case 1: schema shape matches what herdr ships ---------------------------
 problems = []
 extra_top = set(doc) - REF_TOP
 if extra_top:
     problems.append(f"unknown top-level keys: {sorted(extra_top)}")
-if set(doc) - {"rules"} - REF_TOP:
-    problems.append("missing required top-level keys")
+# A second "unknown top-level keys" test used to sit here, phrased as "missing
+# required top-level keys". It could only ever fire on the condition above --
+# "rules" is itself a member of REF_TOP -- so the only thing it added was a
+# message naming the wrong fault. Required keys are checked by name below, which
+# is what can actually report a missing one.
 for key in ("id", "version", "min_engine_version", "updated_at"):
     if key not in doc:
         problems.append(f"missing {key}")

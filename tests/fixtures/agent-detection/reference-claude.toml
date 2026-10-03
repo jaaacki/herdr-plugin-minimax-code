@@ -1,0 +1,117 @@
+# tests/fixtures/agent-detection/reference-claude.toml
+#
+# A VENDORED REFERENCE, NOT A FIXTURE WE AUTHORED. tests/agent-detection-check.py
+# derives the set of manifest keys it will accept from this file, so it has to be
+# a manifest herdr actually ships -- otherwise the schema check compares our file
+# against itself and proves nothing.
+#
+# Provenance
+# ----------
+#   source        herdr's own manifest cache:
+#                 /Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml
+#   source sha256 038d0aa23fee3f9b39cb3c9ca117d0f95b0b3a5873cf0f38284ccbac279c9664
+#   herdr         0.9.3
+#   captured      2026-10-04 07:11 +0800
+#   declares      version = "2026.09.11.1", updated_at = "2026-09-11T00:00:00Z"
+#
+# What was trimmed, and why that is safe
+# -------------------------------------
+# herdr's claude.toml has 16 rules; this keeps 4 of them. The four are copied
+# VERBATIM -- the top-level block and every kept rule are byte-identical to the
+# source above, comments included. Only the 12 unreferenced rules were dropped.
+#
+# The cut is measured, not guessed. The union of rule-level keys over all 16 of
+# herdr's rules, and the union over the 22 manifests in that cache, are BOTH
+# exactly these 14 keys:
+#
+#   all, any, contains, id, line_regex, not, priority, regex, region,
+#   skip_state_update, state, visible_blocker, visible_idle, visible_working
+#
+# and these 4 rules already carry all 14. So deriving the allow-list from this
+# trimmed file yields the same allow-list as reading every shipped manifest.
+# Re-derive it yourself on a machine with herdr installed:
+#
+#   python3 - <<'EOF'
+#   import tomllib, glob
+#   k = set()
+#   for p in glob.glob("~/.local/state/herdr/agent-detection/remote/*.toml"):
+#       for r in tomllib.load(open(p, "rb")).get("rules", []): k |= set(r)
+#   print(sorted(k))
+#   EOF
+#
+# Dropping a rule from THIS file can only narrow the allow-list, which makes the
+# check reject our manifest loudly. It cannot silently widen it. That is why the
+# trim is safe to make: the failure mode of being wrong here is a red suite, not
+# a green one.
+#
+# And because even a widened allow-list is a real hole -- an invented key ADDED
+# here would let an invented key through in our manifest -- the body below (this
+# comment header excluded) is pinned by sha256 in tests/agent-detection-check.py
+# as REF_SHA256. Any edit to it fails the suite until that constant is updated in
+# the same commit. The two digests are different things and both are labelled:
+# the one above is the whole upstream file, the pinned one is this trimmed body.
+
+id = "claude"
+version = "2026.09.11.1"
+min_engine_version = 2
+updated_at = "2026-09-11T00:00:00Z"
+aliases = ["claude-code"]
+
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+visible_working = true
+# Braille covers <= 2.1.227; half-circles are the 2.1.228 busy spinner.
+regex = ['^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}] ']
+
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 1000
+region = "bottom_non_empty_lines(3)"
+skip_state_update = true
+contains = ["showing detailed transcript"]
+any = [
+  { contains = ["ctrl+o", "to toggle"] },
+  { contains = ["ctrl+e", "show all"] },
+  { contains = ["ctrl+e", "collapse"] },
+  { contains = ["↑↓ scroll"] },
+  { contains = ["? for shortcuts"] },
+]
+
+[[rules]]
+id = "mcp_elicitation_prompt"
+state = "blocked"
+priority = 980
+region = "whole_recent"
+visible_blocker = true
+# MCP elicitation dialogs (elicitation/create) show Accept/Decline controls
+# with an "Esc to cancel" footer but no Enter hint, so live_blocked_form
+# cannot see them (issue #3283). Gate on the invariant header line, the
+# Accept/Decline control line, and the cancel footer.
+contains = ["esc to cancel"]
+line_regex = ['(?i)^\s*MCP server ["\x{201C}].+["\x{201D}] requests your input\s*$']
+all = [
+  { any = [
+    { line_regex = ['^\s*\x{276F}?\s*Accept\b'] },
+    { line_regex = ['^\s*\x{276F}?\s*Decline\b'] },
+  ] },
+]
+
+[[rules]]
+id = "live_prompt_box"
+state = "idle"
+priority = 950
+region = "prompt_box_body"
+visible_idle = true
+line_regex = ['^\s*❯']
+not = [
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["tab/arrow keys"] },
+  { contains = ["arrow keys to navigate"] },
+  { contains = ["↑/↓ to navigate"] },
+]
