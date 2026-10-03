@@ -119,7 +119,11 @@ resolve_session_for_cwd() {
     cwd=$(jq -r '(.cwd // .workspace.cwd // .paths.cwd // empty) | select(type == "string")' \
           "$manifest" 2>/dev/null) || continue
     [ "$cwd" = "$want_cwd" ] || continue
-    jq -r 'select(type == "string") | "\(.updatedAtMs // .createdAtMs // 0)\t\(.sessionId)"' \
+    # No `select(type == "string")` here: the input is the manifest object, so
+    # `type` is "object" and such a filter discards every row. Only the id
+    # itself is type-checked.
+    jq -r 'select((.sessionId | type) == "string")
+           | "\(.updatedAtMs // .createdAtMs // 0)\t\(.sessionId)"' \
        "$manifest" 2>/dev/null
   done | sort -rn | head -1 | cut -f2
 }
