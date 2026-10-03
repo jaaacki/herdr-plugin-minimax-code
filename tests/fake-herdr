@@ -70,6 +70,10 @@
 #                         the shape a mis-parsed response would produce
 #   split-id-no-colon     the split response's pane id is well-formed but has no
 #                         colon, so it is not a pane id at all
+#   agent-get-empty       `agent get` succeeds but records no agent_status, i.e.
+#                         the pane is not registered yet
+#   report-agent-session-unsupported
+#                         a Herdr with no `pane report-agent-session` verb
 #
 # Every fault is a *variant of the real capture*: jq rewrites one field and leaves
 # the envelope, id, type, scroll and every other field exactly as herdr produced
@@ -247,6 +251,8 @@ if [ "${1:-}" = "--self-check" ]; then
   # Not a capture, and never parsed by the entrypoint. Labelled, not disguised.
   printf 'pane-run\t%s\n'     '{"result":{"ok":true}}'
   printf 'pane-report-agent\t%s\n' '{"result":{"ok":true}}'
+  printf 'pane-report-agent-session\t%s\n' '{"result":{"ok":true}}'
+  printf 'agent-get\t%s\n' '{"result":{"agent":{"agent":"mcode","agent_status":"working"},"type":"agent_info"}}'
   printf 'agent-list\t%s\n'   '{"result":{"agents":[],"type":"agent_list"}}'
   printf 'agent-rename\t%s\n' '{"result":{"agent":{"agent":"mcode","name":"mcode"},"type":"agent_renamed"}}'
   exit 0
@@ -278,8 +284,33 @@ case "$sub" in
     fi
     printf '%s\n' '{"result":{"ok":true}}'
     ;;
+  "agent get")
+    # PARSED, unlike the report/rename verbs below. bin/mcode-session.sh reads
+    # the status herdr already records for the pane so it can re-assert it
+    # instead of imposing a placeholder that would overwrite a real one.
+    # agent-get-empty models a pane herdr has not registered yet, which is the
+    # launch-path case and the only one where the script picks a state itself.
+    if has_fault agent-get-empty; then
+      announce_fault agent-get-empty "reporting a pane with no recorded agent state"
+      printf '%s\n' '{"result":{"agent":{},"type":"agent_info"}}'
+      exit 0
+    fi
+    printf '%s\n' '{"result":{"agent":{"agent":"mcode","agent_status":"working"},"type":"agent_info"}}'
+    ;;
   "agent list")
     emit_agent_list
+    ;;
+  "pane report-agent-session")
+    # Exit status only, on the same grounds as `pane run`: the session id and the
+    # resume command are arguments, and arguments are already in the log the
+    # tests assert on. report-agent-session-unsupported models a Herdr that has
+    # no such verb, a different failure from one that errors.
+    if has_fault report-agent-session-unsupported; then
+      announce_fault report-agent-session-unsupported "behaving as a Herdr with no report-agent-session verb"
+      printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-}" >&2
+      exit 64
+    fi
+    printf '%s\n' '{"result":{"ok":true}}'
     ;;
   "agent rename")
     # Also exit-status only. The name the entrypoint chose is in the log, which
