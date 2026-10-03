@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
-# mcode-session.sh — resolve this pane's mcode session identity and register it
-# with herdr, including a command that resumes the session after a restart.
+# mcode-session.sh — register this pane's mcode session with herdr, and record
+# the command herdr would use to resume it after a restart.
 #
-# Standalone on purpose. It is NOT called from bin/mcode-plugin.sh: that file is
-# owned by issue #34 and is in flight, so the wiring is left to its owner. This
-# script is designed to be invoked from inside the pane it registers, because
-# herdr rejects a resume_argv whose reporter does not hold the pane
-# ("resume_argv requires the reporter to hold the pane").
+# STATUS: wired but UNVERIFIED. This records a resume command; nobody has yet
+# watched herdr restore a pane from one. The restart needed to prove it cannot
+# be run safely anywhere yet — every candidate environment is a live machine
+# whose other work a restart would destroy. So: the registration is tested, the
+# resume is reasoned, not demonstrated. Do not describe it as working.
+#
+# Two ways this gets used:
+#
+#   * Operator-run today. Run it from inside the mcode pane you want registered:
+#         cd <pane's workspace> && HERDR_PANE_ID=<pane> bin/mcode-session.sh report
+#     `herdr pane list` gives you the pane id. Until the launch path calls this
+#     automatically (issue #44 wires it; that file is in flight), running it by
+#     hand is the only way a pane gets registered.
+#
+#   * Called by the launch path once #44 lands. It is deliberately not called
+#     from bin/mcode-plugin.sh yet, because that file is #34's and in flight.
+#
+# It must run inside the pane it registers: herdr rejects a resume_argv whose
+# reporter does not hold that pane ("resume_argv requires the reporter to hold
+# the pane").
 #
 #   resolve   print the resolution outcome; never mutates anything
-#   report    resolve, then call `pane report-agent-session`
+#   report    resolve, then re-assert the pane's agent state and attach identity
 #
 # Environment (all optional):
 #   HERDR_BIN_PATH         path to the herdr binary
@@ -46,22 +61,32 @@ die() { log "mcode-session: $*"; exit 1; }
 # layout = "v2-final-dated-session". `v2` is a layout marker and will change, so
 # it is discovered rather than hard-coded. If several exist, the most recently
 # modified wins and the choice is stated on stderr.
+# The most recently *updated* store under $MCODE_HOME, by the manifests' own
+# updatedAtMs.
+#
+# Ranking by updatedAtMs rather than by filesystem mtime is deliberate, and it
+# matters twice over. It is portable — no `stat`, whose -f flag means "format" on
+# BSD and "filesystem" on GNU, so a `stat`-based version silently breaks on every
+# Linux runner. And it is the same notion of "newest" that
+# resolve_session_for_cwd already uses, so discovery and resolution agree instead
+# of ranking by two unrelated clocks.
 sessions_root() {
-  local candidate newest="" newest_mtime=-1 dir
+  local dir best="" best_ms=-1 newest
   for dir in "$MCODE_HOME"/*/sessions; do
     [ -d "$dir" ] || continue
-    candidate="$dir"
-    local mtime
-    mtime=$(find "$dir" -name manifest.json -type f -print0 2>/dev/null \
-             | xargs -0 stat -f '%m' 2>/dev/null | sort -rn | head -1)
-    mtime="${mtime:--1}"
-    if [ "$mtime" -gt "$newest_mtime" ]; then
-      newest_mtime="$mtime"
-      newest="$candidate"
+    newest=$(find "$dir" -name manifest.json -type f 2>/dev/null | head -200 \
+             | while IFS= read -r manifest; do
+                 jq -r '(.updatedAtMs // .createdAtMs // 0) | tostring' \
+                    "$manifest" 2>/dev/null
+               done | sort -rn | head -1)
+    newest="${newest:--1}"
+    if [ "$newest" -gt "$best_ms" ]; then
+      best_ms="$newest"
+      best="$dir"
     fi
   done
-  [ -n "$newest" ] || return 1
-  printf '%s\n' "$newest"
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
 }
 
 # --- session id resolution -----------------------------------------------------
