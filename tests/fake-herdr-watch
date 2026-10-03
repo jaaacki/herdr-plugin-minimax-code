@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# fake-herdr-watch - a herdr stub for bin/mcode-watch.sh tests.
+#
+# Separate from tests/fake-herdr on purpose: that stub serves the plugin's own
+# pane/split JSON envelopes and is exercised by the existing suite. This one
+# serves *detection snapshots* and the agent-lifecycle verbs, which is a
+# different surface. Keeping them apart means neither suite can be broken by the
+# other's changes.
+#
+# Knobs:
+#   WATCH_LOG         append every argv here, one invocation per line (TAB-separated)
+#   WATCH_SNAPSHOTS   comma-separated fixture paths, served in order; the last
+#                     one repeats once the list is exhausted. Unset = empty
+#                     snapshot, which is what a starting pane looks like.
+#   WATCH_PANE_GONE   if set, `pane get` fails, i.e. the watched pane is gone
+
+set -uo pipefail
+
+log() { [ -n "${WATCH_LOG:-}" ] && printf '%s\n' "$*" >>"$WATCH_LOG"; return 0; }
+record() { log "$(printf '%s' "$*")"; return 0; }
+
+next_snapshot() {
+  [ -n "${WATCH_SNAPSHOTS:-}" ] || return 0
+  # The stub is re-executed for every herdr call, so the read counter has to
+  # outlive the process or every poll would serve the first snapshot and no
+  # transition could ever be observed.
+  counter_file="${WATCH_LOG:-/dev/null}.reads"
+  read_n=0
+  [ -f "$counter_file" ] && read_n="$(cat "$counter_file" 2>/dev/null || echo 0)"
+  case "$read_n" in ''|*[!0-9]*) read_n=0 ;; esac
+  read_n=$(( read_n + 1 ))
+  printf '%s' "$read_n" >"$counter_file"
+  IFS=',' read -ra LIST <<<"$WATCH_SNAPSHOTS"
+  n=${#LIST[@]}
+  i=$(( read_n - 1 ))
+  [ "$i" -ge "$n" ] && i=$(( n - 1 ))
+  cat "${LIST[$i]}"
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  pane)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      get)
+        record "pane get $*"
+        if [ -n "${WATCH_PANE_GONE:-}" ]; then
+          printf 'fake-herdr-watch: no such pane\n' >&2
+          exit 1
+        fi
+        printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"wZ:p1"},"type":"pane_info"}}\n'
+        ;;
+      read)
+        record "pane read $*"
+        next_snapshot
+        ;;
+      report-agent)
+        record "pane report-agent $*"
+        # Enforce the --source namespace, the way herdr does. herdr matches
+        # --source exactly and a mismatch fails silently, so a stub that accepted
+        # any value could never catch a reporter drifting off the convention -
+        # which is exactly what happened once. Refuse loudly instead.
+        case " $* " in
+          *" --source herdr:minimax-code "*) ;;
+          *) printf 'fake-herdr-watch: rejecting --source; expected herdr:minimax-code\n' >&2
+             exit 1 ;;
+        esac
+        printf '{"id":"cli:pane:report-agent","result":{"ok":true}}\n'
+        ;;
+      release-agent)
+        record "pane release-agent $*"
+        printf '{"id":"cli:pane:release-agent","result":{"ok":true}}\n'
+        ;;
+      *)
+        record "pane $sub $*"
+        printf '{"id":"cli:pane:unknown","result":{"ok":true}}\n'
+        ;;
+    esac
+    ;;
+  *) record "$cmd $*"; printf '{"result":{"ok":true}}\n' ;;
+esac

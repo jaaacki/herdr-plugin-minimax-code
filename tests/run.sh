@@ -98,6 +98,20 @@ assert_stderr_mentions() { # assert_stderr_mentions <needle>
   fi
 }
 
+# assert_count FILE NEEDLE WANT LABEL - how many lines of FILE contain the
+# literal NEEDLE. "Mentions it at least once" is too weak for the state hint:
+# the point of printing one line is that it is ONE line, and a second copy is
+# noise the user cannot read past. grep -c exits non-zero on no match while
+# still printing 0, hence the `|| true`.
+assert_count() { # assert_count <file> <needle> <want> <label>
+  local file="$1" needle="$2" want="$3" label="$4" got
+  got="$(grep -cF -- "$needle" "$file" 2>/dev/null || true)"
+  got="${got:-0}"
+  if [ "$got" != "$want" ]; then
+    note "$label: expected $want line(s) mentioning '$needle', found $got"
+  fi
+}
+
 assert_log_empty() {
   if [ -s "$FAKE_HERDR_LOG" ]; then
     note "expected no herdr invocations, got:"
@@ -150,7 +164,15 @@ setup_case() {
 }
 
 run_entrypoint() {
-  "$PLUGIN_BIN" start >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  run_entrypoint_at "$PLUGIN_BIN"
+}
+
+# run_entrypoint_at PATH runs a DIFFERENT entrypoint. It takes the path as an
+# argument rather than reassigning $PLUGIN_BIN, because that variable is global
+# and a case that changed it would silently retarget every case after it. Only
+# cases 21-23 use this, and only with the copy stage_plugin hands them.
+run_entrypoint_at() { # run_entrypoint_at <entrypoint>
+  "$1" start >"$STDOUT_FILE" 2>"$STDERR_FILE"
   RC=$?
 }
 
@@ -207,24 +229,99 @@ expected_split_line() { # expected_split_line <source-pane> [with-cwd: yes|no]
 # 3 and 4 assert the launcher never typed into a pane, which is the property
 # they exist to protect. An exit-code-only assertion would not: a script that
 # called `pane run` and failed afterwards would still exit non-zero.
-expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd]
+expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd] [registered]
   local src="$1"
   local mcode="$2"
   local with_cwd="${3:-yes}"
-  local lines
+  # registered is a three-state flag, and the middle state exists because it is a
+  # real branch, not a theoretical one:
+  #   no        `pane run` never happened, or it died — nothing follows
+  #   reported  `pane run` succeeded, `report-agent` was called and failed, so
+  #             naming is skipped (renaming an unregistered pane cannot work)
+  #   full      `pane run` succeeded and the pane was registered *and* named
+  # It is separate from a non-empty mcode because case 5 has mcode on the
+  # command line and then dies inside `pane run` — there the run line is
+  # present and nothing after it is.
+  local registered="${4:-no}"
+  local lines newpane
+  newpane="$(expected_new_pane)"
   lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src" "$with_cwd")")"
   if [ -n "$mcode" ]; then
-    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$(expected_new_pane)" "$mcode")"
+    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$newpane" "$mcode")"
+  fi
+  if [ "$registered" = "reported" ] || [ "$registered" = "full" ]; then
+    lines="$(printf '%s\npane\treport-agent\t%s\t--source\therdr:minimax-code\t--agent\tmcode\t--state\tunknown' \
+      "$lines" "$newpane")"
+  fi
+  if [ "$registered" = "full" ]; then
+    lines="$(printf '%s\nagent\tlist' "$lines")"
+    lines="$(printf '%s\nagent\trename\t%s\t%s' "$lines" "$newpane" "$(expected_agent_name)")"
   fi
   printf '%s' "$lines"
 }
 
+# The name next_agent_name() should settle on, mirroring the stub's agent list.
+expected_agent_name() { # expected_agent_name
+  case ",${FAKE_HERDR_FAULT:-}," in
+    *,agent-names-taken,*) printf 'mcode-3' ;;
+    *)                   printf 'mcode' ;;
+  esac
+}
+
+# watcher_path_for ENTRYPOINT - the absolute watcher path the entrypoint's hint
+# must name for that entrypoint.
+#
+# Derived the way watcher_hint() derives it: from the entrypoint's own
+# directory, one level up, because the entrypoint IS the plugin's
+# bin/mcode-plugin.sh. Deriving rather than hard-coding means the expectation
+# follows the checkout, and it turns the `bin/bin/` slip - appending
+# "/bin/mcode-watch.sh" to a directory that is already `bin/` - into a red test
+# rather than a permanently unresolvable path that still reads plausibly.
+watcher_path_for() { # watcher_path_for <entrypoint>
+  printf '%s/bin/mcode-watch.sh' "$(cd -- "$(dirname -- "$1")/.." && pwd -P)"
+}
+
+expected_watcher_path() { watcher_path_for "$PLUGIN_BIN"; }
+
+# stage_plugin [none|fake] - copy the entrypoint into $CASE_DIR/plugin and print
+# the copy's path, so a case can vary what sits BESIDE it.
+#
+# A copy, never the real checkout: bin/mcode-watch.sh belongs to another member
+# and a test has no business chmod-ing or removing it there. This is the same
+# mechanism MCODE_PLUGIN_BIN already exists for, used per case.
+#
+#   none  no watcher file at all, so watcher_hint() must take its warning branch
+#   fake  a stub that records each invocation in $CASE_DIR/plugin/watcher-ran
+#
+# The stub sleeps before exiting. Without that, a mutant which runs the watcher
+# SYNCHRONOUSLY would return instantly and the "nothing holds the action's own
+# pane open" property would never be exercised.
+stage_plugin() { # stage_plugin [none|fake]
+  local root="$CASE_DIR/plugin"
+  mkdir -p "$root/bin"
+  cp "$PLUGIN_BIN" "$root/bin/mcode-plugin.sh"
+  chmod +x "$root/bin/mcode-plugin.sh"
+  case "${1:-none}" in
+    fake)
+      cat >"$root/bin/mcode-watch.sh" <<'STUB'
+#!/bin/sh
+# Test stub. Records that it ran, then blocks. See stage_plugin.
+echo ran >>"$(dirname -- "$0")/../watcher-ran"
+sleep 5
+STUB
+      chmod +x "$root/bin/mcode-watch.sh"
+      ;;
+  esac
+  printf '%s' "$root/bin/mcode-plugin.sh"
+}
+
 # Case 2's sequence: `pane current` first, to resolve the source pane.
-expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|"">
+expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|""> [registered]
   local mcode="$1"
+  local registered="${2:-no}"
   local src rest
   src="$(expected_current_pane)"
-  rest="$(expected_sequence "$src" "$mcode")"
+  rest="$(expected_sequence "$src" "$mcode" yes "$registered")"
   printf 'pane\tcurrent\n%s' "$rest"
 }
 
@@ -319,7 +416,7 @@ case_1() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode")"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
 }
 
 # --- case 2 ------------------------------------------------------------------
@@ -332,7 +429,7 @@ case_2() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  assert_log_exactly "$(expected_sequence_via_current "$CASE_DIR/bin/mcode")"
+  assert_log_exactly "$(expected_sequence_via_current "$CASE_DIR/bin/mcode" full)"
 }
 
 # --- case 3 ------------------------------------------------------------------
@@ -377,6 +474,14 @@ case_5() {
   assert_rc_nonzero "$RC"
   assert_stderr_nonempty
   assert_stderr_mentions "$(expected_new_pane)"
+  # No state hint on a failed launch. Every failure path returns before
+  # watcher_hint() is reached, and that is the property worth pinning: a hint
+  # printed for a pane that never got mcode sends the operator off to watch an
+  # empty window - and it would appear only in the one situation where the user
+  # is already unhappy.
+  if grep -qF -- "mcode-watch.sh" "$STDERR_FILE"; then
+    note "stderr printed a state hint for a launch that failed; there is no pane to watch"
+  fi
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode")"
 }
 
@@ -478,7 +583,7 @@ case_9() {
   if grep -qF 'reported no cwd' "$STDERR_FILE"; then
     note "stderr blames an empty cwd, but the pane get call actually failed"
   fi
-  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no)"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no full)"
 }
 
 # --- case 10 -----------------------------------------------------------------
@@ -597,6 +702,206 @@ case_15() {
 }
 
 # --- driver ------------------------------------------------------------------
+# --- case 16 ----------------------------------------------------------------
+# `pane report-agent` errors. The launch already happened and the user can see
+# mcode running, so the entrypoint must NOT turn this into a failure: exit 0,
+# mcode still launched, and stderr says the registration failed. This is the
+# branch most likely to be "corrected" later into a hard failure, so it is
+# asserted on all three properties.
+case_16() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="pane report-agent:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not register"
+  assert_stderr_mentions "$(expected_new_pane)"
+  # mcode really was started, and naming was skipped: renaming a pane that was
+  # never registered cannot work, and trying would emit a second warning for
+  # one root cause.
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes reported)"
+}
+
+# --- case 17 ----------------------------------------------------------------
+# An older Herdr with no `report-agent` verb at all. Different failure from
+# case 16, same required outcome: exit 0, mcode launched, stderr explains.
+case_17() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="report-agent-unsupported"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not register"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes reported)"
+}
+
+# --- case 18 ----------------------------------------------------------------
+# Registration succeeds but the rename fails. The pane is then visible in
+# `agent list` yet unnamed, which is a half-working state the user cannot
+# diagnose on their own — so stderr must name the commands that will not work
+# (prompt / send-keys), not just say "rename failed".
+case_18() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="agent rename:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not be renamed"
+  assert_stderr_mentions "send-keys"
+  assert_stderr_mentions "agent_not_ready"
+  # The point of the message is to stop a user renaming the agent by hand, so it
+  # must name the real cause and must NOT promise that naming would help.
+  assert_stderr_mentions "Herdr itself started"
+  if grep -qF 'until it is named' "$STDERR_FILE"; then
+    note "stderr tells the user naming would fix prompt/send-keys; on 0.9.3 it would not"
+  fi
+  # The registration and the name lookup both still happened.
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+}
+
+# --- case 19 ----------------------------------------------------------------
+# Name collision. `mcode` and `mcode-2` are already in use, so the entrypoint
+# must pick the next free slot rather than blindly renaming to `mcode` — which
+# on a real Herdr fails with agent_name_taken and leaves the agent unnamed.
+case_19() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="agent-names-taken"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+  if ! grep -qF "$(printf 'agent	rename	%s	mcode-3' "$(expected_new_pane)")" "$FAKE_HERDR_LOG"; then
+    note "expected the rename to land on mcode-3 with mcode and mcode-2 taken"
+  fi
+}
+
+# --- case 20 ----------------------------------------------------------------
+# The state hint after a successful launch: exactly one line, naming the NEW
+# pane and a watcher path that is actually executable. Asserted for
+# executability rather than for shape, because a well-formed path to a file
+# that is not there is precisely the failure a user cannot act on.
+case_20() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local watcher newpane
+  watcher="$(expected_watcher_path)"
+  newpane="$(expected_new_pane)"
+
+  if [ ! -x "$watcher" ]; then
+    note "$watcher is not executable, so this case cannot assert a runnable command"
+    return
+  fi
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  # The launch line is unchanged - the hint is additive, not a replacement.
+  assert_stderr_mentions "started $CASE_DIR/bin/mcode in pane $newpane"
+  assert_count "$STDERR_FILE" "$watcher $newpane" 1 "state hint"
+  # It must name the NEW pane. Pointing at the source pane would send the
+  # operator to watch the window they launched from, which is not the one that
+  # just started.
+  if grep -qF -- "$watcher $SRC_PANE" "$STDERR_FILE"; then
+    note "state hint points at the source pane $SRC_PANE instead of the new pane $newpane"
+  fi
+  # And it must be honest about what it is telling them.
+  assert_stderr_mentions "not tracked"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+}
+
+# --- case 21 ----------------------------------------------------------------
+# The hint's failure policy, which is the registration policy: a watcher that
+# cannot be run is a warning, the launch still exits 0, and the message must
+# not hand the user a run command for a path that is not there.
+case_21() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local copy watcher newpane
+  copy="$(stage_plugin none)"
+  watcher="$(watcher_path_for "$copy")"
+  newpane="$(expected_new_pane)"
+
+  if [ -e "$watcher" ]; then
+    note "$watcher exists, so the 'watcher missing' branch cannot be exercised"
+    return
+  fi
+
+  run_entrypoint_at "$copy"
+  assert_rc_zero "$RC"
+  # The launch is still reported as the success it is. That is the entire point
+  # of the best-effort policy: the user asked for a pane and got a working one.
+  assert_stderr_mentions "started $CASE_DIR/bin/mcode in pane $newpane"
+  assert_stderr_mentions "state watcher"
+  assert_stderr_mentions "The launch itself succeeded"
+  # No run command for a file that does not exist: that would be worse than
+  # silence, because the user copies it and it cannot work.
+  if grep -qF -- "run: $watcher" "$STDERR_FILE"; then
+    note "stderr printed a run command for a watcher that does not exist"
+  fi
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+}
+
+# --- case 22 ----------------------------------------------------------------
+# THE lifecycle guarantee of issue #47 - in this design it is strictly stronger
+# than the one the issue asks for. The issue asks for "no orphan outlives the
+# pane"; this build starts no watcher at all, so there is nothing that can
+# outlive a pane, nothing a second launch can duplicate, and nothing that can
+# hold the action's own pane open.
+#
+# A stub watcher that records its own invocation is the honest probe. The herdr
+# call log cannot see a watcher at all: a freshly backgrounded one makes no
+# herdr call until its first poll, so an exact-sequence assertion would stay
+# green while the entrypoint silently leaked a process.
+case_22() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local copy root
+  copy="$(stage_plugin fake)"
+  root="$CASE_DIR/plugin"
+
+  run_entrypoint_at "$copy"
+  assert_rc_zero "$RC"
+  if [ -e "$root/watcher-ran" ]; then
+    note "cmd_start started the state watcher $(wc -l <"$root/watcher-ran" | tr -d ' ') time(s); it must be left for the operator to run"
+  fi
+  # Second probe, on the real tree: nothing from THIS checkout may be running
+  # either. pgrep excludes itself, and the path is checkout-specific, so an
+  # unrelated watcher the user has running elsewhere cannot mask a failure.
+  if ! command -v pgrep >/dev/null 2>&1; then
+    note "pgrep is required to assert that no watcher process is left behind"
+  elif pgrep -f -- "$(expected_watcher_path)" >/dev/null 2>&1; then
+    note "a watcher from this checkout is still running: $(pgrep -f -- "$(expected_watcher_path)" | tr '\n' ' ')"
+  fi
+}
+
+# --- case 23 ----------------------------------------------------------------
+# The same guarantee under the race the issue names: two launches in a row. With
+# the watcher left to the operator there is nothing to duplicate, and asserting
+# the count stays at zero is the only form of this test that would catch a
+# re-introduced automatic wiring. The second launch is asserted to be a complete
+# launch of its own, not a degraded one.
+case_23() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local copy root
+  copy="$(stage_plugin fake)"
+  root="$CASE_DIR/plugin"
+
+  run_entrypoint_at "$copy"
+  assert_rc_zero "$RC"
+  # Reset the record so the second launch's count cannot hide inside the first.
+  : >"$FAKE_HERDR_LOG"
+  run_entrypoint_at "$copy"
+  assert_rc_zero "$RC"
+  if [ -e "$root/watcher-ran" ]; then
+    note "two launches started the state watcher $(wc -l <"$root/watcher-ran" | tr -d ' ') time(s); it must be 0"
+  fi
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+}
+
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
   CASES_RUN=$((CASES_RUN + 1))
@@ -610,7 +915,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -654,6 +959,14 @@ for name in "${SELECTED[@]}"; do
     case-13) run_case case-13 case_13 ;;
     case-14) run_case case-14 case_14 ;;
     case-15) run_case case-15 case_15 ;;
+    case-16) run_case case-16 case_16 ;;
+    case-17) run_case case-17 case_17 ;;
+    case-18) run_case case-18 case_18 ;;
+    case-19) run_case case-19 case_19 ;;
+    case-20) run_case case-20 case_20 ;;
+    case-21) run_case case-21 case_21 ;;
+    case-22) run_case case-22 case_22 ;;
+    case-23) run_case case-23 case_23 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

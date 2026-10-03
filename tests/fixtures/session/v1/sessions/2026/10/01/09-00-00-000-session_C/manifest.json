@@ -1,0 +1,11 @@
+{
+  "createdAtMs": 999000000000,
+  "layout": "v1-legacy",
+  "paths": {
+    "sessionDir": "/tmp/session-C"
+  },
+  "schemaVersion": 1,
+  "sessionId": "mvs_3333333333333333333333333333cccc",
+  "source": "local-runtime",
+  "updatedAtMs": 1000000000000
+}

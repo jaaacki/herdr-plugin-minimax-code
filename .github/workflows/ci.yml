@@ -79,11 +79,105 @@ jobs:
         shell: bash
         run: bash -n bin/mcode-plugin.sh
 
-      # Issue C's suite. It points HERDR_BIN_PATH at tests/fake-herdr, so it
-      # exercises cmd_start's argv construction and failure branches WITHOUT
-      # needing a live herdr. It does NOT cover manifest argv resolution --
-      # that path is only reachable through a real
-      # `herdr plugin action invoke`, and it was broken until issue #16.
-      - name: Run the test suite
+      # Every suite, discovered by glob rather than named one at a time.
+      #
+      # A hard-coded list of suites is the exact trap this epic was assembled to
+      # close: a suite gets written, proved locally, and never executes in CI, so
+      # it rots silently. Naming tests/run.sh and nothing else left issue #35's
+      # eleven cases decorative for a whole PR. Globbing means a suite cannot be
+      # committed without being run, and #45 is bringing tests too.
+      #
+      # It also fails loudly when it finds no suite, rather than passing
+      # vacuously -- a rename that broke the glob must not read as success.
+      - name: Run every test suite
         shell: bash
-        run: ./tests/run.sh
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          suites=(tests/*run.sh)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "no test suites found under tests/ - refusing to pass vacuously" >&2
+            exit 1
+          fi
+          for suite in "${suites[@]}"; do
+            echo "=== $suite ==="
+            "$suite"
+          done
+
+  # ── End-to-end, against a REAL herdr ───────────────────────────────────────
+  #
+  # Deliberately a separate job from `syntax`, and deliberately NOT picked up by
+  # its `tests/*run.sh` glob. Bash's `*` does not cross `/`, so the glob cannot
+  # reach tests/e2e/run.sh — and that is correct rather than an accident. This
+  # suite needs a real herdr installed first; the stub suites must never touch
+  # one. Widening the glob to `tests/**/run.sh` would run it inside the `syntax`
+  # job, where herdr is absent, and it would exit 2 on every push.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The suite starts a real server, links the plugin and drives panes. Slower
+    # than the stub job but bounded: the polling loops carry their own timeouts,
+    # so a wedged server fails the case rather than hanging the runner.
+    timeout-minutes: 15
+    strategy:
+      # As in the syntax job: a macOS-only failure is still information, because
+      # the plugin declares platforms = ["linux", "macos"].
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # SUPPLY CHAIN, STATED RATHER THAN ASSUMED. This pipes a remote script
+      # into a shell. It is herdr's own documented install path, over TLS, from
+      # the vendor's domain, and it is the only way this suite tests the thing
+      # it exists to test — a stubbed e2e is a unit test with extra steps.
+      #
+      # UNPINNED ON PURPOSE. The criterion-5 tripwire is a canary, and a canary
+      # that only burns when someone remembers to unpin it is not a canary. A
+      # herdr release that adds prompt/send-keys support for self-reported
+      # agents SHOULD turn this job red: that is the signal we designed it to
+      # deliver, and the failure text says so in those words. Pinning would defer
+      # that signal to an unspecified future bump, which is precisely the "the
+      # plugin quietly keeps claiming a ceiling that nothing re-checks" outcome
+      # the inversion was designed to prevent.
+      #
+      # The accepted cost, stated plainly: a herdr regression unrelated to this
+      # plugin can also redden this job. That is why the version is printed
+      # before the suite runs, so any red is attributable to a specific herdr
+      # build rather than to a mystery.
+      - name: Install herdr
+        shell: bash
+        run: curl -fsSL https://herdr.dev/install.sh | sh
+
+      - name: Record the herdr version
+        shell: bash
+        run: |
+          command -v herdr
+          herdr --version
+
+      # THE JOB PROVES THE JOB. An e2e that quietly passed with herdr missing
+      # would be worse than no e2e at all: it would report coverage it never
+      # had, which is the exact failure this epic was assembled to close. So
+      # assert the suite REFUSES to run without herdr, before running it for
+      # real. If the suite ever starts skipping itself, this step is where that
+      # gets caught — loudly, on the same push, rather than as a false assurance
+      # three months from now.
+      - name: Prove the suite refuses to skip when herdr is absent
+        shell: bash
+        run: |
+          set -uo pipefail
+          if env -u HERDR_BIN_PATH PATH="/usr/bin:/bin" ./tests/e2e/run.sh; then
+            echo "FAIL: tests/e2e/run.sh exited 0 with herdr absent." >&2
+            echo "It must fail loudly instead of skipping, or it is a false assurance." >&2
+            exit 1
+          fi
+          echo "confirmed: the suite exits non-zero when herdr is absent"
+
+      - name: Run the end-to-end suite against a real herdr
+        shell: bash
+        run: ./tests/e2e/run.sh
