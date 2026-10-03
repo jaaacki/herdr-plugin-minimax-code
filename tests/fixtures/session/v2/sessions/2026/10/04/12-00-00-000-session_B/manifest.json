@@ -1,0 +1,11 @@
+{
+  "createdAtMs": 1791040000000,
+  "layout": "v2-final-dated-session",
+  "paths": {
+    "sessionDir": "/tmp/session-B"
+  },
+  "schemaVersion": 1,
+  "sessionId": "mvs_2222222222222222222222222222bbbb",
+  "source": "local-runtime",
+  "updatedAtMs": 1791050000000
+}
