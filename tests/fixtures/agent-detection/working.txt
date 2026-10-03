@@ -1,0 +1,40 @@
+
+  ├ • Ran  Probe explain with different target forms · 15 output lines
+  └ • Thought for 0.0s
+
+  ● pane get and agent list both report minimax-code, but agent get/explain can't find it — a real inconsistency. Let me find where that label actually originates.
+
+  ├ • Ran  Check if mcode ships herdr self-reporting · 18 output lines
+  └ • Thought for 0.0s
+
+  ● No herdr integration in mcode's config, and no Layer-1 state file. The label's origin stays open — I'll return to it. First, the primary instruction: probe mcode acp.
+
+  ├ • Ran  Probe mcode acp with JSON-RPC initialize · 5 output lines
+  └ • Thought for 0.0s
+
+  ● timeout isn't on macOS. Let me write a proper Python probe that can actually read the responses.
+
+  ├ • Wrote (/tmp/acp_probe.py)
+  ├ • Ran  Run the ACP probe against mcode · 12 output lines
+  └ • Thought for 0.0s
+
+  ● Decisive — ACP is emphatically not prompt-only. loadSession: true, sessionCapabilities: {list, fork, resume, close}, live modes and configOptions, plus session/update notifications. Let me now
+    check whether herdr already speaks ACP upstream.
+
+  ├ • Ran  Check whether herdr speaks ACP at all · 7 output lines
+  └ • Thought for 0.0s
+
+  ● The herdr binary contains _INTERACTIVE_PLATFORMS = {"cli", "tui", "desktop", "acp"}. That's a real signal — let me dig into what herdr's ACP support actually is.
+
+  └ • Ran  Enumerate ACP strings in herdr binary · 16 output lines
+
+    ● Ack #37 and gather baseline evidence: mcode --version, --help, herdr agent list
+    ○ Probe `mcode acp` — characterise what it actually exposes (state? lifecycle? prompt-only?)
+    ○ Check whether herdr upstream already ships ACP or mcode support (if so, stop and report)
+    … +4 more · 0/7 done · 6 pending · Ctrl+T expand
+    ⠸ Retrying model request · 1/5 · next in 697ms · Timeout · code 50113 7min7s · ⚡ 26117 tok/s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/herdr-plugin-minimax-code │ ◇ Run proclaude flock inbox command │ ⎇ c2-diagnostic-content-v2 │ Full access │ ✦ M3.1-Flash-Preview · Effort default │ Context 56% left
