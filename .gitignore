@@ -1,0 +1,11 @@
+# herdr plugin config/state — created by `herdr plugin config-dir jaaacki.minimax-code`
+# user-editable files like .env live here and are NOT in the checkout
+.herdr-config/
+.herdr-state/
+
+# macOS
+.DS_Store
+
+# scratch
+*.log
+*.swp
