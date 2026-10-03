@@ -55,6 +55,41 @@ json_field() {
   jq -r "if (${1}|type) == \"string\" then ${1} else empty end" 2>/dev/null || true
 }
 
+# next_agent_name - print the first free name in the sequence mcode, mcode-2,
+# mcode-3, ... and ALWAYS print something: when the agent list cannot be read,
+# or when all ten slots are taken, it falls back to the bare label and lets the
+# rename fail with a truthful message. It never prints nothing and never fails.
+#
+# WHY A SEQUENCE, AND NOT THE PANE ID. The name is what a human types into
+# `herdr agent prompt <name>`, so it has to be predictable and short. A pane id
+# or a hex suffix is unique for free but tells the user nothing, and a name
+# derived from the working directory collides the moment two workspaces share a
+# basename. The bare label the user already knows — `mcode` — is the best first
+# guess; the number exists only to disambiguate a second concurrent instance.
+#
+# The upper bound is a backstop, not a policy: ten concurrent mcode panes is far
+# past any real use, and running out must still leave a usable name.
+#
+# Because this always prints, the caller's empty-name branch is defensive and is
+# NOT reachable today — it is there so that changing this helper's contract to
+# "may fail" cannot silently produce a rename with an empty argument. Do not
+# read it as a tested path; there is no test for it because there is no way to
+# reach it.
+next_agent_name() {
+  local taken candidate n
+  taken="$("$HERDR" agent list 2>/dev/null | jq -r '.result.agents[]? | .name // empty' 2>/dev/null || true)"
+  n=1
+  while [ "$n" -le 10 ]; do
+    if [ "$n" -eq 1 ]; then candidate="${MCODE_BIN_NAME}"; else candidate="${MCODE_BIN_NAME}-${n}"; fi
+    if ! printf '%s\n' "$taken" | grep -qxF -- "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    n=$((n + 1))
+  done
+  printf '%s\n' "${MCODE_BIN_NAME}"
+}
+
 # resolve_mcode - print the absolute path to the launcher binary, or fail.
 resolve_mcode() {
   command -v "$MCODE_BIN_NAME" 2>/dev/null
@@ -230,6 +265,80 @@ cmd_start() {
   fi
 
   log "minimax-code: started ${mcode_bin} in pane ${new_pane}"
+
+  # 7. Register the new pane with Herdr's agent surface, best-effort.
+  #
+  #    Until this, the pane is anonymous to Herdr: it shows in `pane list` with
+  #    agent_status "unknown" and never appears in `herdr agent list`. After
+  #    this, `herdr agent get <PANE_ID>` and `herdr agent read <PANE_ID>
+  #    --source detection` resolve against it.
+  #
+  #    FAILURE POLICY - deliberately the opposite of the split guard above, and
+  #    the asymmetry is intentional. There, an unidentifiable pane means we
+  #    might type into the wrong window, so failing loudly is the safe move.
+  #    Here the launch is already done and the user can see mcode running: the
+  #    thing they asked for succeeded. Exiting non-zero now would report a
+  #    success as a failure and could make a caller retry, spawning a second
+  #    pane. So a failed registration is a warning on stderr and exit 0.
+  #
+  #    DO NOT add a `pane release-agent` call here. Measured on Herdr 0.9.3:
+  #    report-agent makes the entry appear, and release-agent makes it vanish
+  #    again on the next `agent list`. The intent of releasing is to hand
+  #    authority back so screen detection can resume - but Herdr has no screen
+  #    manifest for MiniMax Code, so there is nothing to hand back to, and
+  #    releasing would simply delete the registration this step exists to
+  #    create. The entry is scoped to the pane: it disappears when the pane
+  #    closes, so holding authority leaks nothing. A future state watcher
+  #    (bin/mcode-watch.sh) should keep reporting on this same registration
+  #    rather than re-reporting per state, and should not release either.
+  #
+  #    --state is `idle`, not `working`: the pane was just created and mcode is
+  #    still starting. Claiming work we have not observed is a lie the agent
+  #    surface would then display.
+  #
+  #    --seq is omitted on purpose. Herdr assigns state_change_seq itself (it
+  #    did, 122, on a first report in a live check), so inventing our own
+  #    counter would add a second, competing ordering scheme.
+  #
+  #    --agent-session-id is omitted: mcode does not hand us one at launch, and
+  #    inventing a session id would be worse than reporting none.
+  # 8. Name the agent, so it can be addressed by something a human would type.
+  #
+  #    `report-agent` alone gets the pane into `agent list` and no further: with
+  #    no active name, `herdr agent get`/`read`/`wait` will not resolve it by
+  #    name. `agent rename` is what installs the name, and it only works on an
+  #    already registered agent — which is why this is nested inside the success
+  #    branch of step 7. Renaming a pane that was never registered cannot
+  #    succeed, and trying would turn one root cause into two warnings.
+  #
+  #    WHAT NAMING BUYS, AND WHAT IT DOES NOT — measured on 0.9.3, do not
+  #    "simplify" the messages below into a promise it cannot keep. After a
+  #    successful rename, `agent get`, `agent read` and `agent wait` all resolve
+  #    by name. `agent prompt` and `agent send-keys` still fail with
+  #    `agent_not_ready: not an active named agent`, and no amount of renaming
+  #    changes that: only `herdr agent start --kind` mints an *active* agent, and
+  #    that closed 22-value enum has no `minimax-code` member. So a self-reported
+  #    agent is named but never active. That is an upstream ceiling, tracked in
+  #    issue #37, not a step we are one rename away from. The warning text says
+  #    so explicitly, because a user told only "it is unnamed" will spend an
+  #    afternoon renaming it and get nowhere.
+  #
+  #    Same best-effort policy as step 7, for the same reason: the launch is
+  #    already done. A pane that is registered but unnamed is still better than
+  #    one that is invisible, so a failure here is a warning and exit 0 — and the
+  #    warning says exactly which commands are lost, because "it half worked"
+  #    with no consequence spelled out is how this gets misdiagnosed later.
+  if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
+    local agent_name
+    agent_name=$(next_agent_name)
+    if [ -z "$agent_name" ]; then
+      log "minimax-code: could not work out a free name for pane ${new_pane}, so it stays registered but unnamed. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will not work for it either way on Herdr 0.9.3 (agent_not_ready) — those need an agent Herdr itself started. Naming it later would not change that."
+    elif ! "$HERDR" agent rename "$new_pane" "$agent_name"; then
+      log "minimax-code: pane ${new_pane} is registered but could not be renamed, so it has no active name. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will not work for it either way on Herdr 0.9.3 (agent_not_ready) — those need an agent Herdr itself started. Renaming it later would not change that. The launch itself succeeded."
+    fi
+  else
+    log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`, could not be named, and \`herdr agent prompt\`/\`send-keys\` will not work for it. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."
+  fi
 }
 
 main() {

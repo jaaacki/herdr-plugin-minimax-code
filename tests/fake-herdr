@@ -227,12 +227,28 @@ emit_split() { # emit_split
   fi
 }
 
+emit_agent_list() { # emit_agent_list
+  # The entrypoint calls `agent list` only to learn which agent names are already
+  # taken, and reads nothing else from it. There is no captured fixture for this
+  # verb, so the shape is the minimum that can answer that question and is
+  # labelled here rather than dressed up as a capture.
+  if has_fault agent-names-taken; then
+    announce_fault agent-names-taken "reporting mcode and mcode-2 as already named"
+    printf '%s\n' '{"result":{"agents":[{"agent":"mcode","name":"mcode","pane_id":"wZ:p9"},{"agent":"mcode","name":"mcode-2","pane_id":"wZ:p7"}],"type":"agent_list"}}'
+  else
+    printf '%s\n' '{"result":{"agents":[],"type":"agent_list"}}'
+  fi
+}
+
 if [ "${1:-}" = "--self-check" ]; then
   printf 'pane-get\t%s\n'     "$(emit_pane_info pane-get)"
   printf 'pane-current\t%s\n' "$(emit_pane_info pane-current)"
   printf 'pane-split\t%s\n'   "$(jq -c '.' "$(fixture_path pane-split)")"
   # Not a capture, and never parsed by the entrypoint. Labelled, not disguised.
   printf 'pane-run\t%s\n'     '{"result":{"ok":true}}'
+  printf 'pane-report-agent\t%s\n' '{"result":{"ok":true}}'
+  printf 'agent-list\t%s\n'   '{"result":{"agents":[],"type":"agent_list"}}'
+  printf 'agent-rename\t%s\n' '{"result":{"agent":{"agent":"mcode","name":"mcode"},"type":"agent_renamed"}}'
   exit 0
 fi
 
@@ -250,6 +266,25 @@ case "$sub" in
     # The entrypoint checks this call's exit status only and never reads its
     # body, so there is no captured shape to be faithful to here.
     printf '%s\n' '{"result":{"ok":true}}'
+    ;;
+  "pane report-agent")
+    # Same as `pane run`: exit status only, body never parsed. The
+    # report-agent-unsupported fault models an older Herdr that has no such
+    # verb at all, which is a different failure from a verb that errors.
+    if has_fault report-agent-unsupported; then
+      announce_fault report-agent-unsupported "behaving as a Herdr with no report-agent verb"
+      printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-}" >&2
+      exit 64
+    fi
+    printf '%s\n' '{"result":{"ok":true}}'
+    ;;
+  "agent list")
+    emit_agent_list
+    ;;
+  "agent rename")
+    # Also exit-status only. The name the entrypoint chose is in the log, which
+    # is what the tests assert on.
+    printf '%s\n' '{"result":{"agent":{"agent":"mcode","name":"mcode"},"type":"agent_renamed"}}'
     ;;
   *)
     printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-<none>} ${2:-}" >&2
