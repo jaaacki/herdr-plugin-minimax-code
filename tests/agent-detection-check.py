@@ -110,14 +110,52 @@ def observed_state(text):
     return max(fired, key=lambda r: r.get("priority", 0)).get("state")
 
 
-with open(manifest_path, "rb") as fh:
-    doc = tomllib.load(fh)
+try:
+    with open(manifest_path, "rb") as fh:
+        doc = tomllib.load(fh)
+except FileNotFoundError:
+    print(f"FAIL  preflight: the manifest under test {manifest_path} is missing")
+    sys.exit(2)
+except tomllib.TOMLDecodeError as exc:
+    # "Does it parse as TOML" is case 1, so a parse failure is a verdict on the
+    # manifest rather than a crash. Left to raise, it printed a raw traceback:
+    # the same "a clear requirement became a stack trace" fault the reference
+    # preflight above exists to fix, one level up. Exit 2, like the other
+    # preflights, because cases 2 and 3 cannot run without a parsed document.
+    print("FAIL  schema-matches-the-shipped-manifests")
+    print(f"        {manifest_path} is not valid TOML: {exc}")
+    sys.exit(2)
 
 if not os.path.exists(REF):
     print(f"FAIL  preflight: the vendored reference manifest {REF} is missing")
     print("        the schema case derives the allowed keys from a real herdr manifest;")
     print("        falling back to a remembered key set is the failure this check catches")
     sys.exit(2)
+
+# Every capture the checks below read. Held in one place so the precondition, the
+# evidence table and case 3 cannot drift apart.
+#
+# The preflight is the point of this block. Case 3 used to `continue` past a
+# capture that was not on disk, which meant deleting `not-mcode.txt` left this
+# suite reporting "3 case(s), all passed" while no longer checking that our rules
+# stay quiet on a pane that is not mcode at all. A suite that quietly stops
+# reading evidence is worse than one that fails: it reports the same green while
+# testing less, which is the exact failure this epic exists to end.
+CAPTURES = (
+    "working.txt",
+    "idle.txt",
+    "idle-after-working.txt",
+    "not-mcode.txt",
+    "stale-scrollback.txt",
+)
+missing = [c for c in CAPTURES if not os.path.exists(os.path.join(fix_dir, c))]
+if missing:
+    print(f"FAIL  preflight: captures missing from {fix_dir}: {', '.join(missing)}")
+    print("        every capture the checks read must be in the repository. A rule with")
+    print("        no capture is not shippable, and a capture that is silently skipped")
+    print("        is worse than a red suite, because the suite still reports green.")
+    sys.exit(2)
+
 ref_text = open(REF, encoding="utf-8").read()
 
 
@@ -241,11 +279,12 @@ else:
 # throughput counter. Fixtures that show the other states must not trigger it.
 crossed = []
 for r in doc["rules"]:
-    for fixture in ("working.txt", "idle.txt", "idle-after-working.txt",
-                    "not-mcode.txt", "stale-scrollback.txt"):
+    for fixture in CAPTURES:
+        # No `continue` for a file that is not there. The preflight above has
+        # already refused to start unless every capture is present, so reaching
+        # this line means the file exists; the old guard made a deleted capture
+        # indistinguishable from a capture with nothing to report.
         path = os.path.join(fix_dir, fixture)
-        if not os.path.exists(path):
-            continue
         want_fixture, want_state = EXPECTED.get(r["id"], (None, None))
         if fixture == want_fixture:
             continue          # its own evidence: firing is the point
