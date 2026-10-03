@@ -20,7 +20,7 @@ id = "minimax-code-status"
 title = "MiniMax Code agent status"
 description = "List detected MiniMax Code agents and their state"
 contexts = ["global", "workspace", "tab", "pane"]
-command = ["${HERDR_PLUGIN_DIR}/bin/mcode-plugin.sh", "status"]
+command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "status"]
 
 # Event hooks fire on herdr events. Unknown names are non-fatal: herdr keeps the
 # plugin and surfaces a warning through `herdr plugin list --json`.
@@ -28,4 +28,4 @@ command = ["${HERDR_PLUGIN_DIR}/bin/mcode-plugin.sh", "status"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["${HERDR_PLUGIN_DIR}/bin/mcode-plugin.sh", "on-status-change"]
+command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "on-status-change"]
