@@ -106,4 +106,6 @@ tracks the v0.2.0 work; `dev` is the integration branch and `main` is released f
 be green on both CI legs before merge.
 
 Worktrees are created **only** via `flock worktree add --repo <path> --issue <n>` — never by hand,
-because cleanup trusts the recorded ownership.
+because cleanup trusts the recorded ownership. **It branches from `main`, not `dev`** — members
+have hit this and reviewed a stale tree before noticing. Always
+`git fetch origin && git reset --hard origin/dev` before reviewing or testing anything.
