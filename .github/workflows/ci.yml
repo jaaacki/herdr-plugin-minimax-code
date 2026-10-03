@@ -1,0 +1,61 @@
+name: CI
+
+# The plugin declares platforms = ["linux", "macos"] in herdr-plugin.toml.
+# Both are exercised here so that claim rests on a pipeline, not on a local run.
+#
+# `dev` is included alongside `main` because the epic's PRs target `dev`
+# (see CLAUDE.md git flow and the issue Flow sections). Triggering on `main`
+# alone would mean no PR in this epic ever runs CI, and the "pipeline green on
+# both platforms" acceptance criterion would be unverifiable until the first
+# merge to `main`. Deviation from the issue text is deliberate — flagged to the
+# architect in the PR body.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both platforms even if one fails; a macOS-only failure is still
+      # information when the plugin ships on linux too.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Issue B's cmd_start parses herdr's JSON with jq. Assert it explicitly
+      # rather than assuming: both hosted runners ship it today, but a runner
+      # image change should fail loudly here instead of turning into a
+      # confusing parse error inside the test suite.
+      - name: Assert jq is present
+        shell: bash
+        run: |
+          command -v jq
+          jq --version
+
+      - name: Syntax-check the plugin entrypoint
+        shell: bash
+        run: bash -n bin/mcode-plugin.sh
+
+      # Stage 2, deferred until issue C2 lands: add the test suite to this same
+      # workflow. Do not create a second workflow file.
+      #   - name: Run the test suite
+      #     shell: bash
+      #     run: ./tests/run.sh
