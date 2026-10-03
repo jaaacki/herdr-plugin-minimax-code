@@ -32,6 +32,28 @@ jobs:
           # that was tagged, not whatever the default branch points at now.
           fetch-depth: 0
 
+      - name: "Guard: the tagged commit must already be on main"
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # This workflow fires on any v* tag, from any branch. A release cut from
+          # a feature branch would be indistinguishable from a real one to anyone
+          # who installs from it, so refuse to publish unreleased work.
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+
+          if ! git merge-base --is-ancestor "${VERSION}" origin/main; then
+            echo "REFUSING TO PUBLISH: tag ${VERSION} is not reachable from origin/main." >&2
+            echo "A release must ship a commit that is already on main." >&2
+            echo "Merge the commit to main first, or cut the tag from main." >&2
+            echo "--- commits in the tag but not on main ---" >&2
+            git log --oneline "origin/main..${VERSION}" >&2 || true
+            exit 1
+          fi
+
+          echo "OK: ${VERSION} is reachable from origin/main."
+
       - name: Build the tarball with git archive
         id: build
         shell: bash
@@ -141,17 +163,35 @@ jobs:
 
           ## Verify what you downloaded
 
+          A \`sha256.txt\` asset is attached next to the tarball. Check it with:
+
+          \`\`\`sh
+          sha256sum -c sha256.txt
           \`\`\`
-          sha256sum herdr-plugin-minimax-code-${VERSION}.tar.gz
-          ${sha}
+
+          That should print \`herdr-plugin-minimax-code-${VERSION}.tar.gz: OK\`. If you
+          would rather compare by hand, the expected line is exactly:
+
+          \`\`\`
+          ${sha}  herdr-plugin-minimax-code-${VERSION}.tar.gz
           \`\`\`
 
           ## Install from the tarball
 
+          The archive puts files at its **root** — there is no versioned top-level
+          directory — so the manifest sits directly in whatever directory you extract
+          into. Extract into a directory of its own so you link the plugin and not
+          your current working directory:
+
           \`\`\`sh
-          tar -xzf herdr-plugin-minimax-code-${VERSION}.tar.gz
-          herdr plugin link ./  # from the extracted directory
+          mkdir -p ./minimax-code-plugin
+          tar -xzf herdr-plugin-minimax-code-${VERSION}.tar.gz -C ./minimax-code-plugin
+          herdr plugin link ./minimax-code-plugin
           \`\`\`
+
+          If you already have a copy of this plugin linked, unlink it first with
+          \`herdr plugin unlink jaaacki.minimax-code\`; Herdr will not register a
+          second copy over an existing one.
 
           Then invoke the action from the Herdr action menu, or:
 
