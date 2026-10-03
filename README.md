@@ -62,8 +62,6 @@ Pane `placement` is `overlay`, `popup`, `split`, `tab` or `zoomed`.
 ./tests/run.sh
 ```
 
-<!-- TODO(architect): confirm this is the command that passes once #C2 merges -->
-
 ## License
 
 [MIT](LICENSE) — Copyright (c) 2026 `jaaacki`.
