@@ -18,9 +18,41 @@ Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
 | `idle-after-working.txt` | `herdr pane read wZ:p1A --source detection --lines 40` | `wZ:p1A` | a turn that has finished — the composer |
 | `stale-scrollback.txt` | **constructed**, see below | — | finished work still in the scrollback |
 | `not-mcode.txt` | `herdr pane read wZ:p1 --source detection --lines 40` | `wZ:p1` | a `claude` pane, not mcode at all |
+| `reference-claude.toml` | **copied** from herdr's manifest cache, see below | — | a real herdr manifest; the specification our keys are checked against |
 
 `wZ:p1A` was created for this work and closed after capture. `wZ:p5` and `wZ:p1` belong
 to other flock members; only their screens were read, never their state.
+
+## `reference-claude.toml` is a different kind of fixture
+
+The five `.txt` files are captures *we* took. `reference-claude.toml` is a copy of a
+manifest **herdr ships**, and it is the only file in this directory that is not
+evidence for a rule — it is the spec the rules are measured against.
+
+It is vendored rather than read from disk because the first version of the checker
+read it from `/Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml`.
+That path exists on exactly one machine, so the suite passed here and failed on both
+CI legs with a `FileNotFoundError` naming somebody's home directory.
+
+| | |
+|---|---|
+| source | `/Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml` |
+| sha256 | `038d0aa23fee3f9b39cb3c9ca117d0f95b0b3a5873cf0f38284ccbac279c9664` |
+| herdr | 0.9.3 |
+| captured | 2026-10-04 07:11 +0800 |
+| declares | `version = "2026.09.11.1"`, `updated_at = "2026-09-11T00:00:00Z"` |
+
+It is a **trimmed** copy: herdr's `claude.toml` has 16 rules, this keeps 4. The
+top-level block and all 4 kept rules are byte-identical to the source, comments
+included. The 4 were chosen because the union of their keys is the union of the keys
+over **all 16 of herdr's rules and all 22 manifests in that cache** — the same 14 —
+so nothing is lost by the cut. The file's own header carries that measurement, the
+command to re-derive it, and the reason a wrong trim here fails red rather than
+green.
+
+`tests/agent-detection-check.py` **derives** the allowed key set from this file. It
+used to load it and then compare against a hand-copied constant list, which is the
+same check with the reference bolted on decoratively.
 
 ## The lines the rules match
 
