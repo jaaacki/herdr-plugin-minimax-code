@@ -174,7 +174,39 @@ run_case_bootstrap() {
   pass "$name"
 }
 
-# ── helpers over the live session ───────────────────────────────────────────
+# ── the stub launcher ───────────────────────────────────────────────────────
+# A stub `mcode`. The action resolves the launcher with `command -v` and types
+# its absolute path into the new pane, so a stub on PATH is enough to exercise
+# the plugin's plumbing. What is under test is whether a plugin-launched pane
+# becomes a registered agent — not whether mcode's TUI works.
+#
+# THE PATH EXPORT MUST HAPPEN BEFORE THE SERVER STARTS, and that ordering is the
+# whole reason this function exists separately. The action is spawned by the
+# herdr SERVER, which inherits the environment it was started with — not the one
+# the suite has at the moment it invokes the action. Exporting the stub after
+# the server is already running leaves the action without it, and the action
+# then dies at `command -v mcode`.
+#
+# This is not hypothetical: it is exactly how this suite failed on its first CI
+# run, on both legs, while passing on a developer machine. The developer machine
+# had a REAL mcode on the ambient PATH, so the missing stub was invisible; the
+# runner had no mcode at all, so the omission became the whole failure. Only a
+# real CI run against a real herdr could surface it — which is the argument for
+# this job existing.
+prepare_stub_mcode() {
+  mkdir -p "$WORKDIR/bin"
+  cat > "$WORKDIR/bin/$AGENT_LABEL" <<STUB
+#!/bin/sh
+# Stand-in for the real launcher. Kept alive so the pane does not exit: herdr
+# drops a pane's agent registration when the pane's process ends, and a pane
+# whose shell exits would take the registration with it.
+printf 'mcode (e2e stub) %s\n' "\$*"
+exec sleep 300
+STUB
+  chmod +x "$WORKDIR/bin/$AGENT_LABEL"
+  PATH="$WORKDIR/bin:$PATH"
+  export PATH
+}
 pane_ids() {
   "$HERDR" --session "$SESSION" pane list 2>/dev/null \
     | jq -r '.result.panes[]?.pane_id' 2>/dev/null
@@ -185,26 +217,31 @@ agent_row() { # $1 = pane id
     | jq -c --arg p "$1" '.result.agents[]? | select(.pane_id == $p)' 2>/dev/null
 }
 
+# The most recent plugin command record, reduced to the fields that explain a
+# failure: status, exit code, and whatever the command wrote to stderr.
+#
+# Two shapes that are easy to get wrong, and were: `plugin log list` takes NO
+# --json flag (it is rejected; the command already answers JSON), and each
+# record's `action_id` is the BARE id — `minimax-code-start`, not the fully
+# qualified `jaaacki.minimax-code.minimax-code-start` used to invoke it. Filtering
+# on the qualified name matches nothing and yields an empty report, which reads
+# as "no log record" and hides the very failure it was added to explain.
+action_log_tail() {
+  local out
+  out="$("$HERDR" --session "$SESSION" plugin log list --plugin "$PLUGIN_ID" 2>/dev/null)"
+  printf '%s' "$out" | jq -r \
+    '[.result.logs[]? | select(.action_id == "minimax-code-start")] | last
+     | if . == null then "no log record for the action"
+       else "status=\(.status) exit=\(.exit_code // "-") stderr=\((.stderr // "") | gsub("\\s+"; " ") | .[0:200])"
+       end' 2>/dev/null || echo "log unavailable or unparseable"
+}
+
 # ── case 2: the real action launches a real pane ─────────────────────────────
 # The action is ASYNCHRONOUS. `plugin action invoke` returns a log record with
 # status "running" and no pane. Asserting immediately reads a false negative —
 # I hit this while writing the suite, so the wait is not optional.
 run_case_launch() {
   local name="launch: the real action creates a pane"
-
-  # A stub `mcode`. The action resolves the launcher with `command -v` and types
-  # its absolute path into the new pane, so a stub on PATH is enough to exercise
-  # the plugin's plumbing. What is under test is whether a plugin-launched pane
-  # becomes a registered agent — not whether mcode's TUI works.
-  mkdir -p "$WORKDIR/bin"
-  cat > "$WORKDIR/bin/$AGENT_LABEL" <<STUB
-#!/bin/sh
-# Stand-in for the real launcher; see run_case_launch.
-printf 'mcode (e2e stub) %s\n' "\$*"
-exec sleep 300
-STUB
-  chmod +x "$WORKDIR/bin/$AGENT_LABEL"
-  export PATH="$WORKDIR/bin:$PATH"
 
   BEFORE="$(pane_ids | wc -l | tr -d ' ')"
   pane_ids | sort > "$WORKDIR/panes.before"
@@ -222,8 +259,15 @@ STUB
     sleep 0.5
   done
   if [ "$after" -le "$BEFORE" ]; then
+    # "No pane appeared" names a symptom, not a cause. The action runs
+    # asynchronously, so a failure inside it is invisible from here unless the
+    # plugin's own command log is read. Without this, a launcher that died with
+    # "mcode not found" and a multiplexer that refused to split look identical
+    # — and the first CI run proved that guess costs a whole debugging round
+    # trip.
     fail "$name" "no pane appeared within 30s of invoking the action" \
-      "the action is asynchronous; see the comment above"
+      "the action is asynchronous; see the comment above" \
+      "action log: $(action_log_tail)"
     return
   fi
 
@@ -410,6 +454,11 @@ LINKED_BY_US=1
 # exist. Cheap to assert here and it catches a dead hook the moment one lands.
 WARNINGS="$("$HERDR" plugin list --json 2>/dev/null \
   | jq -c --arg id "$PLUGIN_ID" '.result.plugins[]? | select(.plugin_id == $id) | (.warnings // [])' 2>/dev/null)"
+
+# The stub launcher MUST be on PATH before the server starts: the action is
+# spawned by the server and inherits the server's environment, not this
+# script's. See prepare_stub_mcode for what that cost on the first CI run.
+prepare_stub_mcode
 
 run_case_bootstrap
 run_case_launch
