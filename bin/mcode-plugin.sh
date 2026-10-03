@@ -127,6 +127,72 @@ resolve_source_pane() {
   printf '%s\n' "$pane"
 }
 
+# WHY THIS PRINTS A COMMAND INSTEAD OF STARTING THE WATCHER (issue #47).
+#
+# Issue #47 asked for `bin/mcode-watch.sh <pane>` to be running after every
+# launch, and explicitly invited the alternative. The alternative won, on
+# evidence, not on effort:
+#
+#   1. The watcher's own exit path deletes the thing we just created.
+#      mcode-watch.sh calls `pane release-agent` from its INT/TERM/EXIT traps
+#      and when the watched pane dies, and `release-agent` REMOVES the agent
+#      entry - measured and reproduced live (register + rename, run one
+#      `mcode-watch.sh --once`, and the entry is gone from `agent list`).
+#      Auto-starting it would unregister every pane it watched the moment that
+#      pane closed or the operator hit Ctrl-C. That is worse than the stale
+#      `idle` claim, because a missing registration also costs `get`, `read`,
+#      `wait` and the name. The defect is in bin/mcode-watch.sh, not here, so
+#      wiring the watcher before that is fixed means shipping a known bug and
+#      calling it a feature.
+#
+#   2. A detached watcher has no honest way to learn that Herdr exited. The
+#      foreground design was precisely the answer to that: a watcher the human
+#      can see, and stop with Ctrl-C. Backgrounding it means inventing a
+#      supervisor - PID bookkeeping, reaping, an orphan sweep - to answer a
+#      question the foreground form already answers for free. That is a much
+#      larger change than this issue, in a file this member does not own.
+#
+#   3. The actual harm #47 names - "the agent claims `idle` forever while it is
+#      working" - is fixed by the `--state unknown` change at the report-agent
+#      call, not by the watcher. With `unknown` there is no stale lie to
+#      prevent, so the missing watcher costs accuracy the user has to opt into,
+#      rather than accuracy the user was given and can trust.
+#
+# So the watcher stays opt-in and discoverable: one line, on stderr, next to
+# the line that already says the pane started. The same failure policy as
+# registration applies - a hint that cannot be produced is a warning, and the
+# launch still exits 0, because the launch is what the user asked for and it
+# already worked.
+watcher_hint() { # watcher_hint <pane-id>
+  # One line telling the operator how to make state tracking real for a pane
+  # this plugin just launched. Printed, never run - see WHY above.
+  local pane="$1"
+  local dir watcher
+  # Resolved from this script's own directory, NOT $HERDR_PLUGIN_ROOT: the env
+  # var is only injected when Herdr runs the action, so a hand-run of the
+  # entrypoint would print a path built from an empty string.
+  #
+  # `..` because this file IS the plugin's bin/mcode-plugin.sh, so its own
+  # directory is the `bin/` directory and the watcher sits one level up.
+  # Getting this wrong yields <root>/bin/bin/mcode-watch.sh - a path short
+  # enough to look right, and `-x`-false, which is how the bug would have shown
+  # up: a permanently unresolvable hint and a warning on every launch. `pwd -P`
+  # collapses the `..` and resolves symlinks, so the path a user copies is the
+  # path that actually exists.
+  #
+  # `|| true` matters under `set -e`: a failing `cd` inside this command
+  # substitution would otherwise abort the launch *after* it had already
+  # succeeded, converting a cosmetic hint into a failed action. An unresolved
+  # dir leaves the watcher unrunnable, which the branch below reports honestly.
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
+  watcher="${dir}/bin/mcode-watch.sh"
+  if [ -x "$watcher" ]; then
+    log "minimax-code: state for pane ${pane} is not tracked (reported as unknown). To report idle/working, run: ${watcher} ${pane}"
+  else
+    log "minimax-code: could not point at the state watcher - ${watcher} is missing or not executable - so pane ${pane} will stay 'unknown' in \`herdr agent list\`. The launch itself succeeded."
+  fi
+}
+
 cmd_start() {
   # 1. Preflight. jq parses the CLI's JSON output; without it a missing parser
   #    would surface as a confusing parse error instead of a real diagnostic.
@@ -292,9 +358,29 @@ cmd_start() {
   #    (bin/mcode-watch.sh) should keep reporting on this same registration
   #    rather than re-reporting per state, and should not release either.
   #
-  #    --state is `idle`, not `working`: the pane was just created and mcode is
-  #    still starting. Claiming work we have not observed is a lie the agent
-  #    surface would then display.
+  #    --source namespace. Must match the other two reporters, and follows herdr's
+  #    own `herdr:<agent>` convention (see the Claude integration hook). herdr uses
+  #    this to tell reporters apart; three different values for one agent defeats
+  #    it. The siblings are bin/mcode-session.sh and bin/mcode-watch.sh; the three
+  #    are one change and must land together.
+  #
+  #    --state is `unknown`, and that is the point of the change. An earlier
+  #    revision claimed `idle` here, on the reasoning that the pane was just
+  #    created and mcode was still starting. But nothing in the plugin ever
+  #    updates that claim, so it was not a cautious placeholder - it was a
+  #    permanent false one. Measured on 0.9.3: a pane registered `idle` here
+  #    still read `idle` twenty-five seconds later with the MiniMax Code TUI up
+  #    and visibly working, and `herdr agent list` would have shown the lie for
+  #    as long as the pane lived. `unknown` is the only state this process can
+  #    keep true, and it is what Herdr shows for a pane nobody has registered.
+  #
+  #    The fix is deliberately NOT "start the watcher so that `idle` becomes
+  #    true" (issue #47). bin/mcode-watch.sh calls `pane release-agent` from its
+  #    INT/TERM/EXIT traps and when the watched pane dies, and `release-agent`
+  #    DELETES the agent entry - measured, reproduced live. Auto-starting the
+  #    watcher would therefore unregister every pane it watched, trading a stale
+  #    state for no state at all, and that defect is not in this file. See
+  #    watcher_hint below for what is offered instead.
   #
   #    --seq is omitted on purpose. Herdr assigns state_change_seq itself (it
   #    did, 122, on a first report in a live check), so inventing our own
@@ -328,7 +414,7 @@ cmd_start() {
   #    one that is invisible, so a failure here is a warning and exit 0 — and the
   #    warning says exactly which commands are lost, because "it half worked"
   #    with no consequence spelled out is how this gets misdiagnosed later.
-  if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
+  if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state unknown; then
     local agent_name
     agent_name=$(next_agent_name)
     if [ -z "$agent_name" ]; then
@@ -339,6 +425,14 @@ cmd_start() {
   else
     log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`, could not be named, and \`herdr agent prompt\`/\`send-keys\` will not work for it. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."
   fi
+
+  # 9. Tell the operator how to turn state tracking on, if they want it.
+  #
+  #    Unconditional, and deliberately so: the hint is most useful when
+  #    registration FAILED, because running the watcher re-reports the pane and
+  #    recreates the entry. Suppressing it on the error path would hide the one
+  #    situation where it is worth most.
+  watcher_hint "$new_pane"
 }
 
 main() {
