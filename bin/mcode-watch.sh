@@ -69,37 +69,42 @@ esac
 # Markers are matched with a fixed-string grep, not a regex, because they
 # contain characters that are regex metacharacters in some spellings.
 
-# Markers that only appear while mcode is doing something. Any one is decisive.
+# THE RULES
+# ---------
+# A flat "state|marker" table, deliberately data rather than code. The manifest
+# cannot load MiniMax Code today, so these rules live in bash; keeping them in one
+# declarative table means they can be lifted verbatim into a herdr screen manifest
+# later without the classification being rewritten.
 #
-# Each was checked against all three captured snapshots, not just the working one.
-# Two candidates were REJECTED on that evidence:
+# Every marker was checked against every captured snapshot in
+# tests/fixtures/detection/, not just the one it was read from. Three candidates
+# were REJECTED on that evidence:
 #
-#   "tok/s"  appears in the post-turn snapshot too, inside
-#            "Completed in 3s - 667 tok/s" - a turn that has already finished.
-#            Using it would report a finished session as working.
-#   "Ask Mcode to do anything" is the input placeholder, present in every
-#            snapshot including idle. Present everywhere means it discriminates
-#            nothing.
+#   tok/s   appears inside "Completed in 3s - 667 tok/s", a turn that has
+#           already FINISHED. As a working marker it would report every
+#           completed session as working.
+#   Ask Mcode to do anything
+#           the input placeholder; present in every snapshot, so it
+#           discriminates nothing.
+#   Esc     on its own. mcode's own changelog prose contains "pressing Esc on an
+#           empty Composer", so a bare "Esc" matches a captured IDLE screen.
+#           Markers must be phrases.
 #
-# These are not iterated in a loop; see classify() for why that matters.
-WORKING_MARKERS='Esc stop
-Ctrl+O details
-Ctrl+T expand'
-
-# The braille spinner frames mcode cycles while busy.
-SPINNER='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠭⠫'
-
-# Markers that only appear while mcode is NOT working. There are two distinct
-# resting shapes, and both are idle - a watcher that only knew the first would
-# report `unknown` for every ordinary session that has completed a turn, which
-# is most of the time:
+# Order matters: working is tested before idle. mcode has THREE resting shapes,
+# not two - a fresh session ("Start - @"), a finished turn ("Completed in"), and
+# mid-flight. A finished turn is idle and is the common case; a watcher keyed only
+# on the fresh-session shape reports unknown for nearly every session.
 #
-#   fresh session  "Start - @ file or Plugin", "● Ready"
-#   after a turn   "Completed in 3s", "Message - Enter send" (the composer)
-IDLE_MARKERS='Start · @
-● Ready
-Completed in
-Message · Enter send'
+# These are never word-split on whitespace: each line is read whole and split on
+# '|' only. That is what caused the "Esc" bug documented in classify().
+RULES='working|Esc stop
+working|Ctrl+O details
+working|Ctrl+T expand
+working|⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠭⠫
+idle|Start · @
+idle|● Ready
+idle|Completed in
+idle|Message · Enter send'
 
 has_marker() { # has_marker <text> <marker>
   printf '%s\n' "$1" | grep -qF -- "$2"
@@ -117,11 +122,11 @@ snapshot_tail() { # snapshot_tail <snapshot>
 
 # classify SNAPSHOT -> working|idle|unknown
 #
-# Each check is written out longhand rather than looped over a newline-separated
-# list. A loop would word-split on spaces and turn "Esc stop" into two markers,
-# "Esc" and "stop" - and "Esc" occurs in mcode's own changelog prose, which would
-# classify an idle session as working. That is not hypothetical: it is exactly
-# what the first version of this function did, and what caught it.
+# The rule table is read one whole line at a time and split on '|' only. An
+# earlier version looped over a whitespace-separated list, which split "Esc stop"
+# into "Esc" and "stop" - and mcode's own changelog prose contains the word "Esc",
+# so a captured IDLE screen was classified working. Not hypothetical: that is
+# exactly what happened, and the idle case caught it.
 classify() {
   local snap
   snap="$(snapshot_tail "$1")"
@@ -135,21 +140,18 @@ classify() {
     return 0
   fi
 
-  if has_marker "$snap" "Esc stop"        ||
-     has_marker "$snap" "Ctrl+O details"  ||
-     has_marker "$snap" "Ctrl+T expand"   ||
-     has_marker "$snap" "$SPINNER"; then
-    printf 'working\n'
-    return 0
-  fi
-
-  if has_marker "$snap" "Start · @"           ||
-     has_marker "$snap" "● Ready"             ||
-     has_marker "$snap" "Completed in"        ||
-     has_marker "$snap" "Message · Enter send"; then
-    printf 'idle\n'
-    return 0
-  fi
+  local line state marker
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    state="${line%%|*}"
+    marker="${line#*|}"
+    if has_marker "$snap" "$marker"; then
+      printf '%s\n' "$state"
+      return 0
+    fi
+  done <<EOF
+$RULES
+EOF
 
   # Nothing matched. `blocked` is deliberately not guessed here - see BLOCKED.
   printf 'unknown\n'
