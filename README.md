@@ -66,6 +66,38 @@ pane, so the failure is silent by default. Check it with:
 herdr plugin log list --plugin jaaacki.minimax-code
 ```
 
+## Reporting state (optional)
+
+Herdr shows an agent's `idle` / `working` state per pane. Nothing here reports
+MiniMax Code's state by default, so a pane running `mcode` shows no state at all.
+
+If you want that, run the watcher in a pane of your choice:
+
+```bash
+bin/mcode-watch.sh <PANE_ID>
+```
+
+`<PANE_ID>` is the pane running `mcode` — find it with `herdr pane list`. It reads
+that pane's screen every two seconds, works out whether `mcode` is busy or resting,
+and tells Herdr **only when the answer changes**. An unchanged screen produces no
+traffic at all, so this is not a chatty poller.
+
+Things worth knowing:
+
+- **It is a foreground process.** Stop it with `Ctrl-C`, or by closing the pane you
+  ran it in. It is deliberately *not* started for you: a detached watcher per pane
+  would be an orphan if Herdr died, whereas a foreground job cannot outlive its pane.
+- **It reports `idle` and `working`, and `unknown` — never `blocked`.** `blocked`
+  means Herdr saw an approval prompt, and no such screen has been captured, because
+  `mcode` 0.6.2 runs at `Full access` where no prompt appears. That gap is
+  deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
+  session's permission mode with `/permission` and a prompt becomes reachable, at
+  which point the rule can be written from real evidence.
+- **It stops when the pane it watches disappears**, and hands lifecycle authority
+  back with `release-agent` so Herdr's own screen detection can resume.
+- Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
+  a real captured screen; the comments record which candidates were rejected and why.
+
 ## What it exposes
 
 | Trigger | Menu title | Kind | Does |

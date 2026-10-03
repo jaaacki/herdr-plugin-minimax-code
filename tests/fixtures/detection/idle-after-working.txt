@@ -1,0 +1,29 @@
+                                                    ██╔████╔██║██║██╔██╗ ██║██║██╔████╔██║███████║ ╚███╔╝     ██║     ██║   ██║██║  ██║█████╗
+                                                    ██║╚██╔╝██║██║██║╚██╗██║██║██║╚██╔╝██║██╔══██║ ██╔██╗     ██║     ██║   ██║██║  ██║██╔══╝
+                                                    ██║ ╚═╝ ██║██║██║ ╚████║██║██║ ╚═╝ ██║██║  ██║██╔╝ ██╗    ╚██████╗╚██████╔╝██████╔╝███████╗
+                                                    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝     ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
+
+  ╭─ v0.6.2 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ Tips for getting started                                                                                                                                                                     │
+  │ › Run /init to teach MCode this repo.                                                                                                                                                        │
+  │ › Use /feedback to preview a redacted report before upload.                                                                                                                                  │
+  │ › Say what you want and how to verify it.                                                                                                                                                    │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ What's new · /changelog for history                                                                                                                                                          │
+  │ › In a /btw side session, pressing Esc on an empty Composer no longer suggests editing the latest message; /edit is unavailable there.                                                       │
+  │ › Switching between a side session and the main conversation no longer resets the main run's Running/Loading timer to zero.                                                                  │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   › reply with the single word ok
+
+
+  ● ok
+
+    └ Completed in 3s · ⚡ 667 tok/s
+
+    Message · Enter send · Shift+Enter newline                                                                                           Tip: /goal keeps multi-step work focused on a finish line
+    ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/herdr-plugin-minimax-code │ ◇ Reply with single word ok │ ⎇ dev │ Full access │ ✦ M3.1-Flash-Preview · Effort default │ Context 96% left
