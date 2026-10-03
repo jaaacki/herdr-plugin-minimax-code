@@ -7,10 +7,20 @@ platforms = ["linux", "macos"]
 
 # Actions appear in Herdr's action menu for the given contexts.
 #   global | workspace | tab | pane | selection
+#
+# DO NOT "simplify" the `command` array below back to a direct path. Herdr does
+# NOT expand ${...} inside a manifest `command` array: the array is exec'd as
+# argv, and because the path contains a "/" the OS treats it as a relative path
+# against the *invoking pane's cwd*, hunting for a literal directory named
+# ${HERDR_PLUGIN_ROOT}. That directory does not exist -> ENOENT, silently, on
+# every run. HERDR_PLUGIN_ROOT *is* set in the action's environment; the
+# manifest simply has no way to interpolate it. Only a shell can, hence
+# /bin/sh -c. The \" escaping below is required: a \$ escape is invalid TOML
+# and fails the same way.
 
 [[actions]]
 id = "minimax-code-start"
 title = "Start MiniMax Code in this worktree"
 description = "Launch `mcode` in a new pane for the active worktree"
 contexts = ["workspace", "pane"]
-command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "start"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]
