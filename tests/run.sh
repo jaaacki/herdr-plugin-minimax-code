@@ -14,10 +14,17 @@
 # per-case file. A case then asserts on the recorded invocation sequence and on
 # the entrypoint's exit code and stderr. Nothing touches a real multiplexer.
 #
-# Scope: this file implements cases 1, 2 and 6 (issue #4 / C1). Cases 3, 4 and 5
-# need the real `pane split` response shape, captured in issue E, so they belong
-# to C2 and are deliberately absent — a missing case is a known gap, not a
-# passing case, and the exit code does not pretend otherwise.
+# Scope: all six cases (issues #4 and #5).
+#
+#   1  happy path, HERDR_PANE_ID set          4  split succeeds, no pane id
+#   2  happy path, HERDR_PANE_ID unset       5  pane run fails
+#   3  pane split fails                       6  jq absent from PATH
+#
+# Cases 3, 4 and 5 assert on the recorded invocation sequence, not the exit code.
+# That is the point of the suite: a launcher that typed into a pane and *then*
+# failed still exits non-zero, so an exit-code-only assertion would call the
+# defect a pass. `pane run` must be provably unreachable when the new pane cannot
+# be identified.
 #
 # MCODE_PLUGIN_BIN overrides the entrypoint under test. It exists so the required
 # mutation check can run against a deliberately broken *copy*, proving the suite
@@ -137,7 +144,8 @@ setup_case() {
   export HERDR_BIN_PATH="$FAKE_HERDR"
   export PATH="$CASE_DIR/bin:$BASE_PATH"
   # Neutralise ambient herdr context so a case only ever sees what it sets.
-  unset HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_CONTEXT_JSON FAKE_HERDR_FAIL
+  unset HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_CONTEXT_JSON
+  unset FAKE_HERDR_FAIL FAKE_HERDR_SPLIT_NO_PANE_ID
 }
 
 run_entrypoint() {
@@ -173,12 +181,38 @@ expected_new_pane() { # expected_new_pane
   printf '%s' "$FAKE_HERDR_NEW_PANE"
 }
 
-# The happy-path invocation sequence, shared by cases 1 and 2. The source pane
-# is passed in because it differs: case 1 takes it from $HERDR_PANE_ID, case 2
-# from whatever `pane current` reports.
-expected_happy_path() { # expected_happy_path <source-pane> <mcode-abs>
-  printf -v REPLY 'pane\tget\t%s\npane\tsplit\t%s\t--direction\tright\t--cwd\t%s\npane\trun\t%s\t%s' \
-    "$1" "$1" "$(expected_cwd)" "$(expected_new_pane)" "$2"
+# The `pane split` invocation, exactly as the entrypoint issues it. `--no-focus`
+# is part of the sequence, not an optional extra: B's head 368e48e decided it
+# deliberately (issue #4's spec predates that decision and is silent on it), so
+# the expectation follows the implementation and the spec gap is reported as a
+# finding rather than papered over here.
+expected_split_line() { # expected_split_line <source-pane>
+  printf 'pane\tsplit\t%s\t--direction\tright\t--no-focus\t--cwd\t%s' "$1" "$(expected_cwd)"
+}
+
+# The full expected invocation log for a launch that reaches `pane split`.
+# Passing an empty second argument omits the `pane run` line — that is how cases
+# 3 and 4 assert the launcher never typed into a pane, which is the property
+# they exist to protect. An exit-code-only assertion would not: a script that
+# called `pane run` and failed afterwards would still exit non-zero.
+expected_sequence() { # expected_sequence <source-pane> <mcode-abs|"">
+  local src="$1"
+  local mcode="$2"
+  local lines
+  lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src")")"
+  if [ -n "$mcode" ]; then
+    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$(expected_new_pane)" "$mcode")"
+  fi
+  printf '%s' "$lines"
+}
+
+# Case 2's sequence: `pane current` first, to resolve the source pane.
+expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|"">
+  local mcode="$1"
+  local src rest
+  src="$(expected_current_pane)"
+  rest="$(expected_sequence "$src" "$mcode")"
+  printf 'pane\tcurrent\n%s' "$rest"
 }
 
 # Mirrors every executable on PATH into a fresh directory, skipping $1. Case 6
@@ -272,9 +306,7 @@ case_1() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  local mcode_abs="$CASE_DIR/bin/mcode"
-  expected_happy_path "$SRC_PANE" "$mcode_abs"
-  assert_log_exactly "$REPLY"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode")"
 }
 
 # --- case 2 ------------------------------------------------------------------
@@ -287,14 +319,52 @@ case_2() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  # The source pane is whatever `pane current` reports, which differs between a
-  # captured fixture and the inline placeholder — so it is read, not assumed.
-  local src mcode_abs expected
-  src="$(expected_current_pane)"
-  mcode_abs="$CASE_DIR/bin/mcode"
-  printf -v expected 'pane\tcurrent\npane\tget\t%s\npane\tsplit\t%s\t--direction\tright\t--cwd\t%s\npane\trun\t%s\t%s' \
-    "$src" "$src" "$(expected_cwd)" "$(expected_new_pane)" "$mcode_abs"
-  assert_log_exactly "$expected"
+  assert_log_exactly "$(expected_sequence_via_current "$CASE_DIR/bin/mcode")"
+}
+
+# --- case 3 ------------------------------------------------------------------
+# `pane split` fails. The launcher must fail loudly and must NOT go on to type
+# into a pane — so the assertion is on the invocation log, never the exit code.
+# A script that called `pane run` and then failed would also exit non-zero.
+case_3() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="pane split:1"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+# --- case 4 ------------------------------------------------------------------
+# The safety-critical branch: `pane split` SUCCEEDS but the response carries no
+# pane id, so the new pane cannot be identified. `pane run` must never be
+# invoked. Asserted on the invocation log, per the same reasoning as case 3.
+case_4() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_SPLIT_NO_PANE_ID=1
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+# --- case 5 ------------------------------------------------------------------
+# `pane run` fails. The launcher must exit non-zero and stderr must name the new
+# pane id, so the user can find and close the orphaned pane by hand.
+case_5() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="pane run:1"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$(expected_new_pane)"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode")"
 }
 
 # --- case 6 ------------------------------------------------------------------
@@ -338,7 +408,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-6)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -369,6 +439,9 @@ for name in "${SELECTED[@]}"; do
   case "$name" in
     case-1) run_case case-1 case_1 ;;
     case-2) run_case case-2 case_2 ;;
+    case-3) run_case case-3 case_3 ;;
+    case-4) run_case case-4 case_4 ;;
+    case-5) run_case case-5 case_5 ;;
     case-6) run_case case-6 case_6 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
