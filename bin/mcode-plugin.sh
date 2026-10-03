@@ -56,7 +56,11 @@ resolve_mcode() {
   command -v "$MCODE_BIN_NAME" 2>/dev/null
 }
 
-# resolve_source_pane - print the pane to split, or fail.
+# resolve_source_pane - print the pane to split, or fail with a distinct code
+# so the caller can report the real cause:
+#   0  resolved
+#   1  `pane current` itself failed
+#   2  `pane current` succeeded but carried no pane id
 #
 # The action is registered for both the workspace and pane contexts, and only
 # the pane context is guaranteed to set HERDR_PANE_ID, so both branches are
@@ -73,9 +77,13 @@ resolve_source_pane() {
     return 1
   fi
 
+  # Deliberately a literal, NOT $NEW_PANE_ID_FIELD. That constant names the
+  # NEW pane, and the source pane is a different concept that merely happens
+  # to sit at the same path. Reusing the constant here would make its name a
+  # lie, so the two stay separate on purpose - do not "deduplicate" them.
   pane=$(printf '%s' "$out" | json_field '.result.pane.pane_id')
   if [ -z "$pane" ]; then
-    return 1
+    return 2
   fi
   printf '%s\n' "$pane"
 }
@@ -96,25 +104,35 @@ cmd_start() {
     die "\`${MCODE_BIN_NAME}\` did not resolve to a path, so there is nothing to launch. No pane was created."
   fi
 
-  # 2. Resolve the source pane.
+  # 2. Resolve the source pane. The two failure modes get distinct wording:
+  #    a failed call and a successful call that carried no id are different
+  #    problems, and reporting both as "no pane id" hides which one happened.
   local source_pane
-  if ! source_pane=$(resolve_source_pane); then
-    die "could not resolve a source pane: HERDR_PANE_ID is unset and \`${HERDR} pane current\` did not yield a pane id. No pane was created."
+  local src_rc=0
+  source_pane=$(resolve_source_pane) || src_rc=$?
+  if [ "$src_rc" -ne 0 ]; then
+    if [ "$src_rc" -eq 1 ]; then
+      die "\`${HERDR} pane current\` exited non-zero and HERDR_PANE_ID is unset, so no source pane could be determined. No pane was created."
+    fi
+    die "\`${HERDR} pane current\` succeeded but its response carried no \`.result.pane.pane_id\`, and HERDR_PANE_ID is unset. No pane was created."
   fi
 
   # 3. Resolve cwd. A missing or empty cwd degrades to the CLI's own default
-  #    placement rather than failing the whole launch.
+  #    placement rather than failing the whole launch. A failed `pane get` is
+  #    reported as a failed read, not as "no cwd", so the cause is not hidden.
   local cwd=""
   local get_out=""
   if get_out=$("$HERDR" pane get "$source_pane" 2>/dev/null); then
     cwd=$(printf '%s' "$get_out" | json_field '.result.pane.cwd')
+  else
+    log "minimax-code: \`${HERDR} pane get ${source_pane}\` failed, so its cwd is unknown; splitting without --cwd and letting the CLI place the pane."
   fi
 
   local cwd_args=()
   if [ -n "$cwd" ]; then
     cwd_args=(--cwd "$cwd")
-  else
-    log "minimax-code: no cwd reported for pane ${source_pane}; splitting without --cwd and letting the CLI place the pane."
+  elif [ -n "$get_out" ]; then
+    log "minimax-code: pane ${source_pane} reported no cwd; splitting without --cwd and letting the CLI place the pane."
   fi
 
   # 4. Split. Direction is fixed to right for this epic; making it
