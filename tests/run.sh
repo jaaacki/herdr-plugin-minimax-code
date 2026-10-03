@@ -43,7 +43,9 @@ FAKE_HERDR="$here/fake-herdr"
 # the env var was used by the *absence* of `pane current` in its log, and case 2
 # proves the fallback by that call's presence.
 SRC_PANE="wZ:p1"
-NEW_PANE="wZ:p2"
+# There is deliberately no NEW_PANE sentinel. The new pane id comes from the
+# captured fixture, never from a value the test invents, so no constant here
+# could ever drift away from reality without the suite noticing.
 
 BASE_PATH="$PATH"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-plugin-tests.XXXXXX")"
@@ -139,13 +141,12 @@ setup_case() {
   export FAKE_HERDR_LOG
   export FAKE_HERDR_FIXTURES="$here/fixtures"
   export FAKE_HERDR_SRC_PANE="$SRC_PANE"
-  export FAKE_HERDR_NEW_PANE="$NEW_PANE"
   export FAKE_HERDR_CWD="$CASE_DIR/project"
   export HERDR_BIN_PATH="$FAKE_HERDR"
   export PATH="$CASE_DIR/bin:$BASE_PATH"
   # Neutralise ambient herdr context so a case only ever sees what it sets.
   unset HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_CONTEXT_JSON
-  unset FAKE_HERDR_FAIL FAKE_HERDR_SPLIT_NO_PANE_ID
+  unset FAKE_HERDR_FAIL FAKE_HERDR_FAULT
 }
 
 run_entrypoint() {
@@ -156,8 +157,9 @@ run_entrypoint() {
 # What the stub will report. This mirrors the precedence documented in
 # tests/fake-herdr, deliberately and in the same place, so the two cannot drift:
 #
-#   cwd, source pane   Knob wins. The tests own these dimensions, and the stub
-#                      bypasses the fixture when the knob is set.
+#   cwd, source pane   Knob wins. The tests own these dimensions, so the stub
+#                      substitutes them into the *captured* response rather than
+#                      replacing it, and announces the substitution.
 #   new pane id        The captured fixture always wins, knob or not, because
 #                      that value must never be faked. It is queried out of the
 #                      fixture rather than hard-coded, so a re-capture cannot
@@ -168,17 +170,22 @@ run_entrypoint() {
 expected_cwd() { printf '%s' "$FAKE_HERDR_CWD"; }
 expected_current_pane() { printf '%s' "$FAKE_HERDR_SRC_PANE"; }
 
+# No fallback on purpose: tests/fixtures/ is mandatory now that the captures have
+# landed, and the stub exits non-zero if a fixture is missing. A quiet fallback
+# here would let the suite assert against something the stub never served.
 expected_new_pane() { # expected_new_pane
   local file="$FAKE_HERDR_FIXTURES/pane-split.json"
   local value
-  if [ -f "$file" ] && command -v jq >/dev/null 2>&1; then
-    value="$(jq -r '.result.pane.pane_id // empty' <"$file" 2>/dev/null)" || value=""
-    if [ -n "$value" ] && [ "$value" != "null" ]; then
-      printf '%s' "$value"
-      return 0
-    fi
+  if [ ! -f "$file" ] || ! command -v jq >/dev/null 2>&1; then
+    note "cannot read the new pane id from $file (jq present: $(command -v jq >/dev/null 2>&1 && echo yes || echo no))"
+    return
   fi
-  printf '%s' "$FAKE_HERDR_NEW_PANE"
+  value="$(jq -r '.result.pane.pane_id // empty' <"$file" 2>/dev/null)" || value=""
+  if [ -z "$value" ] || [ "$value" = "null" ]; then
+    note "pane-split.json carries no .result.pane.pane_id; the fixture may be stale"
+    return
+  fi
+  printf '%s' "$value"
 }
 
 # The `pane split` invocation, exactly as the entrypoint issues it. `--no-focus`
@@ -186,8 +193,13 @@ expected_new_pane() { # expected_new_pane
 # deliberately (issue #4's spec predates that decision and is silent on it), so
 # the expectation follows the implementation and the spec gap is reported as a
 # finding rather than papered over here.
-expected_split_line() { # expected_split_line <source-pane>
-  printf 'pane\tsplit\t%s\t--direction\tright\t--no-focus\t--cwd\t%s' "$1" "$(expected_cwd)"
+expected_split_line() { # expected_split_line <source-pane> [with-cwd: yes|no]
+  local src="$1"
+  if [ "${2:-yes}" = "no" ]; then
+    printf 'pane\tsplit\t%s\t--direction\tright\t--no-focus' "$src"
+  else
+    printf 'pane\tsplit\t%s\t--direction\tright\t--no-focus\t--cwd\t%s' "$src" "$(expected_cwd)"
+  fi
 }
 
 # The full expected invocation log for a launch that reaches `pane split`.
@@ -195,11 +207,12 @@ expected_split_line() { # expected_split_line <source-pane>
 # 3 and 4 assert the launcher never typed into a pane, which is the property
 # they exist to protect. An exit-code-only assertion would not: a script that
 # called `pane run` and failed afterwards would still exit non-zero.
-expected_sequence() { # expected_sequence <source-pane> <mcode-abs|"">
+expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd]
   local src="$1"
   local mcode="$2"
+  local with_cwd="${3:-yes}"
   local lines
-  lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src")")"
+  lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src" "$with_cwd")")"
   if [ -n "$mcode" ]; then
     lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$(expected_new_pane)" "$mcode")"
   fi
@@ -344,7 +357,7 @@ case_3() {
 case_4() {
   setup_case
   export HERDR_PANE_ID="$SRC_PANE"
-  export FAKE_HERDR_SPLIT_NO_PANE_ID=1
+  export FAKE_HERDR_FAULT="split-no-pane-id"
 
   run_entrypoint
   assert_rc_nonzero "$RC"
@@ -394,6 +407,107 @@ case_6() {
   assert_log_empty
 }
 
+# --- case 7 ------------------------------------------------------------------
+# The source-pane guard, which had no coverage at all: `pane split` succeeds but
+# its response names the *source* pane as the new one. Refusing here is what
+# stops `pane run` typing into the window the user is working in — strictly more
+# dangerous to lose than the unidentified-pane guard, and just as invisible to
+# the suite without this case.
+case_7() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="split-echoes-source"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$SRC_PANE"
+  # The whole point: the source pane must never be typed into.
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+# --- case 8 ------------------------------------------------------------------
+# `mcode` absent. The entrypoint resolves the launcher *before* splitting, so
+# this must fail without ever reaching the multiplexer. If the preflight were
+# removed the launcher would split, `pane run` an empty command, report success
+# and leave an orphaned pane behind — so the assertion is an empty log, not just
+# a non-zero exit.
+case_8() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+
+  PATH="$(path_without mcode)"
+  export PATH
+  if command -v mcode >/dev/null 2>&1; then
+    note "failed to remove mcode from PATH; refusing to run a case that cannot fail"
+    return
+  fi
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "mcode"
+  assert_log_empty
+}
+
+# --- case 9 ------------------------------------------------------------------
+# `pane get` fails. The documented behaviour is a graceful degradation: warn,
+# split without --cwd and let the CLI place the pane, still exiting 0. The
+# stderr must name the failed read, because "the read failed" and "the pane
+# reported no cwd" are different problems and collapsing them hides the cause.
+case_9() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="pane get:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "pane get"
+  assert_stderr_mentions "$SRC_PANE"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no)"
+}
+
+# --- case 10 -----------------------------------------------------------------
+# `pane current` succeeds but carries no pane id, and HERDR_PANE_ID is unset, so
+# no source pane can be determined. Nothing may be split, and the message must
+# not claim the *call* failed — it succeeded; it returned nothing usable.
+case_10() {
+  setup_case
+  unset HERDR_PANE_ID
+  export FAKE_HERDR_FAULT="current-no-pane-id"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  # The failed-call branch says "exited non-zero"; this is the other branch.
+  if grep -qF 'exited non-zero' "$STDERR_FILE"; then
+    note "stderr blames a non-zero exit, but the call succeeded and returned no id"
+  fi
+  assert_log_exactly "$(printf 'pane\tcurrent')"
+}
+
+# --- case 11 -----------------------------------------------------------------
+# The split response carries JSON `null` rather than an empty string for the pane
+# id — the other shape the guard exists to catch, and one no case built before.
+# Also asserts the guard's *diagnostic content*, not merely that stderr is
+# non-empty: the message is the only thing telling the user a pane may exist and
+# can be closed by hand. Matching prose is deliberately brittle here, because that
+# diagnostic is user-facing behaviour — replacing it with a bare `die "error"`
+# is a real regression, and this case is what makes it one.
+case_11() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="split-null-pane-id"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$SRC_PANE"
+  # The user needs to know a pane may be orphaned, and how to clear it.
+  assert_stderr_mentions "close"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -408,7 +522,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -443,6 +557,11 @@ for name in "${SELECTED[@]}"; do
     case-4) run_case case-4 case_4 ;;
     case-5) run_case case-5 case_5 ;;
     case-6) run_case case-6 case_6 ;;
+    case-7) run_case case-7 case_7 ;;
+    case-8) run_case case-8 case_8 ;;
+    case-9) run_case case-9 case_9 ;;
+    case-10) run_case case-10 case_10 ;;
+    case-11) run_case case-11 case_11 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done
