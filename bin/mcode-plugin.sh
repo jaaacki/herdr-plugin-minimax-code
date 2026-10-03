@@ -230,6 +230,46 @@ cmd_start() {
   fi
 
   log "minimax-code: started ${mcode_bin} in pane ${new_pane}"
+
+  # 7. Register the new pane with Herdr's agent surface, best-effort.
+  #
+  #    Until this, the pane is anonymous to Herdr: it shows in `pane list` with
+  #    agent_status "unknown" and never appears in `herdr agent list`. After
+  #    this, `herdr agent get <PANE_ID>` and `herdr agent read <PANE_ID>
+  #    --source detection` resolve against it.
+  #
+  #    FAILURE POLICY - deliberately the opposite of the split guard above, and
+  #    the asymmetry is intentional. There, an unidentifiable pane means we
+  #    might type into the wrong window, so failing loudly is the safe move.
+  #    Here the launch is already done and the user can see mcode running: the
+  #    thing they asked for succeeded. Exiting non-zero now would report a
+  #    success as a failure and could make a caller retry, spawning a second
+  #    pane. So a failed registration is a warning on stderr and exit 0.
+  #
+  #    DO NOT add a `pane release-agent` call here. Measured on Herdr 0.9.3:
+  #    report-agent makes the entry appear, and release-agent makes it vanish
+  #    again on the next `agent list`. The intent of releasing is to hand
+  #    authority back so screen detection can resume - but Herdr has no screen
+  #    manifest for MiniMax Code, so there is nothing to hand back to, and
+  #    releasing would simply delete the registration this step exists to
+  #    create. The entry is scoped to the pane: it disappears when the pane
+  #    closes, so holding authority leaks nothing. A future state watcher
+  #    (bin/mcode-watch.sh) should keep reporting on this same registration
+  #    rather than re-reporting per state, and should not release either.
+  #
+  #    --state is `idle`, not `working`: the pane was just created and mcode is
+  #    still starting. Claiming work we have not observed is a lie the agent
+  #    surface would then display.
+  #
+  #    --seq is omitted on purpose. Herdr assigns state_change_seq itself (it
+  #    did, 122, on a first report in a live check), so inventing our own
+  #    counter would add a second, competing ordering scheme.
+  #
+  #    --agent-session-id is omitted: mcode does not hand us one at launch, and
+  #    inventing a session id would be worse than reporting none.
+  if ! "$HERDR" pane report-agent "$new_pane" --source minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
+    log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."
+  fi
 }
 
 main() {
