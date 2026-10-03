@@ -196,6 +196,20 @@ Recorded so nobody re-derives them wrongly:
   missed that integrations and screen manifests ship in-tree. The docs-site view is
   materially incomplete; the source is authoritative.
 - `HERDR_PLUGIN_DIR` was written first and is wrong. Real name: `HERDR_PLUGIN_ROOT`.
+- **`HERDR_PLUGIN_ROOT` is injected into the action's environment, but herdr does NOT expand
+  shell variable syntax inside a manifest `command` array.** This one cost the most and is
+  recorded so it is never repeated. `command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh",
+  "start"]` does not run — the string contains a `/`, so the OS treats it as a relative path and
+  looks for a literal directory named `${HERDR_PLUGIN_ROOT}`, giving `ENOENT`. The working form
+  is `command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]`. Note
+  the TOML escaping: inner quotes are `\"`; a `\$` escape is invalid TOML and manifests as the
+  same `ENOENT`.
+- **A manifest `command` is resolved against the invoking pane's cwd, not the plugin root.**
+  Verified by splitting a pane with `cwd=/tmp` and invoking: a relative `bin/mcode-plugin.sh`
+  failed there and succeeded from the plugin root. So "just use a relative path" is not a fix.
+- **herdr 0.9.3 can record a successful plugin action as `failed` with `ENOENT`,** with empty
+  stdout/stderr, when the command is a `/bin/sh -c` wrapper. Confirmed three-for-three: each run
+  created a real pane with `mcode` running, and each was logged as `failed`. See issue #16.
 - The docs list a `workspace.metadata_updated` and `layout.updated` event, but those are
   **not** in `PLUGIN_HOOK_EVENT_KINDS` and will warn.
 
