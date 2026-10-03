@@ -145,10 +145,40 @@ run_entrypoint() {
   RC=$?
 }
 
-# The happy-path invocation sequence, shared by cases 1 and 2.
-expected_happy_path() { # expected_happy_path <mcode-abs>
+# What the stub will report. This mirrors the precedence documented in
+# tests/fake-herdr, deliberately and in the same place, so the two cannot drift:
+#
+#   cwd, source pane   Knob wins. The tests own these dimensions, and the stub
+#                      bypasses the fixture when the knob is set.
+#   new pane id        The captured fixture always wins, knob or not, because
+#                      that value must never be faked. It is queried out of the
+#                      fixture rather than hard-coded, so a re-capture cannot
+#                      silently invalidate the expectation — and pinning it to
+#                      `.result.pane.pane_id` asserts the documented extraction
+#                      path. An implementation reading `.result.pane_id`, which
+#                      resolves to `null` in the real capture, fails here.
+expected_cwd() { printf '%s' "$FAKE_HERDR_CWD"; }
+expected_current_pane() { printf '%s' "$FAKE_HERDR_SRC_PANE"; }
+
+expected_new_pane() { # expected_new_pane
+  local file="$FAKE_HERDR_FIXTURES/pane-split.json"
+  local value
+  if [ -f "$file" ] && command -v jq >/dev/null 2>&1; then
+    value="$(jq -r '.result.pane.pane_id // empty' <"$file" 2>/dev/null)" || value=""
+    if [ -n "$value" ] && [ "$value" != "null" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  fi
+  printf '%s' "$FAKE_HERDR_NEW_PANE"
+}
+
+# The happy-path invocation sequence, shared by cases 1 and 2. The source pane
+# is passed in because it differs: case 1 takes it from $HERDR_PANE_ID, case 2
+# from whatever `pane current` reports.
+expected_happy_path() { # expected_happy_path <source-pane> <mcode-abs>
   printf -v REPLY 'pane\tget\t%s\npane\tsplit\t%s\t--direction\tright\t--cwd\t%s\npane\trun\t%s\t%s' \
-    "$SRC_PANE" "$SRC_PANE" "$FAKE_HERDR_CWD" "$NEW_PANE" "$1"
+    "$1" "$1" "$(expected_cwd)" "$(expected_new_pane)" "$2"
 }
 
 # Mirrors every executable on PATH into a fresh directory, skipping $1. Case 6
@@ -243,7 +273,7 @@ case_1() {
   assert_rc_zero "$RC"
 
   local mcode_abs="$CASE_DIR/bin/mcode"
-  expected_happy_path "$mcode_abs"
+  expected_happy_path "$SRC_PANE" "$mcode_abs"
   assert_log_exactly "$REPLY"
 }
 
@@ -257,9 +287,13 @@ case_2() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  local mcode_abs="$CASE_DIR/bin/mcode"
+  # The source pane is whatever `pane current` reports, which differs between a
+  # captured fixture and the inline placeholder — so it is read, not assumed.
+  local src mcode_abs expected
+  src="$(expected_current_pane)"
+  mcode_abs="$CASE_DIR/bin/mcode"
   printf -v expected 'pane\tcurrent\npane\tget\t%s\npane\tsplit\t%s\t--direction\tright\t--cwd\t%s\npane\trun\t%s\t%s' \
-    "$SRC_PANE" "$SRC_PANE" "$FAKE_HERDR_CWD" "$NEW_PANE" "$mcode_abs"
+    "$src" "$src" "$(expected_cwd)" "$(expected_new_pane)" "$mcode_abs"
   assert_log_exactly "$expected"
 }
 
