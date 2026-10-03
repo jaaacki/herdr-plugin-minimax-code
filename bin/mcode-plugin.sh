@@ -56,7 +56,9 @@ json_field() {
 }
 
 # next_agent_name - print the first free name in the sequence mcode, mcode-2,
-# mcode-3, ... and nothing (exit 0) when the list of agents cannot be read.
+# mcode-3, ... and ALWAYS print something: when the agent list cannot be read,
+# or when all ten slots are taken, it falls back to the bare label and lets the
+# rename fail with a truthful message. It never prints nothing and never fails.
 #
 # WHY A SEQUENCE, AND NOT THE PANE ID. The name is what a human types into
 # `herdr agent prompt <name>`, so it has to be predictable and short. A pane id
@@ -67,6 +69,12 @@ json_field() {
 #
 # The upper bound is a backstop, not a policy: ten concurrent mcode panes is far
 # past any real use, and running out must still leave a usable name.
+#
+# Because this always prints, the caller's empty-name branch is defensive and is
+# NOT reachable today — it is there so that changing this helper's contract to
+# "may fail" cannot silently produce a rename with an empty argument. Do not
+# read it as a tested path; there is no test for it because there is no way to
+# reach it.
 next_agent_name() {
   local taken candidate n
   taken="$("$HERDR" agent list 2>/dev/null | jq -r '.result.agents[]? | .name // empty' 2>/dev/null || true)"
@@ -297,25 +305,36 @@ cmd_start() {
   # 8. Name the agent, so it can be addressed by something a human would type.
   #
   #    `report-agent` alone gets the pane into `agent list` and no further: with
-  #    no active name, `herdr agent get`/`read` will not resolve it by name and
-  #    `prompt`/`send-keys` refuse it outright as "not an active named agent".
-  #    `agent rename` is what installs the name, and it only works on an already
-  #    registered agent — which is why this is nested inside the success branch
-  #    of step 7. Renaming a pane that was never registered cannot succeed, and
-  #    trying would turn one root cause into two warnings.
+  #    no active name, `herdr agent get`/`read`/`wait` will not resolve it by
+  #    name. `agent rename` is what installs the name, and it only works on an
+  #    already registered agent — which is why this is nested inside the success
+  #    branch of step 7. Renaming a pane that was never registered cannot
+  #    succeed, and trying would turn one root cause into two warnings.
+  #
+  #    WHAT NAMING BUYS, AND WHAT IT DOES NOT — measured on 0.9.3, do not
+  #    "simplify" the messages below into a promise it cannot keep. After a
+  #    successful rename, `agent get`, `agent read` and `agent wait` all resolve
+  #    by name. `agent prompt` and `agent send-keys` still fail with
+  #    `agent_not_ready: not an active named agent`, and no amount of renaming
+  #    changes that: only `herdr agent start --kind` mints an *active* agent, and
+  #    that closed 22-value enum has no `minimax-code` member. So a self-reported
+  #    agent is named but never active. That is an upstream ceiling, tracked in
+  #    issue #37, not a step we are one rename away from. The warning text says
+  #    so explicitly, because a user told only "it is unnamed" will spend an
+  #    afternoon renaming it and get nowhere.
   #
   #    Same best-effort policy as step 7, for the same reason: the launch is
   #    already done. A pane that is registered but unnamed is still better than
   #    one that is invisible, so a failure here is a warning and exit 0 — and the
   #    warning says exactly which commands are lost, because "it half worked"
   #    with no consequence spelled out is how this gets misdiagnosed later.
-  if "$HERDR" pane report-agent "$new_pane" --source minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
+  if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
     local agent_name
     agent_name=$(next_agent_name)
     if [ -z "$agent_name" ]; then
-      log "minimax-code: could not work out a free name for pane ${new_pane}, so it stays registered but unnamed. \`herdr agent get\` and \`read\` will need the pane id ${new_pane} instead, and \`prompt\`/\`send-keys\` will refuse it until it is named."
+      log "minimax-code: could not work out a free name for pane ${new_pane}, so it stays registered but unnamed. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will not work for it either way on Herdr 0.9.3 (agent_not_ready) — those need an agent Herdr itself started. Naming it later would not change that."
     elif ! "$HERDR" agent rename "$new_pane" "$agent_name"; then
-      log "minimax-code: pane ${new_pane} is registered but could not be renamed, so it has no active name. \`herdr agent get\` and \`read\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will refuse it with agent_not_ready. The launch itself succeeded."
+      log "minimax-code: pane ${new_pane} is registered but could not be renamed, so it has no active name. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will not work for it either way on Herdr 0.9.3 (agent_not_ready) — those need an agent Herdr itself started. Renaming it later would not change that. The launch itself succeeded."
     fi
   else
     log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`, could not be named, and \`herdr agent prompt\`/\`send-keys\` will not work for it. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."

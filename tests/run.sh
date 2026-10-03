@@ -228,7 +228,7 @@ expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd
     lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$newpane" "$mcode")"
   fi
   if [ "$registered" = "reported" ] || [ "$registered" = "full" ]; then
-    lines="$(printf '%s\npane\treport-agent\t%s\t--source\tminimax-code\t--agent\tmcode\t--state\tidle' \
+    lines="$(printf '%s\npane\treport-agent\t%s\t--source\therdr:minimax-code\t--agent\tmcode\t--state\tidle' \
       "$lines" "$newpane")"
   fi
   if [ "$registered" = "full" ]; then
@@ -675,6 +675,12 @@ case_18() {
   assert_stderr_mentions "could not be renamed"
   assert_stderr_mentions "send-keys"
   assert_stderr_mentions "agent_not_ready"
+  # The point of the message is to stop a user renaming the agent by hand, so it
+  # must name the real cause and must NOT promise that naming would help.
+  assert_stderr_mentions "Herdr itself started"
+  if grep -qF 'until it is named' "$STDERR_FILE"; then
+    note "stderr tells the user naming would fix prompt/send-keys; on 0.9.3 it would not"
+  fi
   # The registration and the name lookup both still happened.
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
 }
