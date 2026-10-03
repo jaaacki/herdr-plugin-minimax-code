@@ -178,24 +178,57 @@ path_without() { # path_without <basename>
 # every case pass or fail for the wrong reason. Caught once here, up front, by
 # asking the stub what it would serve rather than trusting it.
 check_stub_responses() {
-  local name json
+  local out name json fail_log
+
   if ! command -v jq >/dev/null 2>&1; then
     printf 'warn  jq not found; skipping the fake-herdr response self-check\n'
     return 0
   fi
-  while IFS=$'\t' read -r name json; do
+
+  # Capture first, then validate. Piping --self-check straight into the loop
+  # would make an empty or failed run vacuously pass, which is the opposite of
+  # what a guard is for.
+  if ! out="$("$FAKE_HERDR" --self-check 2>/dev/null)"; then
+    printf 'FAIL  stub: %s --self-check exited non-zero\n' "$FAKE_HERDR"
+    return 1
+  fi
+  if [ -z "$out" ]; then
+    printf 'FAIL  stub: %s --self-check produced no output\n' "$FAKE_HERDR"
+    return 1
+  fi
+
+  for name in pane-get pane-current pane-split pane-run; do
+    json="$(printf '%s\n' "$out" | grep "^$name" | head -1 | cut -f2-)"
+    if [ -z "$json" ]; then
+      printf 'FAIL  stub: --self-check is missing the %s response\n' "$name"
+      return 1
+    fi
     if ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
       printf 'FAIL  stub-response %s: not valid JSON\n' "$name"
       return 1
     fi
-    if [ "$name" = "pane-run" ]; then
-      continue
+    if [ "$name" != "pane-run" ]; then
+      if ! printf '%s' "$json" | jq -e '.result.pane.pane_id' >/dev/null 2>&1; then
+        printf 'FAIL  stub-response %s: no .result.pane.pane_id\n' "$name"
+        return 1
+      fi
     fi
-    if ! printf '%s' "$json" | jq -e '.result.pane.pane_id' >/dev/null 2>&1; then
-      printf 'FAIL  stub-response %s: no .result.pane.pane_id\n' "$name"
-      return 1
-    fi
-  done < <("$FAKE_HERDR" --self-check)
+  done
+
+  # Exercise the failure-injection path here so it is covered on every run
+  # rather than first being trusted in C2, where cases 3 and 5 depend on it.
+  fail_log="$WORK/selfcheck-fail.log"
+  : >"$fail_log"
+  if FAKE_HERDR_LOG="$fail_log" FAKE_HERDR_FAIL="pane split:7" \
+      "$FAKE_HERDR" pane split wZ:p1 >/dev/null 2>&1; then
+    printf 'FAIL  stub: FAKE_HERDR_FAIL did not make the call fail\n'
+    return 1
+  fi
+  if ! grep -q 'pane' "$fail_log"; then
+    printf 'FAIL  stub: a failing call was not recorded in the log\n'
+    return 1
+  fi
+  return 0
 }
 
 # --- case 1 ------------------------------------------------------------------

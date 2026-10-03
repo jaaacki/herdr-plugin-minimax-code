@@ -93,12 +93,13 @@ fixtures="${FAKE_HERDR_FIXTURES:-$here/fixtures}"
 
 src_pane="${FAKE_HERDR_SRC_PANE:-wZ:p1}"
 new_pane="${FAKE_HERDR_NEW_PANE:-wZ:p2}"
-src_cwd="${FAKE_HERDR_CWD:-$here/..}"
+# Normalised, so a default cwd never leaks a trailing "/.." into a --cwd value.
+src_cwd="${FAKE_HERDR_CWD:-$(cd -- "$here/.." && pwd)}"
 
 emit() { # emit <fixture-name> <inline-json>
   local name="$1"
   local inline="$2"
-  local file="$fixtures/$1.json"
+  local file="$fixtures/$name.json"
   if [ -f "$file" ]; then
     cat -- "$file"
   else
