@@ -79,11 +79,27 @@ jobs:
         shell: bash
         run: bash -n bin/mcode-plugin.sh
 
-      # Issue C's suite. It points HERDR_BIN_PATH at tests/fake-herdr, so it
-      # exercises cmd_start's argv construction and failure branches WITHOUT
-      # needing a live herdr. It does NOT cover manifest argv resolution --
-      # that path is only reachable through a real
-      # `herdr plugin action invoke`, and it was broken until issue #16.
-      - name: Run the test suite
+      # Every suite, discovered by glob rather than named one at a time.
+      #
+      # A hard-coded list of suites is the exact trap this epic was assembled to
+      # close: a suite gets written, proved locally, and never executes in CI, so
+      # it rots silently. Naming tests/run.sh and nothing else left issue #35's
+      # eleven cases decorative for a whole PR. Globbing means a suite cannot be
+      # committed without being run, and #45 is bringing tests too.
+      #
+      # It also fails loudly when it finds no suite, rather than passing
+      # vacuously -- a rename that broke the glob must not read as success.
+      - name: Run every test suite
         shell: bash
-        run: ./tests/run.sh
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          suites=(tests/*run.sh)
+          if [ ${#suites[@]} -eq 0 ]; then
+            echo "no test suites found under tests/ - refusing to pass vacuously" >&2
+            exit 1
+          fi
+          for suite in "${suites[@]}"; do
+            echo "=== $suite ==="
+            "$suite"
+          done
