@@ -1,0 +1,89 @@
+name: CI
+
+# The plugin declares platforms = ["linux", "macos"] in herdr-plugin.toml.
+# Both are exercised here so that claim rests on a pipeline, not on a local run.
+#
+# `dev` is included alongside `main` because the epic's PRs target `dev`
+# (see CLAUDE.md git flow and the issue Flow sections). Triggering on `main`
+# alone would mean no PR in this epic ever runs CI, and the "pipeline green on
+# both platforms" acceptance criterion would be unverifiable until the first
+# merge to `main`. Deviation from the issue text is deliberate — flagged to the
+# architect in the PR body.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+# Superseded PR pushes would otherwise queue a second full matrix run behind the
+# first. Cancelling in progress keeps the signal on the newest commit.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A hung step otherwise burns six hours of runner time. These steps are
+    # jq --version, bash -n and a stub-driven test suite; 10 minutes is ample.
+    timeout-minutes: 10
+    strategy:
+      # Report both platforms even if one fails; a macOS-only failure is still
+      # information when the plugin ships on linux too.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Issue B's cmd_start parses herdr's JSON with jq. Assert it explicitly
+      # rather than assuming: both hosted runners ship it today, but a runner
+      # image change should fail loudly here instead of turning into a
+      # confusing parse error inside the test suite.
+      # Record which bash actually ran, so "macOS coverage" is not silently
+      # redefined by a runner-image change. The entrypoint and the test suite
+      # both resolve bash via `#!/usr/bin/env bash`, so this is the interpreter
+      # the rest of the job is exercising.
+      #
+      # /bin/sh is recorded too, and deliberately: the manifest action is a
+      # /bin/sh -c wrapper (the fix for the command-array expansion bug), and
+      # /bin/sh is bash on macOS but dash on Debian/Ubuntu. That is the one part
+      # of the plugin whose shell differs by platform, so the log should say
+      # which shell it was.
+      - name: Record the bash, sh and jq versions
+        shell: bash
+        run: |
+          bash --version | head -1
+          # Positive identification, because `ls -l` is not enough: on macOS
+          # /bin/sh is a regular file rather than a symlink, so the link target
+          # only shows up on Linux. BASH_VERSION is set if and only if the shell
+          # actually is bash, so this distinguishes bash from dash directly.
+          echo "/bin/sh is: $(/bin/sh -c 'echo ${BASH_VERSION:-not-bash}')"
+          command -v jq
+          jq --version
+
+      - name: Syntax-check the plugin entrypoint
+        shell: bash
+        run: bash -n bin/mcode-plugin.sh
+
+      # Issue C's suite. It points HERDR_BIN_PATH at tests/fake-herdr, so it
+      # exercises cmd_start's argv construction and failure branches WITHOUT
+      # needing a live herdr. It does NOT cover manifest argv resolution --
+      # that path is only reachable through a real
+      # `herdr plugin action invoke`, and it was broken until issue #16.
+      - name: Run the test suite
+        shell: bash
+        run: ./tests/run.sh
