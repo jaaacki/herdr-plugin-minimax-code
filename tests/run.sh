@@ -464,6 +464,13 @@ case_9() {
   assert_rc_zero "$RC"
   assert_stderr_mentions "pane get"
   assert_stderr_mentions "$SRC_PANE"
+  # The entrypoint reports a *failed read* and a *pane that reported no cwd* with
+  # different wording, because they are different problems. Collapsing them hides
+  # the cause, so assert the failed-read branch and refuse the other one.
+  assert_stderr_mentions "failed"
+  if grep -qF 'reported no cwd' "$STDERR_FILE"; then
+    note "stderr blames an empty cwd, but the pane get call actually failed"
+  fi
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no)"
 }
 
@@ -508,6 +515,76 @@ case_11() {
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
 }
 
+# --- cases 12-14 -------------------------------------------------------------
+# Pane-id *shape* validation. m2 settled the guard as: jq `type == "string"`,
+# then characters from [A-Za-z0-9_.:-] only, and it must contain a colon. These
+# three cases pin each clause to a response shape that must be refused.
+#
+# They are written against m2's described guard and are therefore RED against a
+# build that lacks it — which is the point: a suite that cannot fail here is not
+# evidence. See the note in the PR body about the landing order.
+case_12() { # pane id is a JSON number, not a string
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="split-id-not-string"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$SRC_PANE"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+case_13() { # pane id contains characters outside [A-Za-z0-9_.:-]
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="split-id-unsafe-chars"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$SRC_PANE"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+case_14() { # pane id is well-formed but has no colon, so it is not a pane id
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="split-id-no-colon"
+
+  run_entrypoint
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "$SRC_PANE"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "")"
+}
+
+# --- case 15 -----------------------------------------------------------------
+# A relative PATH entry makes `command -v mcode` return a *relative* path.
+# `pane run` would then resolve it against the new pane's own directory, where it
+# does not exist, so the launcher must refuse before splitting rather than
+# reporting a launch that cannot happen. No stub fault needed: this is PATH and
+# cwd, both of which run.sh already controls.
+case_15() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+
+  local rc
+  if ( cd "$CASE_DIR" && PATH="bin:$BASE_PATH" "$PLUGIN_BIN" start ) \
+       >"$STDOUT_FILE" 2>"$STDERR_FILE"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  RC=$rc
+
+  assert_rc_nonzero "$RC"
+  assert_stderr_nonempty
+  assert_stderr_mentions "relative"
+  # Must not have split: the whole point is refusing before the multiplexer.
+  assert_log_empty
+}
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -522,7 +599,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -562,6 +639,10 @@ for name in "${SELECTED[@]}"; do
     case-9) run_case case-9 case_9 ;;
     case-10) run_case case-10 case_10 ;;
     case-11) run_case case-11 case_11 ;;
+    case-12) run_case case-12 case_12 ;;
+    case-13) run_case case-13 case_13 ;;
+    case-14) run_case case-14 case_14 ;;
+    case-15) run_case case-15 case_15 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

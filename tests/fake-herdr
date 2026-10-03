@@ -62,6 +62,14 @@
 #   current-no-pane-id    `pane current` succeeds but carries no pane id
 #   split-null-pane-id    the split response's pane id is JSON null, not ""
 #   split-no-pane-id      the split response's pane id is blank
+#   split-id-not-string   the split response's pane id is a JSON number, not a
+#                         string, so `jq -r` renders it without quotes and the
+#                         entrypoint cannot tell an id from a count
+#   split-id-unsafe-chars the split response's pane id contains characters
+#                         outside [A-Za-z0-9_.:-] — e.g. a space and a semicolon,
+#                         the shape a mis-parsed response would produce
+#   split-id-no-colon     the split response's pane id is well-formed but has no
+#                         colon, so it is not a pane id at all
 #
 # Every fault is a *variant of the real capture*: jq rewrites one field and leaves
 # the envelope, id, type, scroll and every other field exactly as herdr produced
@@ -200,6 +208,15 @@ emit_split() { # emit_split
   elif has_fault split-no-pane-id; then
     announce_fault split-no-pane-id "blanking the pane id in the captured split response"
     jq -c '.result.pane.pane_id = ""' "$file"
+  elif has_fault split-id-not-string; then
+    announce_fault split-id-not-string "setting the split response's pane id to a JSON number"
+    jq -c '.result.pane.pane_id = 42' "$file"
+  elif has_fault split-id-unsafe-chars; then
+    announce_fault split-id-unsafe-chars "setting the split response's pane id to a value with characters outside [A-Za-z0-9_.:-]"
+    jq -c --arg p 'wZ:p8; echo pwned' '.result.pane.pane_id = $p' "$file"
+  elif has_fault split-id-no-colon; then
+    announce_fault split-id-no-colon "setting the split response's pane id to a colon-less value"
+    jq -c '.result.pane.pane_id = "wZp8"' "$file"
   else
     jq -c '.' "$file"
   fi
