@@ -207,24 +207,52 @@ expected_split_line() { # expected_split_line <source-pane> [with-cwd: yes|no]
 # 3 and 4 assert the launcher never typed into a pane, which is the property
 # they exist to protect. An exit-code-only assertion would not: a script that
 # called `pane run` and failed afterwards would still exit non-zero.
-expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd]
+expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd] [registered]
   local src="$1"
   local mcode="$2"
   local with_cwd="${3:-yes}"
-  local lines
+  # registered is a three-state flag, and the middle state exists because it is a
+  # real branch, not a theoretical one:
+  #   no        `pane run` never happened, or it died — nothing follows
+  #   reported  `pane run` succeeded, `report-agent` was called and failed, so
+  #             naming is skipped (renaming an unregistered pane cannot work)
+  #   full      `pane run` succeeded and the pane was registered *and* named
+  # It is separate from a non-empty mcode because case 5 has mcode on the
+  # command line and then dies inside `pane run` — there the run line is
+  # present and nothing after it is.
+  local registered="${4:-no}"
+  local lines newpane
+  newpane="$(expected_new_pane)"
   lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src" "$with_cwd")")"
   if [ -n "$mcode" ]; then
-    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$(expected_new_pane)" "$mcode")"
+    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$newpane" "$mcode")"
+  fi
+  if [ "$registered" = "reported" ] || [ "$registered" = "full" ]; then
+    lines="$(printf '%s\npane\treport-agent\t%s\t--source\tminimax-code\t--agent\tmcode\t--state\tidle' \
+      "$lines" "$newpane")"
+  fi
+  if [ "$registered" = "full" ]; then
+    lines="$(printf '%s\nagent\tlist' "$lines")"
+    lines="$(printf '%s\nagent\trename\t%s\t%s' "$lines" "$newpane" "$(expected_agent_name)")"
   fi
   printf '%s' "$lines"
 }
 
+# The name next_agent_name() should settle on, mirroring the stub's agent list.
+expected_agent_name() { # expected_agent_name
+  case ",${FAKE_HERDR_FAULT:-}," in
+    *,agent-names-taken,*) printf 'mcode-3' ;;
+    *)                   printf 'mcode' ;;
+  esac
+}
+
 # Case 2's sequence: `pane current` first, to resolve the source pane.
-expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|"">
+expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|""> [registered]
   local mcode="$1"
+  local registered="${2:-no}"
   local src rest
   src="$(expected_current_pane)"
-  rest="$(expected_sequence "$src" "$mcode")"
+  rest="$(expected_sequence "$src" "$mcode" yes "$registered")"
   printf 'pane\tcurrent\n%s' "$rest"
 }
 
@@ -319,7 +347,7 @@ case_1() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode")"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
 }
 
 # --- case 2 ------------------------------------------------------------------
@@ -332,7 +360,7 @@ case_2() {
   run_entrypoint
   assert_rc_zero "$RC"
 
-  assert_log_exactly "$(expected_sequence_via_current "$CASE_DIR/bin/mcode")"
+  assert_log_exactly "$(expected_sequence_via_current "$CASE_DIR/bin/mcode" full)"
 }
 
 # --- case 3 ------------------------------------------------------------------
@@ -478,7 +506,7 @@ case_9() {
   if grep -qF 'reported no cwd' "$STDERR_FILE"; then
     note "stderr blames an empty cwd, but the pane get call actually failed"
   fi
-  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no)"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" no full)"
 }
 
 # --- case 10 -----------------------------------------------------------------
@@ -597,6 +625,77 @@ case_15() {
 }
 
 # --- driver ------------------------------------------------------------------
+# --- case 16 ----------------------------------------------------------------
+# `pane report-agent` errors. The launch already happened and the user can see
+# mcode running, so the entrypoint must NOT turn this into a failure: exit 0,
+# mcode still launched, and stderr says the registration failed. This is the
+# branch most likely to be "corrected" later into a hard failure, so it is
+# asserted on all three properties.
+case_16() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="pane report-agent:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not register"
+  assert_stderr_mentions "$(expected_new_pane)"
+  # mcode really was started, and naming was skipped: renaming a pane that was
+  # never registered cannot work, and trying would emit a second warning for
+  # one root cause.
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes reported)"
+}
+
+# --- case 17 ----------------------------------------------------------------
+# An older Herdr with no `report-agent` verb at all. Different failure from
+# case 16, same required outcome: exit 0, mcode launched, stderr explains.
+case_17() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="report-agent-unsupported"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not register"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes reported)"
+}
+
+# --- case 18 ----------------------------------------------------------------
+# Registration succeeds but the rename fails. The pane is then visible in
+# `agent list` yet unnamed, which is a half-working state the user cannot
+# diagnose on their own — so stderr must name the commands that will not work
+# (prompt / send-keys), not just say "rename failed".
+case_18() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAIL="agent rename:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_stderr_mentions "could not be renamed"
+  assert_stderr_mentions "send-keys"
+  assert_stderr_mentions "agent_not_ready"
+  # The registration and the name lookup both still happened.
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+}
+
+# --- case 19 ----------------------------------------------------------------
+# Name collision. `mcode` and `mcode-2` are already in use, so the entrypoint
+# must pick the next free slot rather than blindly renaming to `mcode` — which
+# on a real Herdr fails with agent_name_taken and leaves the agent unnamed.
+case_19() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  export FAKE_HERDR_FAULT="agent-names-taken"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
+  if ! grep -qF "$(printf 'agent	rename	%s	mcode-3' "$(expected_new_pane)")" "$FAKE_HERDR_LOG"; then
+    note "expected the rename to land on mcode-3 with mcode and mcode-2 taken"
+  fi
+}
+
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
   CASES_RUN=$((CASES_RUN + 1))
@@ -610,7 +709,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -654,6 +753,10 @@ for name in "${SELECTED[@]}"; do
     case-13) run_case case-13 case_13 ;;
     case-14) run_case case-14 case_14 ;;
     case-15) run_case case-15 case_15 ;;
+    case-16) run_case case-16 case_16 ;;
+    case-17) run_case case-17 case_17 ;;
+    case-18) run_case case-18 case_18 ;;
+    case-19) run_case case-19 case_19 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

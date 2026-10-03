@@ -55,6 +55,33 @@ json_field() {
   jq -r "if (${1}|type) == \"string\" then ${1} else empty end" 2>/dev/null || true
 }
 
+# next_agent_name - print the first free name in the sequence mcode, mcode-2,
+# mcode-3, ... and nothing (exit 0) when the list of agents cannot be read.
+#
+# WHY A SEQUENCE, AND NOT THE PANE ID. The name is what a human types into
+# `herdr agent prompt <name>`, so it has to be predictable and short. A pane id
+# or a hex suffix is unique for free but tells the user nothing, and a name
+# derived from the working directory collides the moment two workspaces share a
+# basename. The bare label the user already knows — `mcode` — is the best first
+# guess; the number exists only to disambiguate a second concurrent instance.
+#
+# The upper bound is a backstop, not a policy: ten concurrent mcode panes is far
+# past any real use, and running out must still leave a usable name.
+next_agent_name() {
+  local taken candidate n
+  taken="$("$HERDR" agent list 2>/dev/null | jq -r '.result.agents[]? | .name // empty' 2>/dev/null || true)"
+  n=1
+  while [ "$n" -le 10 ]; do
+    if [ "$n" -eq 1 ]; then candidate="${MCODE_BIN_NAME}"; else candidate="${MCODE_BIN_NAME}-${n}"; fi
+    if ! printf '%s\n' "$taken" | grep -qxF -- "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    n=$((n + 1))
+  done
+  printf '%s\n' "${MCODE_BIN_NAME}"
+}
+
 # resolve_mcode - print the absolute path to the launcher binary, or fail.
 resolve_mcode() {
   command -v "$MCODE_BIN_NAME" 2>/dev/null
@@ -267,8 +294,31 @@ cmd_start() {
   #
   #    --agent-session-id is omitted: mcode does not hand us one at launch, and
   #    inventing a session id would be worse than reporting none.
-  if ! "$HERDR" pane report-agent "$new_pane" --source minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
-    log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."
+  # 8. Name the agent, so it can be addressed by something a human would type.
+  #
+  #    `report-agent` alone gets the pane into `agent list` and no further: with
+  #    no active name, `herdr agent get`/`read` will not resolve it by name and
+  #    `prompt`/`send-keys` refuse it outright as "not an active named agent".
+  #    `agent rename` is what installs the name, and it only works on an already
+  #    registered agent — which is why this is nested inside the success branch
+  #    of step 7. Renaming a pane that was never registered cannot succeed, and
+  #    trying would turn one root cause into two warnings.
+  #
+  #    Same best-effort policy as step 7, for the same reason: the launch is
+  #    already done. A pane that is registered but unnamed is still better than
+  #    one that is invisible, so a failure here is a warning and exit 0 — and the
+  #    warning says exactly which commands are lost, because "it half worked"
+  #    with no consequence spelled out is how this gets misdiagnosed later.
+  if "$HERDR" pane report-agent "$new_pane" --source minimax-code --agent "$MCODE_BIN_NAME" --state idle; then
+    local agent_name
+    agent_name=$(next_agent_name)
+    if [ -z "$agent_name" ]; then
+      log "minimax-code: could not work out a free name for pane ${new_pane}, so it stays registered but unnamed. \`herdr agent get\` and \`read\` will need the pane id ${new_pane} instead, and \`prompt\`/\`send-keys\` will refuse it until it is named."
+    elif ! "$HERDR" agent rename "$new_pane" "$agent_name"; then
+      log "minimax-code: pane ${new_pane} is registered but could not be renamed, so it has no active name. \`herdr agent get\` and \`read\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will refuse it with agent_not_ready. The launch itself succeeded."
+    fi
+  else
+    log "minimax-code: could not register pane ${new_pane} with Herdr's agent surface, so it will not appear in \`herdr agent list\`, could not be named, and \`herdr agent prompt\`/\`send-keys\` will not work for it. The launch itself succeeded; nothing was rolled back. \`herdr agent list\` will show it once Herdr detects it, if it ever does."
   fi
 }
 
