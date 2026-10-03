@@ -43,7 +43,9 @@ FAKE_HERDR="$here/fake-herdr"
 # the env var was used by the *absence* of `pane current` in its log, and case 2
 # proves the fallback by that call's presence.
 SRC_PANE="wZ:p1"
-NEW_PANE="wZ:p2"
+# There is deliberately no NEW_PANE sentinel. The new pane id comes from the
+# captured fixture, never from a value the test invents, so no constant here
+# could ever drift away from reality without the suite noticing.
 
 BASE_PATH="$PATH"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-plugin-tests.XXXXXX")"
@@ -139,7 +141,6 @@ setup_case() {
   export FAKE_HERDR_LOG
   export FAKE_HERDR_FIXTURES="$here/fixtures"
   export FAKE_HERDR_SRC_PANE="$SRC_PANE"
-  export FAKE_HERDR_NEW_PANE="$NEW_PANE"
   export FAKE_HERDR_CWD="$CASE_DIR/project"
   export HERDR_BIN_PATH="$FAKE_HERDR"
   export PATH="$CASE_DIR/bin:$BASE_PATH"
@@ -156,8 +157,9 @@ run_entrypoint() {
 # What the stub will report. This mirrors the precedence documented in
 # tests/fake-herdr, deliberately and in the same place, so the two cannot drift:
 #
-#   cwd, source pane   Knob wins. The tests own these dimensions, and the stub
-#                      bypasses the fixture when the knob is set.
+#   cwd, source pane   Knob wins. The tests own these dimensions, so the stub
+#                      substitutes them into the *captured* response rather than
+#                      replacing it, and announces the substitution.
 #   new pane id        The captured fixture always wins, knob or not, because
 #                      that value must never be faked. It is queried out of the
 #                      fixture rather than hard-coded, so a re-capture cannot
@@ -168,17 +170,22 @@ run_entrypoint() {
 expected_cwd() { printf '%s' "$FAKE_HERDR_CWD"; }
 expected_current_pane() { printf '%s' "$FAKE_HERDR_SRC_PANE"; }
 
+# No fallback on purpose: tests/fixtures/ is mandatory now that the captures have
+# landed, and the stub exits non-zero if a fixture is missing. A quiet fallback
+# here would let the suite assert against something the stub never served.
 expected_new_pane() { # expected_new_pane
   local file="$FAKE_HERDR_FIXTURES/pane-split.json"
   local value
-  if [ -f "$file" ] && command -v jq >/dev/null 2>&1; then
-    value="$(jq -r '.result.pane.pane_id // empty' <"$file" 2>/dev/null)" || value=""
-    if [ -n "$value" ] && [ "$value" != "null" ]; then
-      printf '%s' "$value"
-      return 0
-    fi
+  if [ ! -f "$file" ] || ! command -v jq >/dev/null 2>&1; then
+    note "cannot read the new pane id from $file (jq present: $(command -v jq >/dev/null 2>&1 && echo yes || echo no))"
+    return
   fi
-  printf '%s' "$FAKE_HERDR_NEW_PANE"
+  value="$(jq -r '.result.pane.pane_id // empty' <"$file" 2>/dev/null)" || value=""
+  if [ -z "$value" ] || [ "$value" = "null" ]; then
+    note "pane-split.json carries no .result.pane.pane_id; the fixture may be stale"
+    return
+  fi
+  printf '%s' "$value"
 }
 
 # The `pane split` invocation, exactly as the entrypoint issues it. `--no-focus`
