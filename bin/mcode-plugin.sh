@@ -21,23 +21,20 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # path so the launch does not silently depend on the target pane's PATH.
 MCODE_BIN_NAME="mcode"
 
-# Ordered candidates for the new pane's id inside a `pane split` response.
+# The new pane's id in a `pane split` response.
 #
-# The real response shape is NOT captured yet: tests/fixtures/ does not exist
-# (see issue E), and PLAN.md forbids hard-coding a guessed path. Rather than
-# bet on one path, cmd_start tries these in order and takes the first
-# non-empty value. If none of them match, cmd_start exits non-zero WITHOUT
-# calling `pane run` - a command must never be typed into a pane that cannot
-# be positively identified.
+# VERIFIED, not guessed. tests/fixtures/pane-split.json is a real captured
+# response (Herdr 0.9.3, captured 2026-10-04) and:
+#   jq -r '.result.pane.pane_id' tests/fixtures/pane-split.json   ->  wZ:p8
 #
-# Once the fixture lands, collapse this list to the confirmed path.
-NEW_PANE_ID_PATHS=(
-  '.result.pane.pane_id'
-  '.result.pane.id'
-  '.result.pane_id'
-  '.pane.pane_id'
-  '.pane_id'
-)
+# Two traps this file must not walk into:
+#   - The plausible-looking alternative `.result.pane_id` yields `null`. Had
+#     that been used, every launch would trip the guard below and the plugin
+#     would never work, with no error to explain why.
+#   - `result.type` in the split response is `pane_info`, NOT `pane_split`
+#     (the split response is shaped like `pane get`). Nothing here may branch
+#     on `result.type`; the top-level `id` is the reliable discriminator.
+NEW_PANE_ID_FIELD='.result.pane.pane_id'
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "minimax-code: $*"; exit 1; }
@@ -46,8 +43,8 @@ die() { log "minimax-code: $*"; exit 1; }
 # document is unparseable or the path is absent. Never fails the caller.
 #
 # PATH is a jq path expression including its leading dot, e.g.
-# '.result.pane.pane_id'. These come from the literal NEW_PANE_ID_PATHS array
-# above, never from user input, so interpolating one into the filter is safe.
+# '.result.pane.pane_id'. These come from literal constants in this file,
+# never from user input, so interpolating one into the filter is safe.
 # Do not prepend another dot here: "..foo" is jq's recursive-descent operator,
 # which matches nothing here and would make every lookup return empty.
 json_field() {
@@ -122,27 +119,40 @@ cmd_start() {
 
   # 4. Split. Direction is fixed to right for this epic; making it
   #    configurable is a follow-up, not a nit to fix here.
+  #
+  #    --no-focus is deliberate, not inherited from a fixture note. The
+  #    action is registered for the `pane` context, so it can be fired from
+  #    the pane the user is actively typing in. If the split took focus,
+  #    their in-flight keystrokes would land in the brand-new pane in the
+  #    window between the split and mcode starting there. It also keeps the
+  #    invocation deterministic in the `workspace` context, where the source
+  #    pane comes from `pane current` and need not be the focused pane at
+  #    all. The trade-off: the user does not get focus stolen, but the new
+  #    pane still appears beside theirs with the agent visibly starting.
   local split_out=""
-  if ! split_out=$("$HERDR" pane split "$source_pane" --direction right ${cwd_args[@]+"${cwd_args[@]}"}); then
-    die "\`${HERDR} pane split ${source_pane} --direction right\` failed, so no new pane was created and nothing was launched."
+  if ! split_out=$("$HERDR" pane split "$source_pane" --direction right --no-focus ${cwd_args[@]+"${cwd_args[@]}"}); then
+    die "\`${HERDR} pane split ${source_pane} --direction right --no-focus\` failed, so no new pane was created and nothing was launched."
   fi
 
-  # 5. Extract the new pane id. Safety-critical branch: if the new pane cannot
-  #    be identified we stop here, because `pane run` against a wrong or
-  #    unknown pane id types a command into the wrong window.
-  local new_pane=""
-  local candidate=""
-  local path=""
-  for path in "${NEW_PANE_ID_PATHS[@]}"; do
-    candidate=$(printf '%s' "$split_out" | json_field "$path")
-    if [ -n "$candidate" ]; then
-      new_pane="$candidate"
-      break
-    fi
-  done
+  # 5. Extract the new pane id.
+  #
+  #    SAFETY GATE. Both guards below call die, which exits non-zero, so
+  #    `pane run` at step 6 is UNREACHABLE whenever the new pane cannot be
+  #    identified. `pane run` types text into a pane id; a wrong or empty id
+  #    means typing a command into the wrong window, or into no window at all.
+  #    Never reorder or weaken these two conditions to "log and continue".
+  local new_pane
+  new_pane=$(printf '%s' "$split_out" | json_field "$NEW_PANE_ID_FIELD")
 
-  if [ -z "$new_pane" ]; then
-    die "the split of pane ${source_pane} succeeded but its response carried no new pane id, so the new pane cannot be identified. Refusing to run \`${MCODE_BIN_NAME}\` in an unidentified pane. A new pane may exist: check the layout and close it by hand if it is empty."
+  if [ -z "$new_pane" ] || [ "$new_pane" = "null" ]; then
+    die "the split of pane ${source_pane} succeeded but '${NEW_PANE_ID_FIELD}' was empty in its response, so the new pane cannot be identified. Refusing to run \`${MCODE_BIN_NAME}\` in an unidentified pane. A new pane may exist: check the layout and close it by hand if it is empty."
+  fi
+
+  # A split always produces a *different* pane, so a response naming the
+  # source pane means the field layout changed and we misread it. Typing
+  # there would hijack the pane the user is working in.
+  if [ "$new_pane" = "$source_pane" ]; then
+    die "the split of pane ${source_pane} reported that same pane as the new one, so its response was not understood. Refusing to run \`${MCODE_BIN_NAME}\` into the source pane. Check the layout; a new pane may exist."
   fi
 
   # 6. Run the launcher in the new pane.
