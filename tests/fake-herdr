@@ -50,16 +50,40 @@
 # `${VAR+x}` tests *set-ness*, not non-emptiness, so an intentionally empty knob
 # is still honoured.
 #
+# ---- FAULT INJECTION: one list, not one variable per fault -------------------
+# FAKE_HERDR_FAULT is a comma-separated list of response faults. Earlier
+# revisions used a boolean per fault, which meant every added case brought a new
+# environment variable, a new convention in run.sh, and another line of prose to
+# keep true. One list keeps the surface flat however many faults exist.
+#
+#   split-echoes-source   the split response names the SOURCE pane as the new
+#                         one — the pane the user is typing in, which must
+#                         never be typed into
+#   current-no-pane-id    `pane current` succeeds but carries no pane id
+#   split-null-pane-id    the split response's pane id is JSON null, not ""
+#   split-no-pane-id      the split response's pane id is blank
+#
+# Every fault is a *variant of the real capture*: jq rewrites one field and leaves
+# the envelope, id, type, scroll and every other field exactly as herdr produced
+# them. No fault invents a pane id, because a hand-written id would let the suite
+# pass against something herdr never returns.
+#
+# A fault is announced on stderr when it applies, like the knob substitutions
+# above: nothing this stub does to a response is quiet.
+#
+# Separately, FAKE_HERDR_FAIL injects non-zero *exit statuses* and is already a
+# list. Together they cover both halves of a faulty CLI: the calls that fail, and
+# the calls that succeed with the wrong content.
+#
 # Test-only knobs:
 #   FAKE_HERDR_LOG        file to append the invocation log to (required)
 #   FAKE_HERDR_FIXTURES   fixture directory (default: <repo>/tests/fixtures)
 #   FAKE_HERDR_FAIL       "<subcommand>[:<exit-code>]", e.g. "pane split:1".
-#                         Matched against the first two argv fields, so
-#                         "pane split" fails only the split call. Comma-separated
-#                         for several.
+#                         Comma-separated; matched against the first two argv
+#                         fields, so "pane split" fails only the split call.
+#   FAKE_HERDR_FAULT      comma-separated response faults, listed above
 #   FAKE_HERDR_CWD        cwd substituted into `pane get` / `pane current`
 #   FAKE_HERDR_SRC_PANE   pane id substituted into `pane get` / `pane current`
-#   FAKE_HERDR_SPLIT_NO_PANE_ID  serve a split response with the pane id blanked
 
 set -euo pipefail
 
@@ -111,6 +135,22 @@ src_pane="${FAKE_HERDR_SRC_PANE:-wZ:p1}"
 # Normalised, so a default cwd never leaks a trailing "/.." into a --cwd value.
 src_cwd="${FAKE_HERDR_CWD:-$(cd -- "$here/.." && pwd)}"
 
+faults=",${FAKE_HERDR_FAULT:-},"
+
+# Membership test on the comma-separated fault list. The list is wrapped in
+# commas on both sides so `split-no-pane-id` cannot match as a substring of some
+# longer name.
+has_fault() { # has_fault <name>
+  case "$faults" in
+    *",$1,"*) return 0 ;;
+  esac
+  return 1
+}
+
+announce_fault() { # announce_fault <name> <what-it-did>
+  printf 'fake-herdr: FAKE_HERDR_FAULT=%s — %s\n' "$1" "$2" >&2
+}
+
 fixture_path() { # fixture_path <name>; prints the path, or exits non-zero
   local file="$fixtures/$1.json"
   if [ ! -f "$file" ]; then
@@ -129,9 +169,12 @@ fixture_path() { # fixture_path <name>; prints the path, or exits non-zero
 # fields substituted when a knob is set. See KNOB PRECEDENCE above.
 emit_pane_info() { # emit_pane_info <fixture-name>
   local name="$1"
-  local file filter='.'
+  local file
   file="$(fixture_path "$name")"
-  if [ -n "${FAKE_HERDR_CWD+x}" ] || [ -n "${FAKE_HERDR_SRC_PANE+x}" ]; then
+  if [ "$name" = "pane-current" ] && has_fault current-no-pane-id; then
+    announce_fault current-no-pane-id "blanking the pane id in the captured $name response"
+    jq -c '.result.pane.pane_id = ""' "$file"
+  elif [ -n "${FAKE_HERDR_CWD+x}" ] || [ -n "${FAKE_HERDR_SRC_PANE+x}" ]; then
     printf 'fake-herdr: knob set, substituting pane_id/cwd into the captured %s response\n' \
       "$name" >&2
     jq -c --arg p "$src_pane" --arg c "$src_cwd" \
@@ -141,15 +184,25 @@ emit_pane_info() { # emit_pane_info <fixture-name>
   fi
 }
 
-# A `pane split` response whose pane id has been blanked: the case where the split
-# succeeded but told us nothing. Derived from the real capture, so exactly one
-# field differs from reality. Bypasses the fixture on purpose, and says so.
-emit_split_without_pane_id() { # emit_split_without_pane_id
+# `pane split`: the captured response, or a one-field variant of it.
+emit_split() { # emit_split
   local file
   file="$(fixture_path pane-split)"
-  printf 'fake-herdr: FAKE_HERDR_SPLIT_NO_PANE_ID set, blanking the pane id in %s\n' \
-    "$file" >&2
-  jq -c '.result.pane.pane_id = ""' "$file"
+  if has_fault split-echoes-source; then
+    # The source pane is substituted, never invented: the scenario is that the
+    # response layout changed and we misread it, so the split "new pane" is the
+    # pane the user is already in. The captured envelope is untouched.
+    announce_fault split-echoes-source "pointing the split response at the source pane $src_pane"
+    jq -c --arg p "$src_pane" '.result.pane.pane_id = $p' "$file"
+  elif has_fault split-null-pane-id; then
+    announce_fault split-null-pane-id "setting the split response's pane id to JSON null"
+    jq -c '.result.pane.pane_id = null' "$file"
+  elif has_fault split-no-pane-id; then
+    announce_fault split-no-pane-id "blanking the pane id in the captured split response"
+    jq -c '.result.pane.pane_id = ""' "$file"
+  else
+    jq -c '.' "$file"
+  fi
 }
 
 if [ "${1:-}" = "--self-check" ]; then
@@ -169,11 +222,7 @@ case "$sub" in
     emit_pane_info pane-current
     ;;
   "pane split")
-    if [ -n "${FAKE_HERDR_SPLIT_NO_PANE_ID:-}" ]; then
-      emit_split_without_pane_id
-    else
-      jq -c '.' "$(fixture_path pane-split)"
-    fi
+    emit_split
     ;;
   "pane run")
     # The entrypoint checks this call's exit status only and never reads its
