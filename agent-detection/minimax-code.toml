@@ -1,0 +1,158 @@
+# mcode agent-detection manifest
+#
+# Inert on herdr 0.9.3, deliberately so — see "WHY THIS FILE DOES NOTHING TODAY".
+# It exists so that the moment upstream ships an mcode manifest, ours shadows
+# theirs, and so the upstream ask becomes a tested contribution rather than a
+# request. Reference implementation: the working manifests in
+# ~/.local/state/herdr/agent-detection/remote/ (claude.toml, amp.toml, cline.toml).
+#
+# EVERY rule below was read out of a real captured mcode screen saved in
+# tests/fixtures/agent-detection/, with the exact capture command, herdr version
+# and date recorded in that directory's README. Nothing here is imagined.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE DOES NOTHING TODAY — do not "fix" this by claiming otherwise
+# ---------------------------------------------------------------------------
+# A local override at ~/.config/herdr/agent-detection/<agent>.toml is applied
+# when the agent id ALREADY EXISTS in herdr's manifest set, and is SILENTLY
+# DROPPED when the id is new: no warning, no error, no entry in
+# `herdr server agent-manifests`. Measured, not assumed. Since `mcode` is not a
+# known id on 0.9.3, shipping this file cannot make mcode detectable. This is
+# the third of the three documented ceilings, and this file is the long game
+# against it — not a fix for it.
+#
+# ---------------------------------------------------------------------------
+# WHY THERE ARE NO osc_title RULES HERE
+# ---------------------------------------------------------------------------
+# Most of herdr's manifests key off the OSC title, and it is tempting to follow
+# suit. It does not work for mcode, and the measurement says why: mcode sets the
+# terminal title to the CURRENT ACTIVITY, not to a state. Observed live on
+# 2026-10-04, herdr 0.9.3:
+#
+#   wZ:p3  status=idle     title="Run proclaude flock inbox command"
+#   wZ:p4  status=working  title="Run proclaude flock inbox command"
+#   wZ:p5  status=idle     title="Run proclaude flock inbox command"
+#
+# The same title text across idle and working. An osc_title rule would be a rule
+# that cannot fire correctly, so there is not one. A title also leaks user content
+# into a detection heuristic, which is its own hazard.
+#
+# ---------------------------------------------------------------------------
+# WHY EVERY RULE IS SCOPED TO bottom_non_empty_lines
+# ---------------------------------------------------------------------------
+# A finished turn leaves its work behind in the scrollback. The captured
+# post-turn snapshot contains a line reading
+#
+#     └ Completed in 3s · ⚡ 667 tok/s
+#
+# which contains a throughput counter but NO work in progress. A rule that scanned
+# the whole buffer for throughput markers would call a finished session "working"
+# forever. Scoping to the bottom window is what makes these rules correct rather
+# than merely plausible; the watcher in bin/mcode-watch.sh found this the hard way
+# and its case `stale-scrollback-is-idle` is the same lesson in bash.
+
+id = "mcode"
+version = "2026.10.04.1"
+min_engine_version = 2
+updated_at = "2026-10-04T00:00:00Z"
+aliases = ["mcode", "minimax", "minimax-code"]
+
+# ---------------------------------------------------------------------------
+# WORKING
+# ---------------------------------------------------------------------------
+# Observed on wZ:p5 while genuinely busy:
+#   "   ⠸ Retrying model request · 1/5 · next in 697ms · Timeout · code 50113
+#    7min7s · ⚡ 26117 tok/s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop"
+# and earlier in the same session:
+#   "   ⠏ Loading 34s · ⚡ 27584 tok/s · Option+Enter queue · Enter steer · Ctrl+O
+#    details · Esc stop"
+#
+# The braille frame is required and "Esc stop" is required. Either alone is unsafe:
+# the braille set is reused by other TUIs, and "Esc stop" alone would match the
+# help text a user could have on screen. Together they are the live status strip.
+[[rules]]
+id = "mcode_status_strip_working"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+# Braille spinner, then mcode's own "Esc stop" affordance on the same line.
+regex = ['(?m)^[\s]*[\x{2800}-\x{28FF}][^\n]*Esc stop']
+
+# The activity/steps block mcode renders while a turn is in flight:
+#   "   … +4 more · 0/7 done · 6 pending · Ctrl+T expand"
+# "Ctrl+T expand" only exists while that block is live.
+[[rules]]
+id = "mcode_steps_working"
+state = "working"
+priority = 1080
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = ['^[\s]*…[\s]+\+\d+[\s]+more[\s·]+\d+/\d+[\s]+done[\s·]+\d+[\s]+pending[\s·]+Ctrl\+T[\s]+expand']
+
+# ---------------------------------------------------------------------------
+# IDLE
+# ---------------------------------------------------------------------------
+# mcode has TWO distinct resting shapes, and both are idle. A manifest that only
+# knew the first would leave an ordinary finished session looking like nothing in
+# particular, which is how state detection quietly stops being trustworthy.
+#
+# (a) after a turn, in the composer:
+#       "  └ Completed in 3s · ⚡ 667 tok/s"
+#       "    Message · Enter send · Shift+Enter newline"
+[[rules]]
+id = "mcode_composer_idle"
+state = "idle"
+priority = 500
+region = "bottom_non_empty_lines(12)"
+visible_idle = true
+line_regex = ['^[\s]*Message[\s·]+Enter[\s]+send']
+
+[[rules]]
+id = "mcode_turn_complete_idle"
+state = "idle"
+priority = 495
+region = "bottom_non_empty_lines(12)"
+visible_idle = true
+# "Completed in <n>s" only appears once the turn is over. Guarded against the
+# spinner strip so this cannot outrank a genuinely running turn.
+#
+# HONESTY NOTE, because a mutation check found it: this `not` guard is NOT
+# exercised by any capture in tests/fixtures/agent-detection/. Deleting it leaves
+# every current fixture classifying the same, because no capture exists where a
+# "Completed in" line and a live spinner coexist in the same bottom window. It is
+# kept as defence against a case that is plausible - mcode rendering per-step
+# completions during a multi-step turn, or a previous turn's completed line still
+# in the window when the next one starts - but it has NOT been observed. Whoever
+# captures such a screen should either add it as a fixture or delete this guard
+# rather than leave an unexercised rule implying a guarantee it has not earned.
+line_regex = ['^[\s]*[└└─\s]*Completed[\s]+in[\s]+[0-9]+(?:s|m|h)']
+not = [
+  { regex = ['(?m)^[\s]*[\x{2800}-\x{28FF}][^\n]*Esc stop'] },
+]
+
+# (b) a fresh session, at the start prompt:
+#       "   Start · @ file or Plugin · / autocomplete"
+[[rules]]
+id = "mcode_start_prompt_idle"
+state = "idle"
+priority = 490
+region = "bottom_non_empty_lines(12)"
+visible_idle = true
+line_regex = ['^[\s]*Start[\s·]+@[\s]+file[\s]+or[\s]+Plugin']
+
+# ---------------------------------------------------------------------------
+# NOT IMPLEMENTED, DELIBERATELY
+# ---------------------------------------------------------------------------
+# There is no `blocked` rule. `blocked` means herdr recognised an approval or
+# question UI, and no such mcode screen has ever been captured: mcode 0.6.2 runs
+# these sessions at `Full access`, where no permission prompt is raised, and the
+# permission level is a session setting rather than a CLI flag, so the state could
+# not be produced without inventing it. A rule that has never fired is a lie in
+# the one file whose entire job is telling the truth about what mcode is doing.
+#
+# mcode has `/permission`, so an approval prompt IS reachable by a human in a
+# session that has changed mode. Whoever captures one should add a
+# `mcode_permission_prompt_blocked` rule with the captured fixture beside it, and
+# note that a prompt is the FIRST thing worth checking for blocked - more likely
+# than any spinner, which means "busy" rather than "waiting for you".
