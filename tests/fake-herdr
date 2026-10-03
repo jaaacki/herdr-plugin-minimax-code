@@ -129,7 +129,12 @@ if [ -n "${FAKE_HERDR_FAIL:-}" ]; then
       *)   want_sub="$w"; want_code=1 ;;
     esac
     if [ "$sub" = "$want_sub" ]; then
-      printf 'fake-herdr: injected failure for "%s" (exit %s)\n' "$sub" "$want_code" >&2
+      # The marker matters: the entrypoint's own diagnostics also contain the
+      # subcommand name, so a test asserting on that text cannot tell the
+      # entrypoint's message from this one being relayed. This token appears only
+      # here, so its presence in the entrypoint's stderr proves the relay happened.
+      printf 'fake-herdr: injected failure for "%s" (exit %s) [%s]\n' \
+        "$sub" "$want_code" "${FAKE_HERDR_STUB_MARKER:-herdr-stub-failure}" >&2
       exit "$want_code"
     fi
   done

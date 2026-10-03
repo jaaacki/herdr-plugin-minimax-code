@@ -459,11 +459,18 @@ case_9() {
   setup_case
   export HERDR_PANE_ID="$SRC_PANE"
   export FAKE_HERDR_FAIL="pane get:1"
+  export FAKE_HERDR_STUB_MARKER="herdr-stub-failure-marker-xyz"
 
   run_entrypoint
   assert_rc_zero "$RC"
   assert_stderr_mentions "pane get"
   assert_stderr_mentions "$SRC_PANE"
+  # The point of the pane-get-stderr fix: herdr's OWN stderr reaches the user, not
+  # just the entrypoint's paraphrase of it. This marker exists only in the stub's
+  # output, so finding it here proves the relay. Re-suppressing the child's stderr
+  # makes the token vanish and this assertion fail - which is the point: without
+  # it, reverting that fix would leave the suite green.
+  assert_stderr_mentions "herdr-stub-failure-marker-xyz"
   # The entrypoint reports a *failed read* and a *pane that reported no cwd* with
   # different wording, because they are different problems. Collapsing them hides
   # the cause, so assert the failed-read branch and refuse the other one.
@@ -581,6 +588,10 @@ case_15() {
   assert_rc_nonzero "$RC"
   assert_stderr_nonempty
   assert_stderr_mentions "relative"
+  # The diagnostic must NAME the offending value, not merely mention the word
+  # "relative": a user cannot act on "your path was relative" but they can act on
+  # the exact PATH entry that caused it.
+  assert_stderr_mentions "bin/mcode"
   # Must not have split: the whole point is refusing before the multiplexer.
   assert_log_empty
 }
