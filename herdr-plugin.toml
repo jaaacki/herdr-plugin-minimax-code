@@ -1,8 +1,8 @@
 id = "jaaacki.minimax-code"
 name = "MiniMax Code"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.3"
-description = "Start and track MiniMax Code agents from Herdr"
+description = "Start MiniMax Code in a new pane for the active worktree"
 platforms = ["linux", "macos"]
 
 # Actions appear in Herdr's action menu for the given contexts.
@@ -14,18 +14,3 @@ title = "Start MiniMax Code in this worktree"
 description = "Launch `mcode` in a new pane for the active worktree"
 contexts = ["workspace", "pane"]
 command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "start"]
-
-[[actions]]
-id = "minimax-code-status"
-title = "MiniMax Code agent status"
-description = "List detected MiniMax Code agents and their state"
-contexts = ["global", "workspace", "tab", "pane"]
-command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "status"]
-
-# Event hooks fire on herdr events. Unknown names are non-fatal: herdr keeps the
-# plugin and surfaces a warning through `herdr plugin list --json`.
-#   herdr plugin log list --plugin jaaacki.minimax-code
-
-[[events]]
-on = "pane.agent_status_changed"
-command = ["${HERDR_PLUGIN_ROOT}/bin/mcode-plugin.sh", "on-status-change"]
