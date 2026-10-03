@@ -10,10 +10,11 @@ the `herdr pane split` response.** Nobody should hard-code a guessed path.
 `pane get` and `pane current`. It is not nested any deeper, and there is no array of panes
 to index into.
 
+Verified by an actual `jq` run against the captured response in this directory:
+
 ```console
-$ herdr pane split wZ:p4 --direction right --no-focus > split.json
-$ jq -r '.result.pane.pane_id' split.json
-wZ:p7
+$ jq -r '.result.pane.pane_id' tests/fixtures/pane-split.json
+wZ:p8
 ```
 
 The response envelope is `{ "id": "cli:pane:split", "result": { "pane": { ... } } }`, and
@@ -21,45 +22,104 @@ The response envelope is `{ "id": "cli:pane:split", "result": { "pane": { ... } 
 distinguish the split response; the top-level `id` (`cli:pane:split`) is the reliable
 discriminator if you need one.
 
-For the plugin entrypoint this means, in `cmd_start`:
+The plausible alternative guess does not resolve — it yields `null`:
+
+```console
+$ jq -r '.result.pane_id' tests/fixtures/pane-split.json
+null
+```
+
+### The shape is flag-independent
+
+Captured twice, with different flags, and the `jq` path and `result.type` were identical
+both times:
+
+| Flags | New pane id | `result.type` |
+|---|---|---|
+| `--direction right --no-focus` | `wZ:p7` | `pane_info` |
+| `--direction right --cwd <path> --no-focus` | `wZ:p8` | `pane_info` |
+
+`--cwd` *does* flow through into the response: the returned pane's `cwd` is whatever was
+passed to `--cwd`. It does not change where the pane id lives.
+
+## For the `cmd_start` implementer (issue #3)
+
+Verified form — pass the source pane explicitly:
 
 ```bash
-if ! out=$("$HERDR" pane split --direction right --no-focus); then
+if ! out=$("$HERDR" pane split "$HERDR_PANE_ID" --direction right --cwd "$PWD"); then
   printf 'mcode: pane split failed\n' >&2
   exit 1
 fi
 new_pane=$(printf '%s' "$out" | jq -r '.result.pane.pane_id')
-# exit non-zero here if $new_pane is empty/null before any `pane run`
+# exit non-zero if $new_pane is empty or the string "null" BEFORE any `pane run`
 ```
 
-`.result.pane.pane_id` is the only path verified by an actual `jq` run against a captured
-response. The alternative guess `.result.pane_id` does **not** resolve — it yields `null`.
+This was replayed under `set -euo pipefail` against the fixture and yields `wZ:p8`.
+
+**Unverified — do not assume:** the bare `herdr pane split` form with no `PANE_ID` argument.
+`herdr pane split --help` marks `[PANE_ID]` optional, and `herdr pane current` correctly
+resolved the calling pane even while a *different* pane held focus — but the bare form was
+deliberately **not** tested, because if it resolves to the focused pane rather than the
+caller's, testing it would have split another member's pane, which issue #7 forbids. Resolve
+the pane id explicitly (`$HERDR_PANE_ID`, or `herdr pane current`) and pass it.
+
+## Why the metadata is in this file and not inside the fixtures
+
+Issue #7 asks for "a comment in the fixture file". **That is not possible for a `.json`
+fixture without breaking it** — `jq` does not accept comments:
+
+```console
+$ printf '{"a":1}\n# comment\n' > /tmp/c.json
+$ jq -r '.a' /tmp/c.json
+jq: parse error: Invalid numeric literal at line 2, column 2
+1
+$ echo $?
+5
+```
+
+Exit 5. A `#` comment would make the fixture unusable by every consumer that reads it with
+`jq` — which, given these fixtures exist to be parsed by `jq`, defeats their entire purpose.
+So the per-file command, version, and date live here instead. Stated loudly rather than
+silently worked around, per the issue's own instruction not to paper over surprises.
 
 ## Captures
 
-All three captured on **2026-10-04** (03:51 +0800) against **herdr 0.9.3**
+All three captured on **2026-10-04** (03:51–03:56 +0800) against **herdr 0.9.3**
 (`/Users/noonoon/.local/bin/herdr`), `jq` 1.7.1 at `/usr/bin/jq`.
 
 | File | Exact command | Response `id` | `result.type` |
 |---|---|---|---|
 | `pane-get.json` | `herdr pane get wZ:p4` | `cli:pane:get` | `pane_info` |
 | `pane-current.json` | `herdr pane current` | `cli:pane:current` | `pane_current` |
-| `pane-split.json` | `herdr pane split wZ:p4 --direction right --no-focus` | `cli:pane:split` | `pane_info` |
+| `pane-split.json` | `herdr pane split wZ:p4 --direction right --cwd /Users/noonoon/Dev/.worktrees/herdr-plugin-minimax-code-7 --no-focus` | `cli:pane:split` | `pane_info` |
 
 `pane-get.json` and `pane-current.json` were captured against pane `wZ:p4`, which is the
 pane that ran the commands — so both are views of the *caller's own* pane.
 
-`pane-split.json` is a real state mutation: it split `wZ:p4` and returned the newly created
-pane `wZ:p7`. That scratch pane was closed again immediately after capture
-(`herdr pane close wZ:p7` → `{"id":"cli:pane:close","result":{"type":"ok"}}`), and
-`wZ:p4` was left running. No other pane was touched.
+`pane-split.json` is a real state mutation. It split `wZ:p4` and returned the newly created
+pane `wZ:p8`; that scratch pane was closed immediately after capture
+(`herdr pane close wZ:p8` → `{"id":"cli:pane:close","result":{"type":"ok"}}`). An earlier
+capture during the same session created and closed `wZ:p7` the same way. `wZ:p4` was left
+running and no other member's pane was touched.
 
-## Caveat for whoever writes the test harness
+`pane-split.json` deliberately uses the flag combination issue #4 expects the plugin to emit
+(`--direction right --cwd <path>`), so the fixture matches the real invocation rather than a
+convenient one.
 
-These are verbatim captures, so they contain volatile fields that change on every call:
-`revision`, `terminal_id`, `focused`, and `scroll.max_offset_from_bottom`. `cwd` and
-`foreground_cwd` are absolute paths from the capturing machine
-(`/Users/noonoon/Dev/herdr-plugin-minimax-code`).
+## For whoever writes the test harness (issue #4 / C2)
 
-Assert on stable fields only — `pane_id`, `tab_id`, `workspace_id`, `id`, and
-`result.type`. Do not assert on `revision`, `terminal_id`, or anything under `scroll`.
+The `fake-herdr` stub reads canned responses from `tests/fixtures/`. The three filenames are
+exactly:
+
+- `tests/fixtures/pane-get.json`
+- `tests/fixtures/pane-current.json`
+- `tests/fixtures/pane-split.json`
+
+These captures are verbatim, so they contain volatile fields that change on every call:
+`revision`, `terminal_id`, `focused`, `scroll.max_offset_from_bottom`, and absolute `cwd` /
+`foreground_cwd`.
+
+Assert on stable fields only — `pane_id`, `tab_id`, `workspace_id`, `id`, and `result.type`.
+Do not assert on `revision`, `terminal_id`, `focused`, or anything under `scroll`. If the
+harness needs a stable `cwd`, inject it via `--cwd` rather than relying on the captured value.
