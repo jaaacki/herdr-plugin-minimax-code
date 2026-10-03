@@ -145,12 +145,41 @@ case_transition_reported() {
 }
 
 # On exit the watcher must hand lifecycle authority back.
-case_releases_on_exit() {
+# The watcher must NEVER call release-agent.
+#
+# It used to, on every exit path, on the theory that it hands lifecycle authority
+# back so herdr's screen detection can resume. release-agent actually DELETES the
+# entry, so a single --once poll made the pane vanish from `herdr agent list`,
+# destroying the registration cmd_start had just made. There is no screen
+# manifest to fall back to, so nothing is "resumed".
+case_never_releases() {
   setup
   WATCH_SNAPSHOTS="$FIX/idle.txt"; export WATCH_SNAPSHOTS
   run_watch wZ:p1 --once
-  if grep -qF 'release-agent' "$WATCH_LOG"; then ok
-  else bad "no release-agent on exit; herdr's own detection cannot resume"; fi
+  if grep -qF 'release-agent' "$WATCH_LOG"; then
+    bad "watcher called release-agent; that deletes the agent entry cmd_start made"
+  else ok; fi
+}
+
+# The pane-died path must not release either.
+case_pane_gone_does_not_release() {
+  setup
+  WATCH_PANE_GONE=1; export WATCH_PANE_GONE
+  run_watch wZ:p1 --once
+  if grep -qF 'release-agent' "$WATCH_LOG"; then
+    bad "watcher called release-agent on the pane-gone path"
+  else ok; fi
+}
+
+# The --source namespace is enforced: a reporter that drifts off
+# `herdr:minimax-code` would be silently unmatchable by herdr, so the stub
+# rejects it and the case must go red.
+case_source_namespace_is_herdr_minimax_code() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle.txt"; export WATCH_SNAPSHOTS
+  run_watch wZ:p1 --once
+  if grep -F 'report-agent' "$WATCH_LOG" | grep -qF -- '--source herdr:minimax-code'; then ok
+  else bad "report-agent did not use --source herdr:minimax-code: $(grep -F 'report-agent' "$WATCH_LOG" | tr '\n' ' ')"; fi
 }
 
 # A watched pane that disappears must stop the watcher, not report for a ghost.
@@ -203,7 +232,9 @@ CASES=(
   unmatched-is-unknown-not-blocked:case_unmatched_is_unknown_not_blocked
   no-traffic-no-report:case_no_traffic_no_report
   transition-reported:case_transition_reported
-  releases-on-exit:case_releases_on_exit
+  never-releases:case_never_releases
+  pane-gone-does-not-release:case_pane_gone_does_not_release
+  source-namespace-is-herdr-minimax-code:case_source_namespace_is_herdr_minimax_code
   pane-gone-stops:case_pane_gone_stops
   pane-id-passed-through:case_pane_id_passed_through
 )

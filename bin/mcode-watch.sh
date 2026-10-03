@@ -22,7 +22,13 @@ set -euo pipefail
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
 AGENT_LABEL="mcode"
-AGENT_SOURCE="minimax-code"
+# --source namespace. Must match the other two reporters - bin/mcode-plugin.sh
+# and bin/mcode-session.sh - and follows herdr's own `herdr:<agent>` convention,
+# which is what the Claude integration hook uses. herdr uses this to tell
+# reporters apart, so three different values for one agent defeats the point.
+# It also has to match for release-agent to match, though this watcher no longer
+# calls that.
+AGENT_SOURCE="${MCODE_AGENT_SOURCE:-herdr:minimax-code}"
 
 INTERVAL=2
 LINES=40
@@ -176,12 +182,25 @@ report_state() { # report_state <state>
     --state "$1"
 }
 
-# Hand lifecycle authority back so herdr's own screen detection can resume.
-release() {
-  "$HERDR" pane release-agent "$PANE_ID" \
-    --source "$AGENT_SOURCE" \
-    --agent "$AGENT_LABEL" >/dev/null 2>&1 || true
-}
+# Deliberately absent: release().
+#
+# An earlier version called `herdr pane release-agent` on every exit path, on the
+# theory that it hands lifecycle authority back so herdr's own screen detection
+# can resume. That is wrong, and it was measured rather than assumed:
+# `release-agent` DELETES the agent entry. It does not revert to a screen-
+# detected state, because there is no screen manifest for mcode to fall back to
+# - that is the premise of this whole epic. So the old `release` meant that
+# running the watcher once made the pane vanish from `herdr agent list`, taking
+# with it the registration cmd_start had just made. Running the tool to get
+# state reporting lost you the agent entry you already had.
+#
+# Registration is pane-scoped and dies with the pane, which is the whole reason
+# nothing needs cleaning up. If herdr ever gains an mcode screen manifest,
+# releasing becomes correct again - that is the Layer 1 work, not today's
+# problem.
+#
+# The traps stay, because Ctrl-C should still end the watcher cleanly. It is
+# only the release-agent call that had to go.
 
 pane_alive() {
   "$HERDR" pane get "$PANE_ID" >/dev/null 2>&1
@@ -193,8 +212,9 @@ read_detection() {
 
 # --- main loop ---------------------------------------------------------------
 
-trap 'release; exit 0' INT TERM
-trap 'release' EXIT
+# Traps keep Ctrl-C and SIGTERM ending the watcher cleanly, and nothing else:
+# see the note above on why there is no release().
+trap 'exit 0' INT TERM
 
 # Baseline: classify once and report it, so herdr is never left at a stale state
 # inherited from before the watcher started. Only then do we start watching for
@@ -209,9 +229,9 @@ while :; do
   polls=$(( polls + 1 ))
 
   if ! pane_alive; then
-    # The watched pane is gone. Stop; do not report a state for a pane that no
-    # longer exists.
-    release
+    # The watched pane is gone. Stop. Deliberately do NOT report a state for a
+    # pane that no longer exists, and do NOT call release-agent: the
+    # registration is pane-scoped and herdr drops it with the pane.
     exit 0
   fi
 

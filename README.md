@@ -93,11 +93,12 @@ Things worth knowing:
   deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
   session's permission mode with `/permission` and a prompt becomes reachable, at
   which point the rule can be written from real evidence.
-- **It stops when the pane it watches disappears**, and calls `release-agent` so a
-  registration it created does not outlive it. Note that `release-agent` only removes a
-  registration made with the *same* `--source`; a mismatched one is a silent no-op. So the
-  watcher's cleanup only covers registrations it made itself — check with
-  `herdr agent list | grep -c <pane-id>` rather than trusting the call.
+- **It stops when the pane it watches disappears**, and that is the whole of its cleanup.
+  It deliberately does *not* call `release-agent`: that call **deletes** the agent entry
+  rather than handing authority back, so an earlier version of this watcher made your
+  pane disappear from `herdr agent list` as soon as it exited. There is no `mcode`
+  screen manifest for detection to fall back to, so nothing would resume even if it
+  worked. Registration is pane-scoped and Herdr drops it with the pane.
 - Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
   a real captured screen; the comments record which candidates were rejected and why.
 
