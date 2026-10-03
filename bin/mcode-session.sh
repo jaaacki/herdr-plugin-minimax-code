@@ -30,7 +30,7 @@
 #   HERDR_BIN_PATH         path to the herdr binary
 #   HERDR_PANE_ID          the pane to register — this pane. Required for `report`.
 #   MCODE_AGENT_LABEL      agent label to register under      (default: minimax-code)
-#   MCODE_AGENT_SOURCE     --source value for the report      (default: the plugin id)
+#   MCODE_AGENT_SOURCE     --source value for the report      (default: herdr:minimax-code)
 #   MCODE_HOME             mcode's data dir                   (default: $HOME/.minimax)
 #   MCODE_RESUME_CMD       resume command, space-separated   (default: "mcode --continue")
 #
@@ -41,7 +41,11 @@ set -euo pipefail
 HERDR="${HERDR_BIN_PATH:-herdr}"
 MCODE_HOME="${MCODE_HOME:-$HOME/.minimax}"
 AGENT_LABEL="${MCODE_AGENT_LABEL:-minimax-code}"
-AGENT_SOURCE="${MCODE_AGENT_SOURCE:-jaaacki.minimax-code}"
+# --source namespace. Must match the other two reporters, and follows herdr's
+# own `herdr:<agent>` convention (see the Claude integration hook). herdr uses
+# this to tell reporters apart; three different values for one agent defeats it.
+# Overridable for testing, like the label above.
+AGENT_SOURCE="${MCODE_AGENT_SOURCE:-herdr:minimax-code}"
 
 # The resume command herdr will re-run in the restored pane.
 #

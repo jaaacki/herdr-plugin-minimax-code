@@ -237,7 +237,11 @@ set_mtime() { # set_mtime <file> <YYYYMMDDhhmmss>
 # --- expectations ------------------------------------------------------------
 # The agent state herdr already records for the pane, as the stub serves it.
 EXPECTED_STATE="working"
-EXPECTED_SOURCE="jaaacki.minimax-code"
+# --source must be herdr:minimax-code in all three reporters. Asserted here as a
+# literal, not read from the script under test: a test that derived its own
+# expectation from the implementation would agree with any value, including the
+# wrong one. This is the value the other two reporters use too.
+EXPECTED_SOURCE="herdr:minimax-code"
 EXPECTED_LABEL="minimax-code"
 
 expected_report_sequence() { # expected_report_sequence [session-id]
