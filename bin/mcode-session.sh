@@ -178,18 +178,22 @@ cmd_report() {
 
   # Establishing the reporter as this pane's holder, then attaching identity.
   #
-  # The state report is not decoration, but it is not a permanent ordering
-  # constraint either. Verified by execution on herdr 0.9.3: on a pane this
-  # reporter had never registered, `pane report-agent-session` carrying a
-  # resume_argv is rejected with
+  # A resume_argv is only accepted when the reporter actually holds the pane, and
+  # "holds" is stricter than it looks. Measured on herdr 0.9.3:
   #
-  #   resume_not_accepted: resume_argv requires the reporter to hold the pane;
-  #   report its state with pane.report_agent first
+  #   * A freshly split pane, not yet claimed by any detected agent session:
+  #     both calls succeed, exit 0. This is the launch-path case and the one the
+  #     plugin depends on.
+  #   * A pane herdr has already attributed to a detected agent session (this
+  #     one became a `claude` pane with an agent_session id mid-session):
+  #     report-agent with a resume_argv is refused as `resume_not_accepted`,
+  #     under *either* agent label, while the same call without a resume argv
+  #     succeeds. So the rejection is not about ordering at all — herdr's hint to
+  #     "report its state with pane.report_agent first" is misleading, because
+  #     this call *is* report_agent.
   #
-  # Once the pane is registered, the session report alone succeeds — deleting the
-  # state call from this script still exits 0. So the rule is: establish the
-  # reporter once, then attach identity. Both calls carry the resume command, so
-  # either ordering records it.
+  # Both calls carry the resume command, so a refusal here means this pane cannot
+  # be given a resume command, and the failure is reported rather than swallowed.
   local state
   state=$(current_agent_state "$pane")
   if [ -z "$state" ]; then
