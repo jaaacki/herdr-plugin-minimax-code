@@ -80,6 +80,15 @@ jobs:
           #
           # The exec bit is carried through from git's tree mode (100755 on all
           # three); the verification step proves it survived.
+          #
+          # agent-detection/ IS a decision, not an oversight, and it goes the
+          # other way from the bin/ scripts: no user-facing command points at
+          # it. It ships because it is a deliverable of this epic (#37, the
+          # upstream contribution), and a release that omitted it would ship a
+          # manifest nobody downstream can obtain from the pinned artifact.
+          # It ships INERT: nothing in the plugin installs it into herdr's
+          # agent-detection directory, so its presence cannot change a user's
+          # agent detection. Shipping it and activating it are separate acts.
           git archive \
             --format=tar.gz \
             --output="herdr-plugin-minimax-code-${VERSION}.tar.gz" \
@@ -88,6 +97,7 @@ jobs:
             bin/mcode-plugin.sh \
             bin/mcode-watch.sh \
             bin/mcode-session.sh \
+            agent-detection/ \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -115,9 +125,18 @@ jobs:
           #    is exactly what drifted. Check 1b below derives the requirement
           #    from the documentation itself, so the next script added to bin/
           #    is covered without anyone remembering to edit this list.
+          #
+          #    The agent-detection entries are here because step 5 now runs
+          #    that suite from the extracted copy, and the suite refuses to run
+          #    at all without the reference manifest it derives its allowed
+          #    keys from. Listing them keeps the failure a clear MISSING rather
+          #    than a preflight error from a file nobody named.
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
-                   bin/mcode-session.sh README.md LICENSE CLAUDE.md \
-                   tests/run.sh tests/fake-herdr; do
+                   bin/mcode-session.sh agent-detection/minimax-code.toml \
+                   README.md LICENSE CLAUDE.md \
+                   tests/run.sh tests/fake-herdr \
+                   tests/agent-detection-run.sh tests/agent-detection-check.py \
+                   tests/fixtures/agent-detection/reference-claude.toml; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
               echo "If this is a user-facing script, add it to the allowlist above." >&2
@@ -172,8 +191,67 @@ jobs:
             bash -n "$work/$f"
           done
 
-          # 5. And the bundled suite must pass from the extracted copy.
-          "$work/tests/run.sh"
+          # 5. And the bundled suites must pass from the extracted copy.
+          #
+          #    Every suite CI discovers, not just tests/run.sh. Running one
+          #    suite out of five is the same class of gap as an allowlist that
+          #    drifts from the docs: the artifact ships four more suites that
+          #    nothing here ever executes, so a tarball missing a file they need
+          #    would still publish. The glob below is the same `tests/*run.sh`
+          #    CI uses, so the artifact is verified by exactly the checks the
+          #    repo runs on every push. It refuses to pass vacuously if the glob
+          #    matches nothing -- a renamed suite that matches nothing must not
+          #    read as a clean release.
+          ( cd "$work" && shopt -s nullglob && suites=(tests/*run.sh)
+            if [ ${#suites[@]} -eq 0 ]; then
+              echo "no test suites found under tests/ in the artifact - refusing to pass vacuously" >&2
+              exit 1
+            fi
+            for suite in "${suites[@]}"; do
+              echo "=== $suite ==="
+              # Explicit, so the failure names the suite instead of surfacing
+              # as a bare non-zero exit from the subshell under `set -e`.
+              if ! "$suite"; then
+                echo "SUITE FAILED in the extracted artifact: $suite" >&2
+                exit 1
+              fi
+            done )
+
+          # 6. No developer's home directory in the distributed artifact.
+          #
+          #    v0.3.0 also shipped a real person's absolute path, in the
+          #    provenance header of a vendored fixture. That leak is fixed in
+          #    the files; this step is what keeps it fixed. Cleaning a path
+          #    once and adding no check is how it comes back the next time
+          #    somebody records a fresh capture.
+          #
+          #    The exceptions are CAPTURED DATA, enumerated rather than
+          #    pattern-matched so the list cannot quietly widen: a home path
+          #    inside a recorded response or a recorded screen is what was on
+          #    the wire, and editing it would falsify a capture. Five files
+          #    qualify and five are listed -- if a sixth capture is added, this
+          #    list stops matching it and the release is refused, which is the
+          #    correct prompt to decide whether it is captured data.
+          #    tests/fixtures/README.md is deliberately NOT exempt: it is prose,
+          #    and prose is where a path leaks from.
+          while IFS= read -r hit; do
+            rel="${hit#"$work"/}"
+            case "$rel" in
+              tests/fixtures/pane-get.json|\
+              tests/fixtures/pane-current.json|\
+              tests/fixtures/pane-split.json|\
+              tests/fixtures/agent-detection/not-mcode.txt|\
+              tests/fixtures/detection/not-mcode.txt)
+                echo "  (captured data, expected: $rel)" >&2
+                ;;
+              *)
+                echo "PRIVATE PATH in distributed artifact: $rel" >&2
+                echo "Genericise it the way the fixture provenance headers do;" >&2
+                echo "only captured data may carry a home directory." >&2
+                exit 1
+                ;;
+            esac
+          done < <(grep -rlE '/(Users|home)/[A-Za-z0-9._-]+' "$work" 2>/dev/null | sort)
 
           echo "--- artifact contents ---"
           tar -tvzf "herdr-plugin-minimax-code-${VERSION}.tar.gz"

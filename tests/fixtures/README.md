@@ -107,6 +107,32 @@ running and no other member's pane was touched.
 (`--direction right --cwd <path>`), so the fixture matches the real invocation rather than a
 convenient one.
 
+## Home paths: which ones are cleaned and which are data
+
+A private path was found shipping in the `v0.3.0` artifact and cleaned. The line to draw is
+**prose vs. captured data**, and it is not a style preference:
+
+- **Cleaned** — every sentence that said *where a binary lived*, named a cache directory as
+  provenance, or quoted a real working directory in the *Exact command* column above (it now
+  reads `--cwd /path/to/a/worktree`). `herdr 0.9.3 (resolved from PATH)` carries the same
+  information as the absolute path and nothing more. The provenance that matters is a digest:
+  see the `sha256` in `agent-detection/README.md`, which pins a vendored manifest to exact
+  upstream bytes and survives being genericised.
+- **Left alone** — every `/Users/…` inside `pane-get.json`, `pane-current.json`,
+  `pane-split.json` and the two `not-mcode.txt` files. Those are what herdr returned and what
+  the pane showed at capture time: recorded `cwd` fields and recorded screen text. Rewriting
+  them would falsify a capture, and `agent-detection/README.md` states outright that nothing
+  there is hand-edited.
+
+`/usr/bin/jq` stays too: a system path, not anyone's home directory.
+
+So the only files in the artifact that still contain a home directory are the five captured
+ones above, and the release workflow now enforces exactly that. Step 6 of its verification step
+refuses to publish a tarball containing a home directory anywhere else, with those five
+exempted by name — enumerated rather than pattern-matched, so the exception list cannot quietly
+widen. It is deliberately not exempting this README: documentation is prose, and prose is
+where a path leaks from.
+
 ## For whoever writes the test harness (issue #4 / C2)
 
 The `fake-herdr` stub reads canned responses from `tests/fixtures/`. The three filenames are
