@@ -174,6 +174,66 @@ case_pane_gone_does_not_release() {
 # The --source namespace is enforced: a reporter that drifts off
 # `herdr:minimax-code` would be silently unmatchable by herdr, so the stub
 # rejects it and the case must go red.
+# A screen carrying the `◐ Tasks · N background active · N result ready` chip.
+#
+# WHAT THIS DOES AND DOES NOT PROVE, because getting that backwards is how a
+# fixture that cannot fail gets written. It classifies `working`, and it
+# classifies working because of `Esc stop` and `Ctrl+O details`, which are in
+# RULES. The chip is in no rule. So adding the chip to the working table would
+# NOT change this capture's result — this case pins the real captured shape and
+# would catch a narrowing of the working table, and it is not evidence that the
+# chip is inert. `chip-is-not-a-working-marker` is the case that carries that.
+case_chip_bearing_screen_classifies_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-tasks-chip.txt"; export WATCH_SNAPSHOTS
+  run_watch wZ:p2W --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "expected state 'working' from working-with-tasks-chip.txt, got '$(reported_states)'"; fi
+}
+
+# THE CHIP MUST NOT BE A WORKING MARKER — the negative assertion, and the only
+# falsifiable form of this ruling available from real captures.
+#
+# The brief asked for a chip-alone screen that does not classify working. That
+# cannot be written: the chip is in no rule, so a chip-alone screen has nothing
+# to match and would classify `unknown` whatever the table says, and the one real
+# capture carrying the chip also carries `Esc stop`. What CAN be pinned, and is
+# the decision that actually matters, is the absence of the rule itself.
+#
+# WHY AN ABSENCE IS WORTH A TEST HERE. The chip is a *resting* shape — a pane with
+# a background task in flight is not working on the foreground turn. If `◐ Tasks`
+# were ever added to the working table it would report `working` for any pane
+# that simply has something queued, and it would report it SILENTLY and
+# permanently, because the chip does not disappear when the turn it misreports
+# ends. The table is evidence-led: bare `Esc` and `tok/s` were both measured,
+# found to match screens they should not, and dropped. This case is the same
+# discipline pointed at the next candidate, before someone adds it.
+#
+# It reads the table rather than a classification because there is no screen that
+# distinguishes the two, which is stated above rather than papered over. A change
+# here is a change to a decision, and it should be a deliberate one.
+case_chip_is_not_a_working_marker() {
+  setup
+  # Scoped to the RULES assignment only. A bare grep for `Tasks` over the whole
+  # script would match this very comment block, and a test that fails on its own
+  # documentation is a test nobody keeps.
+  local rules
+  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'Tasks'; then
+    bad "the Tasks chip is in the RULES table. It is a RESTING shape - a pane with a" \
+        "background task in flight is not working - so this reports working for any" \
+        "queued pane, and never clears. Measured evidence first, as bare Esc and tok/s" \
+        "were both given and then dropped:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
 case_source_namespace_is_herdr_minimax_code() {
   setup
   WATCH_SNAPSHOTS="$FIX/idle.txt"; export WATCH_SNAPSHOTS
@@ -235,6 +295,8 @@ CASES=(
   never-releases:case_never_releases
   pane-gone-does-not-release:case_pane_gone_does_not_release
   source-namespace-is-herdr-minimax-code:case_source_namespace_is_herdr_minimax_code
+  chip-bearing-screen-classifies-working:case_chip_bearing_screen_classifies_working
+  chip-is-not-a-working-marker:case_chip_is_not_a_working_marker
   pane-gone-stops:case_pane_gone_stops
   pane-id-passed-through:case_pane_id_passed_through
 )
