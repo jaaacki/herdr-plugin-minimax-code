@@ -75,6 +75,10 @@
 #                         agent-session-dropped: this one models a pane herdr has
 #                         never registered, that one models a registration whose
 #                         session identity was accepted and thrown away.
+#   agent-get-no-pane     `agent get` returns a registered agent carrying no
+#                         pane_id, as herdr does for a name that resolves to
+#                         nothing. For issue #74, where a name argument is
+#                         resolved to a pane before anything can be driven.
 #   agent-session-dropped `pane report-agent-session` exits 0 and persists
 #                         nothing, so the later `agent get` reports
 #                         agent_session: null. This is herdr 0.9.3's MEASURED
@@ -247,15 +251,40 @@ remembered_session_id() { # prints the remembered id, or nothing at all
 #
 # The `agent`/`agent_status` fields around it are the minimum this stub has
 # always served; they predate the captures and are not themselves a capture.
+#
+# ---- pane_id AND cwd, added for issue #74 ------------------------------------
+# A real `herdr agent get` returns both, which is how a name is resolved to a
+# pane and a pane to its working directory. Measured on herdr 0.9.3, 2026-10-04:
+#
+#   {"id":"cli:agent:get","result":{"agent":{"agent":"claude",
+#     "agent_session":{…},"agent_status":"working",
+#     "cwd":"/Users/noonoon/Dev/herdr-plugin-minimax-code","focused":true,
+#     "foreground_cwd":"…","pane_id":"wZ:p3","revision":4,
+#     "state_change_seq":88,"tab_id":"wZ:t3","terminal_id":"term_…",
+#     "terminal_title":"◑ Repo overview","workspace_id":"wZ"},"type":"agent_info"}}
+#
+# Sourced from the SAME FAKE_HERDR_SRC_PANE / FAKE_HERDR_CWD knobs `pane get` and
+# `pane current` already use, rather than a second pair. One pane id and one cwd
+# per case is the point: a test that could set them independently for `agent get`
+# and `pane get` could assert a coherent story that no real multiplexer would ever
+# produce.
+#
+# Additive, and verified not to disturb the four existing suites: bin/mcode-session.sh
+# reads only `.result.agent.agent_status` and `.result.agent.agent_session.value` from
+# this response, and tests/session-run.sh asserts on logged ARGV rather than on the
+# response body. The `agent-get-empty` fault still short-circuits to a bare agent
+# object, which is what issue #35's cases depend on.
 emit_agent_get() { # emit_agent_get
   local sid
   sid="$(remembered_session_id)"
   if [ -n "$sid" ]; then
-    jq -cn --arg s "$sid" '{
+    jq -cn --arg s "$sid" --arg p "$src_pane" --arg c "$src_cwd" '{
       result: {
         agent: {
           agent: "mcode",
           agent_status: "working",
+          cwd: $c,
+          pane_id: $p,
           agent_session: {agent: "minimax-code", kind: "id",
                           source: "herdr:minimax-code", value: $s}
         },
@@ -265,9 +294,10 @@ emit_agent_get() { # emit_agent_get
   else
     # No agent_session key at all — del() is what makes this an absence rather
     # than a field set to null.
-    jq -cn '{
+    jq -cn --arg p "$src_pane" --arg c "$src_cwd" '{
       result: {
-        agent: {agent: "mcode", agent_status: "working", agent_session: null},
+        agent: {agent: "mcode", agent_status: "working",
+                cwd: $c, pane_id: $p, agent_session: null},
         type: "agent_info"
       }
     } | del(.result.agent.agent_session)'
@@ -401,6 +431,16 @@ case "$sub" in
     if has_fault agent-get-empty; then
       announce_fault agent-get-empty "reporting a pane with no recorded agent state"
       printf '%s\n' '{"result":{"agent":{},"type":"agent_info"}}'
+      exit 0
+    fi
+    # A name that resolves to nothing. Distinct from both other agent-get faults:
+    # the pane is registered and the state is there, but there is no pane_id to
+    # resolve a NAME to — which is what an implementation must notice rather than
+    # exec against an empty pane argument.
+    if has_fault agent-get-no-pane; then
+      announce_fault agent-get-no-pane "returning an agent with no pane_id, as herdr does for a name that resolves to nothing"
+      jq -cn --arg c "$src_cwd" \
+        '{result:{agent:{agent:"mcode",agent_status:"working",cwd:$c},type:"agent_info"}}'
       exit 0
     fi
     emit_agent_get
