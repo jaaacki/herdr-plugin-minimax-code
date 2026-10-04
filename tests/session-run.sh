@@ -308,14 +308,12 @@ expected_report_sequence() { # expected_report_sequence [session-id]
   printf 'pane\treport-agent\t%s\t--source\t%s\t--agent\t%s\t--state\t%s\t--\tmcode\t--continue\n' \
     "$PANE" "$EXPECTED_SOURCE" "$EXPECTED_LABEL" "$EXPECTED_STATE"
   printf '%s\n' "$session_line"
-  # The read-back of issue #71, and ONLY when an id was actually sent. With no id
-  # there is nothing to compare against: a session already on the pane could be a
-  # stale one from an earlier reporter, so reading it back would produce a number
-  # this run has no right to attribute to itself. The script says so in words
-  # instead — see readback-unverifiable-when-no-id-sent.
-  if [ -n "$sid" ]; then
-    printf 'agent\tget\t%s\n' "$PANE"
-  fi
+  # The read-back of issue #71, and UNCONDITIONAL — including when no id was
+  # sent. Skipping it there would make the no-id path the only path that reports
+  # success without ever looking, which is the exact shape #71 exists to remove.
+  # What it finds in that case is still attributable: any session on the pane is
+  # one this run did not put there.
+  printf 'agent\tget\t%s\n' "$PANE"
 }
 
 # --- cases -------------------------------------------------------------------
@@ -490,8 +488,16 @@ case_report_unresolved_id_still_records_resume() {
   assert_rc_zero "$RC"
 
   assert_stderr_mentions "no session id could be resolved"
-  # Omission must be stated, not silent.
-  assert_stderr_mentions "Resume is unaffected"
+  # The corrected claim, and the wording has moved twice, so this asserts the
+  # sentence rather than a loosened match — the distinction is the whole point of
+  # the case and a regex would let it rot back unnoticed.
+  #
+  # What is true: the MANUAL `mcode --continue` re-resolves by workspace and needs
+  # no id. What is not: that herdr restart-restore is fine, which is a different
+  # mechanism fed by a different write, is discarded outright on 0.9.3, and is
+  # therefore unverifiable rather than verified-absent. "Unverifiable" is not
+  # "unaffected", and conflating them is the defect #71 exists to close.
+  assert_stderr_mentions "MANUAL resume is unaffected: 'mcode --continue' re-resolves by workspace and needs no session id"
   # The identity flag must be absent, and the resume argv present on both calls.
   assert_log_lacks "--agent-session-id"
   assert_log_exactly "$(expected_report_sequence)"
@@ -685,14 +691,12 @@ case_readback_distinguishes_unverifiable_from_dropped() {
   assert_stderr_lacks_match 'not (persist|stored|save)|discard|unavailab|not available'
 }
 
-# 18. The fourth row of the issue's table, and the one that is easiest to leave
-#     unsaid. With no id sent there is nothing to read back and nothing to
-#     compare against — a session already on the pane could be a stale one from
-#     an earlier reporter — so the script must NOT go looking for one, and must
-#     NOT stay quiet either. "Nothing was sent, so nothing was confirmed" is the
-#     honest sentence, and it is a different sentence from #17's "I could not
-#     check": the first is about there being nothing to check, the second about
-#     the check failing. Reporting either as the other is its own small lie.
+# 18. The fourth row of the issue's table. With no id sent there is nothing to
+#     compare against, but the read-back is still made: what it finds is
+#     attributable, because any session already on the pane is one this run did
+#     NOT put there. Skipping the read-back here would make this the only path
+#     that reports success without ever looking, which is the exact shape #71
+#     exists to remove.
 case_readback_unverifiable_when_no_id_sent() {
   setup_case
   export HERDR_PANE_ID="$PANE"
@@ -700,21 +704,26 @@ case_readback_unverifiable_when_no_id_sent() {
   run_session report
   assert_rc_zero "$RC"
 
-  # No id, so no read-back: an `agent get` here would be reading a pane whose
-  # session, if any, belongs to somebody else.
+  # The read-back happens here too: two `agent get` calls, the pre-existing state
+  # read and the verification of what was just written.
   assert_log_exactly "$(expected_report_sequence)"
-  if [ "$(grep -c '^agent	get	' "$FAKE_HERDR_LOG")" -ne 1 ]; then
-    note "expected exactly one \`agent get\` (the pre-existing state read) and no read-back"
+  if [ "$(grep -c '^agent	get	' "$FAKE_HERDR_LOG")" -ne 2 ]; then
+    note "expected two \`agent get\` calls: the state read and the read-back"
   fi
-  # Both halves stated. The id half is the "must not invent an id" contract; the
-  # resume half is new in #71 — herdr discarded resume_argv along with the id, so
-  # whether it was persisted is unverifiable, not "fine".
+  # Nothing was sent, so the script must not claim an id was reported, stored or
+  # confirmed. This is the exact "must not invent an id" contract, on stderr
+  # rather than stdout, and it is the invariant that separates this case from
+  # case 16: there, an id was sent and lost; here, none was sent at all.
+  assert_stderr_lacks_match 'mvs_[0-9a-z]{8,}'
   assert_stderr_mentions "no session id could be resolved"
-  assert_stderr_matches 'nothing was sent|no .*(was )?(sent|reported).*to verify|unverifiable'
+  # Both halves stated as unverifiable rather than as fine.
+  assert_stderr_matches 'unverifiable|nothing was sent|nothing was stored'
   assert_stderr_matches 'resume'
-  # And it must not claim either was lost: nothing was sent, so nothing can be
-  # missing. That is the difference from case 16.
-  assert_stderr_lacks_match 'not (persist|stored|save)|discard|unavailab|not available'
+  # Deliberately NOT asserting the absence of "unavailable" here, though an
+  # earlier draft of this case did. Expecting resume to be unavailable is the
+  # honest statement for this path — `agent get` exposes no resume field, so
+  # persistence is unverifiable either way — and forbidding the word would have
+  # failed a correct implementation for saying the true thing.
 }
 
 # --- driver ------------------------------------------------------------------
