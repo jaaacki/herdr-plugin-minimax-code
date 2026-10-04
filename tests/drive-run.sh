@@ -210,12 +210,12 @@ setup_case() {
   CASE_DIR="$WORK/$CURRENT_CASE"
   rm -rf "$CASE_DIR"
   mkdir -p "$CASE_DIR/project"
-  mkdir -p "$CASE_DIR/bin" "$CASE_DIR/home/v2/sqlite"
+  mkdir -p "$CASE_DIR/bin" "$CASE_DIR/mcode-home/v2/sqlite"
 
   # The implementation requires the database file to EXIST before it queries it,
   # and refuses to guess when it does not. An empty file is enough: every real
   # answer comes from the stub.
-  : >"$CASE_DIR/home/v2/sqlite/runtime-state.sqlite"
+  : >"$CASE_DIR/mcode-home/v2/sqlite/runtime-state.sqlite"
 
   # `sqlite3` resolved by bare name, so the implementation's `command -v sqlite3`
   # preflight passes and finds the stub. Putting it on PATH rather than behind a
@@ -258,11 +258,11 @@ setup_case() {
   # Absolute path to the stub, so the implementation's `command -v` resolves it
   # without this suite depending on where `mcode` happens to be installed.
   export MCODE_BIN_PATH="$FAKE_MCODE"
-  export MCODE_HOME="$CASE_DIR/home"
+  export MCODE_HOME="$CASE_DIR/mcode-home"
   # The database is a per-case file. Naming it explicitly means the suite never
   # queries the real 76 MB runtime store even if the implementation's default
   # path logic changes under us.
-  export MCODE_STATE_DB="$CASE_DIR/home/v2/sqlite/runtime-state.sqlite"
+  export MCODE_STATE_DB="$CASE_DIR/mcode-home/v2/sqlite/runtime-state.sqlite"
   export SQLITE3_BIN="sqlite3"
   # Explicit binding path, so the suite never depends on where the
   # implementation would otherwise look and never writes into $HOME.
@@ -458,7 +458,7 @@ case_multiple_candidates_never_narrowed_to_started() {
 #    and hope is strongest exactly here.
 #
 #    Measured on this machine, 2026-10-04: TWELVE live sessions share the single
-#    workspace /Users/noonoon/Dev/herdr-plugin-minimax-code, and this repo's own
+#    workspace (measured on the reference machine, 2026-10-04), and a multi-worker
 #    flock is the pathological case — three workers, three 'started' sessions
 #    created 3.3 seconds apart. The wrong pick would put a prompt in a colleague's
 #    pane and report success.
