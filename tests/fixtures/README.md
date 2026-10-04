@@ -88,6 +88,19 @@ silently worked around, per the issue's own instruction not to paper over surpri
 All three captured on **2026-10-04** (03:51–03:56 +0800) against **herdr 0.9.3**
 (`~/.local/bin/herdr`), `jq` 1.7.1 at `/usr/bin/jq`.
 
+**The `cwd` values inside the three `.json` files are de-identified.** They were captured
+with the operator's real home directory in `cwd` and `foreground_cwd`, and `tests/` ships
+inside the public release tarball, so that path is now rendered `~/…`. The published
+v0.3.0 asset shipped this home path eight times even after the documentation around it
+had been cleaned, because the leak was in the response bodies, not in the prose.
+
+Nothing else was touched. In particular the `pane_id` values are the real captured ones
+(`wZ:p4`, `wZ:p8`) — the new pane id from `pane-split.json` is the one value in this repo
+that must never be invented, and the suite derives its expectations from this file rather
+than from a hard-coded literal for exactly that reason. The commands below are the
+commands actually run, with the home prefix and the ephemeral worktree path rendered
+generically.
+
 | File | Exact command | Response `id` | `result.type` |
 |---|---|---|---|
 | `pane-get.json` | `herdr pane get wZ:p4` | `cli:pane:get` | `pane_info` |

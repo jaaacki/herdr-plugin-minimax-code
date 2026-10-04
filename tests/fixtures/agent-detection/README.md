@@ -1,7 +1,7 @@
 # Captured mcode screens behind `agent-detection/minimax-code.toml`
 
-Every rule in that manifest was read out of these files. Nothing in it is imagined,
-and nothing here is hand-edited.
+Every rule in that manifest was read out of these files. Nothing in it is imagined.
+The captures are verbatim except for one home path in `not-mcode.txt`, recorded below.
 
 The captures are the same ones the watcher in `bin/mcode-watch.sh` classifies against
 (issue #35, `tests/fixtures/detection/`), re-stated here so the manifest and its
@@ -10,6 +10,18 @@ issue #37. They are the same bytes, copied — not a second capture.
 
 Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
 (`~/.local/bin/herdr`), **mcode v0.6.2** (`~/.minimax-code/bin/mcode`).
+
+**One edit was made after capture**, and it is the only one: `not-mcode.txt` contained
+the operator's real home directory inside the captured screen text, so that path is now
+rendered `~/…`. The file ships inside the public release tarball, and a real person's
+home directory does not belong in one. Nothing else changed — not the pane ids, not the
+screen contents, and not the classification each file is evidence for. The published
+v0.3.0 asset still carried this path, so the statement above is now true of the prose
+and true of the captures instead of true of only one of them.
+
+This is stated rather than done quietly: a capture that has been edited without saying
+so is worth less than one that never needed editing, and the honest note is cheaper
+than the doubt it prevents.
 
 | File | Exact capture command | Pane | What it shows |
 |---|---|---|---|

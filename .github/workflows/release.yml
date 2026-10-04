@@ -78,6 +78,15 @@ jobs:
           # check below is what keeps the two in step; neither is sufficient
           # alone.
           #
+          # agent-detection/ ships because a SHIPPED suite needs it.
+          # tests/agent-detection-run.sh resolves ../agent-detection/minimax-code.toml
+          # from the extracted copy, so leaving this directory out installs a
+          # bundled test that cannot run. The manifest is not read at runtime --
+          # nothing in the plugin loads it -- but the release notes ship
+          # tests/, and a test that fails on arrival tells a user the tarball is
+          # broken when the tarball is fine. Verified against the published
+          # v0.3.0 asset, where the directory was absent and the suite failed.
+          #
           # The exec bit is carried through from git's tree mode (100755 on all
           # three); the verification step proves it survived.
           git archive \
@@ -88,6 +97,7 @@ jobs:
             bin/mcode-plugin.sh \
             bin/mcode-watch.sh \
             bin/mcode-session.sh \
+            agent-detection/ \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -117,6 +127,7 @@ jobs:
           #    is covered without anyone remembering to edit this list.
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
                    bin/mcode-session.sh README.md LICENSE CLAUDE.md \
+                   agent-detection/minimax-code.toml \
                    tests/run.sh tests/fake-herdr; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
@@ -172,8 +183,87 @@ jobs:
             bash -n "$work/$f"
           done
 
-          # 5. And the bundled suite must pass from the extracted copy.
-          "$work/tests/run.sh"
+          # 5. And EVERY bundled suite must pass from the extracted copy.
+          #
+          #    Globbed, not named. This step ran tests/run.sh alone, so the four
+          #    other suites that ship inside the tarball were never run against
+          #    the artifact. That is not hypothetical: the published v0.3.0
+          #    asset ships five suites, four of which pass and
+          #    tests/agent-detection-run.sh fails on arrival with
+          #    "preflight: .../agent-detection/minimax-code.toml is missing" --
+          #    a release that passed its own verification step while shipping a
+          #    broken bundled test.
+          #
+          #    CI already learned this lesson with tests/*run.sh (see ci.yml,
+          #    issue #35): a suite gets written, proved locally, and never
+          #    executes, so it rots silently. A release that re-hardcodes the
+          #    list re-arms the identical trap.
+          #
+          #    The nullglob guard is the part that keeps the glob honest -- if it
+          #    ever stops matching, this must fail loudly rather than pass
+          #    vacuously with an empty list.
+          (
+            cd "$work"
+            shopt -s nullglob
+            suites=(tests/*run.sh)
+            if [ ${#suites[@]} -eq 0 ]; then
+              echo "REFUSING TO PUBLISH: the artifact ships no test suite" >&2
+              exit 1
+            fi
+            for suite in "${suites[@]}"; do
+              echo "=== $suite ==="
+              "$suite"
+            done
+          )
+
+          # 6. bin/ must be COMPLETE, measured against the tagged tree rather
+          #    than against the lists above.
+          #
+          #    Check 1b derives from the README, which is the right instinct
+          #    but cannot see a script the README never names -- bin/mcode-session.sh
+          #    is named only in the release notes, so if it went missing again,
+          #    check 1b would stay green. Diffs both directions: a file in the
+          #    tag but not the artifact, and a file in the artifact but not the
+          #    tag. A script added tomorrow needs no edit anywhere.
+          mapfile -t want_bin < <(git ls-tree -r --name-only "${VERSION}" -- bin/ | grep -E '\.sh$')
+          if [ "${#want_bin[@]}" -eq 0 ]; then
+            echo "REFUSING TO PUBLISH: ${VERSION} contains no bin/*.sh to verify" >&2
+            exit 1
+          fi
+          for f in "${want_bin[@]}"; do
+            if [ ! -f "$work/$f" ]; then
+              echo "MISSING from artifact: $f -- it exists in ${VERSION}, so the" \
+                   "allowlist is no longer covering the tree" >&2
+              exit 1
+            fi
+          done
+          mapfile -t got_bin < <(cd "$work" && find bin -type f | LC_ALL=C sort)
+          mapfile -t want_sorted < <(printf '%s\n' "${want_bin[@]}" | LC_ALL=C sort)
+          if [ "$(printf '%s\n' "${got_bin[@]}")" != "$(printf '%s\n' "${want_sorted[@]}")" ]; then
+            echo "bin/ in the artifact does not match bin/ in ${VERSION}:" >&2
+            diff <(printf '%s\n' "${want_sorted[@]}") \
+                 <(printf '%s\n' "${got_bin[@]}") >&2 || true
+            exit 1
+          fi
+
+          # 7. No absolute home directory may ship.
+          #
+          #    The published v0.3.0 asset carried /Users/noonoon eight times, in
+          #    three captured JSON responses and two captured screens, after the
+          #    fixture READMEs had already been cleaned -- because nothing
+          #    looked. The same argument that produced checks 1 and 1b applies
+          #    here: a leak nobody checks for is a leak that recurs.
+          #
+          #    If a legitimate example ever needs a literal /Users/ path, render
+          #    it as `~` like the rest of the fixtures rather than widening this
+          #    check -- a denylist taught to tolerate its own match is how the
+          #    allowlist went stale in the first place.
+          if grep -rIl '/Users/' "$work" >/dev/null 2>&1; then
+            echo "LEAK: an absolute /Users/ home path would ship in this artifact:" >&2
+            grep -rIn '/Users/' "$work" | head -20 >&2
+            echo "Render it as ~ instead." >&2
+            exit 1
+          fi
 
           echo "--- artifact contents ---"
           tar -tvzf "herdr-plugin-minimax-code-${VERSION}.tar.gz"
