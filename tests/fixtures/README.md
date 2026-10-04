@@ -86,13 +86,13 @@ silently worked around, per the issue's own instruction not to paper over surpri
 ## Captures
 
 All three captured on **2026-10-04** (03:51–03:56 +0800) against **herdr 0.9.3**
-(`/Users/noonoon/.local/bin/herdr`), `jq` 1.7.1 at `/usr/bin/jq`.
+(`~/.local/bin/herdr`), `jq` 1.7.1 at `/usr/bin/jq`.
 
 | File | Exact command | Response `id` | `result.type` |
 |---|---|---|---|
 | `pane-get.json` | `herdr pane get wZ:p4` | `cli:pane:get` | `pane_info` |
 | `pane-current.json` | `herdr pane current` | `cli:pane:current` | `pane_current` |
-| `pane-split.json` | `herdr pane split wZ:p4 --direction right --cwd /Users/noonoon/Dev/.worktrees/herdr-plugin-minimax-code-7 --no-focus` | `cli:pane:split` | `pane_info` |
+| `pane-split.json` | `herdr pane split wZ:p4 --direction right --cwd /path/to/a/worktree --no-focus` | `cli:pane:split` | `pane_info` |
 
 `pane-get.json` and `pane-current.json` were captured against pane `wZ:p4`, which is the
 pane that ran the commands — so both are views of the *caller's own* pane.

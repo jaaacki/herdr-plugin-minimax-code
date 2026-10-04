@@ -3,10 +3,11 @@ name: Release
 # Triggered by pushing a v* tag. This workflow does NOT create tags or cut
 # releases on its own — tagging is the architect's call at the release gate.
 #
-# The plugin is `herdr-plugin.toml` plus a bash entrypoint. There is no build
-# step and no compiled binary. The tarball below is a *pinned convenience*, not
-# the install path: `herdr plugin install jaaacki/herdr-plugin-minimax-code`
-# clones from the GitHub shorthand and remains the supported way to install.
+# The plugin is `herdr-plugin.toml` plus three bash scripts under bin/. There is
+# no build step and no compiled binary. The tarball below is a *pinned
+# convenience*, not the install path: `herdr plugin install
+# jaaacki/herdr-plugin-minimax-code` clones from the GitHub shorthand and
+# remains the supported way to install.
 
 on:
   push:
@@ -66,14 +67,27 @@ jobs:
           # must never reach a distributed artifact. Listing the paths we want
           # means a future internal note cannot leak by accident.
           #
-          # The exec bit on bin/mcode-plugin.sh is carried through from git's
-          # tree mode (100755); the verification step below proves it survived.
+          # Every bin/ script is listed EXPLICITLY, and all three are listed
+          # because all three are user-facing: the manifest action runs
+          # bin/mcode-plugin.sh, the README tells a user to run
+          # `bin/mcode-watch.sh <PANE_ID>` (README, "State reporting"), and the
+          # release notes name bin/mcode-session.sh as the session registrar.
+          # An allowlist that drifts from what the documentation tells a user to
+          # run is how v0.3.0 shipped a tarball whose own README told a user to
+          # run a command the archive did not contain. The required-contents
+          # check below is what keeps the two in step; neither is sufficient
+          # alone.
+          #
+          # The exec bit is carried through from git's tree mode (100755 on all
+          # three); the verification step proves it survived.
           git archive \
             --format=tar.gz \
             --output="herdr-plugin-minimax-code-${VERSION}.tar.gz" \
             "${VERSION}" \
             herdr-plugin.toml \
             bin/mcode-plugin.sh \
+            bin/mcode-watch.sh \
+            bin/mcode-session.sh \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -94,13 +108,41 @@ jobs:
           tar -xzf "herdr-plugin-minimax-code-${VERSION}.tar.gz" -C "$work"
 
           # 1. Required contents.
-          for f in herdr-plugin.toml bin/mcode-plugin.sh README.md LICENSE CLAUDE.md \
+          #
+          #    The two bin/ scripts added in Epic 3 were missing from v0.3.0's
+          #    allowlist while the README told users to run one of them. The fix
+          #    is not just adding two names to this list — a hand-maintained list
+          #    is exactly what drifted. Check 1b below derives the requirement
+          #    from the documentation itself, so the next script added to bin/
+          #    is covered without anyone remembering to edit this list.
+          for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
+                   bin/mcode-session.sh README.md LICENSE CLAUDE.md \
                    tests/run.sh tests/fake-herdr; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
+              echo "If this is a user-facing script, add it to the allowlist above." >&2
               exit 1
             fi
           done
+
+          # 1b. Everything the shipped documentation tells a user to RUN must be
+          #     in the artifact. Derived from the README, not hand-listed, so
+          #     documentation and artifact cannot drift apart again.
+          #
+          #     This is the check that would have caught v0.3.0: the README says
+          #     `bin/mcode-watch.sh <PANE_ID>`, the tarball did not contain that
+          #     file, and nothing in the workflow noticed.
+          missing=0
+          while IFS= read -r script; do
+            if [ ! -f "$work/$script" ]; then
+              echo "README tells a user to run '$script', but it is NOT in the artifact." >&2
+              missing=1
+            fi
+          done < <(grep -oE 'bin/[A-Za-z0-9._-]+\.sh' "$work/README.md" | sort -u)
+          if [ "$missing" -ne 0 ]; then
+            echo "The artifact cannot ship documentation that names a missing command." >&2
+            exit 1
+          fi
 
           # 2. Architect-only notes must not ship.
           for f in PLAN.md HANDOFF.md; do
@@ -113,8 +155,11 @@ jobs:
           # 3. The exec bit must survive the archive. A tarball that loses it
           #    installs a plugin that fails at invocation with a permission
           #    error, which is exactly the bug class this repo already shipped
-          #    once (see HANDOFF).
-          for f in bin/mcode-plugin.sh tests/run.sh; do
+          #    once (see HANDOFF). All three bin/ scripts are listed: the README
+          #    tells a user to run the watcher directly, so a non-executable
+          #    watcher is a user-facing break, not an internal one.
+          for f in bin/mcode-plugin.sh bin/mcode-watch.sh bin/mcode-session.sh \
+                   tests/run.sh; do
             if [ ! -x "$work/$f" ]; then
               echo "EXEC BIT LOST on $f" >&2
               ls -l "$work/$f" >&2
@@ -122,8 +167,10 @@ jobs:
             fi
           done
 
-          # 4. The entrypoint must parse from the extracted copy.
-          bash -n "$work/bin/mcode-plugin.sh"
+          # 4. Every shipped script must parse from the extracted copy.
+          for f in bin/mcode-plugin.sh bin/mcode-watch.sh bin/mcode-session.sh; do
+            bash -n "$work/$f"
+          done
 
           # 5. And the bundled suite must pass from the extracted copy.
           "$work/tests/run.sh"
@@ -157,9 +204,12 @@ jobs:
           tarball when you want a fixed revision instead.
 
           There is no build step and no compiled binary. The plugin is
-          \`herdr-plugin.toml\` plus a bash entrypoint (\`bin/mcode-plugin.sh\`), and the
-          tarball is built with \`git archive\`, so its contents are exactly what is
-          committed at this tag — no working-tree drift, no \`.gitignore\`d files.
+          \`herdr-plugin.toml\` plus three bash scripts: \`bin/mcode-plugin.sh\` (the
+          entrypoint the action runs), \`bin/mcode-watch.sh\` (the state watcher the
+          README tells you to run) and \`bin/mcode-session.sh\` (the session
+          registrar). The tarball is built with \`git archive\`, so its contents are
+          exactly what is committed at this tag — no working-tree drift, no
+          \`.gitignore\`d files.
 
           ## Verify what you downloaded
 
