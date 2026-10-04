@@ -345,9 +345,15 @@ cmd_report() {
   else
     # Deliberate, not accidental: the lookup above cannot succeed against today's
     # manifest schema, and reporting a wrong id is worse than reporting none.
-    # Resume still works, because `mcode --continue` re-resolves by workspace at
-    # restore time and needs no id.
-    log "mcode-session: no session id could be resolved for this pane (no manifest records a cwd), so none is reported. Resume is unaffected: '${MCODE_RESUME_CMD}' re-resolves by workspace."
+    #
+    # This line used to end "Resume is unaffected: '…' re-resolves by workspace",
+    # and that was wrong in a way #71 made visible. "Unaffected" is a claim about
+    # whether herdr kept the resume command, and herdr discarded the whole
+    # report-agent-session call on 0.9.3 — resume_argv included — so we cannot say
+    # it was kept. What is true is narrower and is what this now says: the command
+    # re-resolves by workspace, so it does not *depend* on an id being reported.
+    # Whether it was *stored* is the separate, unverifiable question answered below.
+    log "mcode-session: no session id could be resolved for this pane (no manifest records a cwd), so none is reported. The resume command '${MCODE_RESUME_CMD}' re-resolves by workspace, so it does not depend on an id being reported."
   fi
   session_argv+=("$pane")
   session_argv+=(--)
