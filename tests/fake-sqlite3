@@ -20,16 +20,35 @@
 #      ordering is stated explicitly rather than left to a sort implementation.
 #
 # This is NOT a reimplementation of sqlite. It prints a canned table. It does not
-# parse SQL, evaluate WHERE, or order anything — the rows come out exactly as the
-# fixture lists them, in the fixture's order. That is deliberate: a stub that
-# implemented ORDER BY would be a second, divergent implementation of the query,
-# and the tests would pass against the stub's idea of the answer rather than
+# parse SQL, evaluate an arbitrary WHERE, or order anything — the rows come out
+# exactly as the fixture lists them, in the fixture's order. That is deliberate: a
+# stub that implemented ORDER BY would be a second, divergent implementation of the
+# query, and the tests would pass against the stub's idea of the answer rather than
 # against the fixture the reader can see.
 #
+# ---- THE ONE PREDICATE THIS DOES EVALUATE ------------------------------------
+# The implementation issues the same query twice, the second appending exactly one
+# clause:
+#
+#   … WHERE archived = 0 AND workspace_dir = '<ws>'          ORDER BY updated_at_ms DESC
+#   … WHERE archived = 0 AND workspace_dir = '<ws>' AND status = 'started'  ORDER BY …
+#
+# so without a filter here both calls would answer identically and the narrowing
+# step could not be tested at all — the suite would pass against an implementation
+# that never narrowed. So this stub applies `status = 'started'` and nothing else.
+# One predicate, matched on the literal clause text. It is not a SQL engine and
+# will not become one; if the implementation's second query stops being this
+# clause, the tests are supposed to notice, not be satisfied by a cleverer stub.
+#
+# Output is the FIRST column only, one value per line, because the query selects a
+# single column. That is what `sqlite3` actually prints for
+# `SELECT session_id FROM …`, and a tab-separated multi-column line would be a shape
+# the real tool never produces.
+#
 # Consequence worth stating plainly: this stub proves the implementation ASKS the
-# right question, not that the question returns the right rows in a real engine.
-# The real query was executed by hand against the live db while writing this —
-# see the provenance note in tests/drive-run.sh.
+# right question and narrows correctly, not that the question returns the right rows
+# in a real engine. The real query was executed by hand against the live db while
+# writing this — see the provenance note in tests/drive-run.sh.
 #
 # Test-only knobs:
 #   FAKE_SQLITE_LOG    file to append each query to (required)
@@ -44,6 +63,12 @@ if [ -z "${FAKE_SQLITE_LOG:-}" ]; then
   printf 'fake-sqlite3: FAKE_SQLITE_LOG is not set\n' >&2
   exit 64
 fi
+
+# The query is the last argv field, and it is the only field worth reading.
+query=""
+for arg in "$@"; do
+  query="$arg"
+done
 
 # One line per invocation, argv TAB-joined — same convention as tests/fake-herdr,
 # so a query spanning multiple argv fields stays unambiguously parseable.
@@ -61,9 +86,21 @@ if [ -n "${FAKE_SQLITE_FAIL:-}" ]; then
   exit "$FAKE_SQLITE_FAIL"
 fi
 
-# Tab-separated, no header: that is what `sqlite3 -separator $'\t' db "SELECT …"`
-# actually emits, and a header here would be a shape the real tool never produces.
-if [ -n "${FAKE_SQLITE_ROWS:-}" ] && [ -f "$FAKE_SQLITE_ROWS" ]; then
-  cat "$FAKE_SQLITE_ROWS"
-fi
+[ -n "${FAKE_SQLITE_ROWS:-}" ] && [ -f "$FAKE_SQLITE_ROWS" ] || exit 0
+
+# The one predicate. Matched against the query text, on purpose: a fixture whose
+# rows do not answer the question asked is exactly what the tests need to be able
+# to express.
+case "$query" in
+  *"status = 'started'"*) col=3 ;;
+  *)                     col=0 ;;
+esac
+
+while IFS="$(printf '\t')" read -r sid _ws status _ms; do
+  [ -n "$sid" ] || continue
+  if [ "$col" -eq 3 ] && [ "$status" != "started" ]; then
+    continue
+  fi
+  printf '%s\n' "$sid"
+done <"$FAKE_SQLITE_ROWS"
 exit 0
