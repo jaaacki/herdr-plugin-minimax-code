@@ -292,7 +292,7 @@ EXPECTED_STATE="working"
 # expectation from the implementation would agree with any value, including the
 # wrong one. This is the value the other two reporters use too.
 EXPECTED_SOURCE="herdr:minimax-code"
-EXPECTED_LABEL="minimax-code"
+EXPECTED_LABEL="mcode"
 
 expected_report_sequence() { # expected_report_sequence [session-id]
   local sid="${1:-}"

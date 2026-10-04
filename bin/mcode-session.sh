@@ -96,19 +96,33 @@
 #
 # Environment (all optional):
 #   HERDR_BIN_PATH         path to the herdr binary
-#   HERDR_PANE_ID          the pane to register — this pane. Required for `report`.
-#   MCODE_AGENT_LABEL      agent label to register under      (default: minimax-code)
+#   HERDR_PANE_ID          the pane to register — this pane. Required for
+#                          `report` and `attach`.
+#   MCODE_AGENT_LABEL      agent label to register under         (default: mcode)
 #   MCODE_AGENT_SOURCE     --source value for the report      (default: herdr:minimax-code)
 #   MCODE_HOME             mcode's data dir                   (default: $HOME/.minimax)
 #   MCODE_RESUME_CMD       resume command, space-separated   (default: "mcode --continue")
 #
 # Dependencies: jq and coreutils. No network, no state outside the herdr registry.
+#
+# ---- THE LABEL DEFAULT, AND WHY IT USED TO BE WRONG --------------------------
+# This used to default to `minimax-code` while bin/mcode-plugin.sh and
+# bin/mcode-watch.sh both defaulted to `mcode`. Three reporters, two different
+# labels for one agent. It is invisible on a single pane — and wrong from the
+# second pane onwards, because the launch path hands the first pane a real name
+# from its `mcode`, `mcode-2`, `mcode-3` sequence and the watcher then reports
+# under a name the pane does not have. All three now default to `mcode`, and the
+# launcher passes the ACTUAL name it chose (issue #75).
+#
+# `--source` is a separate axis and is NOT unified this way: it is the namespace
+# herdr uses to tell reporters apart, so it stays fixed and identical across all
+# three. One shared value, per tests/source-run.sh.
 
 set -euo pipefail
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
 MCODE_HOME="${MCODE_HOME:-$HOME/.minimax}"
-AGENT_LABEL="${MCODE_AGENT_LABEL:-minimax-code}"
+AGENT_LABEL="${MCODE_AGENT_LABEL:-mcode}"
 # --source namespace. Must match the other two reporters, and follows herdr's
 # own `herdr:<agent>` convention (see the Claude integration hook). herdr uses
 # this to tell reporters apart; three different values for one agent defeats it.
@@ -404,9 +418,11 @@ cmd_report() {
     die "\`${HERDR} pane report-agent ${pane}\` failed, so the pane is not registered and the resume command was not recorded."
   fi
 
-  local -a session_argv=(pane report-agent-session --source "$AGENT_SOURCE" --agent "$AGENT_LABEL")
+  # Narration for the operator, who ran this verb by hand and asked what it did.
+  # Deliberately NOT in issue_session_report: `attach` runs inside every launch,
+  # where nobody asked a question, and repeating this unasked is noise. The
+  # read-back below is the one line that survives in both verbs.
   if [ -n "$sid" ]; then
-    session_argv+=(--agent-session-id "$sid")
     log "mcode-session: resolved session ${sid} for this pane's cwd"
   else
     # Deliberate, not accidental: the lookup above cannot succeed against today's
@@ -428,11 +444,10 @@ cmd_report() {
     # the header block, which is the single authoritative statement of the split.
     log "mcode-session: no session id could be resolved for this pane (no manifest records a cwd), so none is reported. MANUAL resume is unaffected: '${MCODE_RESUME_CMD}' re-resolves by workspace and needs no session id. That is separate from herdr restart-restore, whose resume command this API cannot report on at all."
   fi
-  session_argv+=("$pane")
-  session_argv+=(--)
-  session_argv+=("${resume_argv[@]}")
 
-  if ! "$HERDR" "${session_argv[@]}"; then
+  # The session report itself is shared with `attach` (issue #79) so the argv, the
+  # --source and the label cannot drift between the two verbs.
+  if ! issue_session_report "$pane" "$sid"; then
     die "\`${HERDR} pane report-agent-session ${pane}\` failed. The state report above succeeded, so the pane is registered; the session identity was not attached."
   fi
 
@@ -448,12 +463,77 @@ cmd_report() {
   verify_session_readback "$pane" "$sid"
 }
 
+issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if herdr accepted
+  local pane="$1" sid="$2"
+  # shellcheck disable=SC2206  # deliberate word-splitting: a command line
+  local -a resume_argv=(${MCODE_RESUME_CMD})
+  local -a session_argv=(pane report-agent-session --source "$AGENT_SOURCE" --agent "$AGENT_LABEL")
+  if [ -n "$sid" ]; then
+    session_argv+=(--agent-session-id "$sid")
+  fi
+  session_argv+=("$pane")
+  session_argv+=(--)
+  session_argv+=("${resume_argv[@]}")
+  "$HERDR" "${session_argv[@]}"
+}
+
+# Attach identity to a pane some OTHER step has already registered. This is the
+# narrow half of `report`, added for issue #79.
+#
+# WHY IT EXISTS, and why `report` was the wrong thing to call from the launcher:
+# `report` re-asserts the agent state and therefore issues its own
+# `pane report-agent`. Calling it from cmd_start produced a SECOND report-agent for
+# one pane — two reporters claiming the same pane in one launch, which is exactly
+# the duplication the three-reporter design is supposed to avoid. The launcher
+# already reported the state in its own step; repeating it is not tidiness, it is a
+# second claim on the same pane.
+#
+# `attach` therefore issues `pane report-agent-session` and nothing else. The
+# ordering law still holds, and holds for a better reason: herdr only accepts a
+# session report from a reporter that already holds the pane, and the HOLDING IS
+# DONE BY THE LAUNCHER's earlier report-agent. That is why this verb must not be
+# reordered ahead of it, and why `attach` deliberately does not establish the
+# holding itself.
+#
+# QUIET BY DEFAULT. `report` is a verb a person runs by hand and wants to see each
+# step of. `attach` runs inside every launch, where the launch path has already said
+# what it is doing; the discovery chatter ("using session store", "resolved
+# session") is narration for an operator who asked a question, and repeating it
+# unasked is noise. The ONE line that must survive is the read-back's, because on
+# herdr 0.9.3 it is the only thing telling the user their session was discarded.
+cmd_attach() {
+  local pane="${HERDR_PANE_ID:-}"
+  if [ -z "$pane" ]; then
+    die "HERDR_PANE_ID is unset, so there is no pane to attach a session to. Nothing was sent."
+  fi
+
+  # Resolved the same way `report` resolves it, and for the same reason it cannot
+  # currently succeed: today's manifest schema records no cwd, so the lookup
+  # returns nothing and no id is reported. A wrong id is worse than none.
+  local root sid=""
+  if root=$(sessions_root); then
+    sid=$(resolve_session_for_cwd "$root" "$(pwd)")
+  fi
+
+  if ! issue_session_report "$pane" "$sid"; then
+    die "\`${HERDR} pane report-agent-session ${pane}\` failed, so the session identity was NOT attached. The pane's registration is untouched by this verb; only identity and the resume command are missing."
+  fi
+
+  verify_session_readback "$pane" "$sid"
+}
+
 main() {
   case "${1:-}" in
     resolve) cmd_resolve ;;
     report)  cmd_report ;;
+    attach)  cmd_attach ;;
     *)
-      log "usage: mcode-session.sh {resolve|report}"
+      log "usage: mcode-session.sh {resolve|report|attach}"
+      log ""
+      log "  resolve  print the resolution outcome; never mutates anything"
+      log "  report   resolve, re-assert this pane's agent state, then attach identity"
+      log "  attach   attach identity ONLY - for a caller that has already reported"
+      log "           the pane's state, such as the launch path. Quieter than report."
       exit 2
       ;;
   esac

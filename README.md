@@ -66,39 +66,56 @@ pane, so the failure is silent by default. Check it with:
 herdr plugin log list --plugin jaaacki.minimax-code
 ```
 
-## Reporting state (optional)
+## Reporting state
 
-Herdr shows an agent's `idle` / `working` state per pane. Nothing here reports
-MiniMax Code's state by default, so a pane running `mcode` shows no state at all.
+Herdr shows an agent's `idle` / `working` state per pane. **Launching a pane
+starts a watcher for it**, so that state follows the pane instead of freezing at
+whatever it was when the pane was created.
 
-If you want that, run the watcher in a pane of your choice:
+The watcher reads the pane's screen every two seconds, works out whether `mcode` is
+busy or resting, and tells Herdr **only when the answer changes**. An unchanged
+screen produces no traffic at all, so this is not a chatty poller. It stops by
+itself when the pane closes.
+
+To opt out — per launch, or in your shell — set `MCODE_WATCH_AUTOSTART=0`:
+
+```bash
+MCODE_WATCH_AUTOSTART=0 bin/mcode-plugin.sh start
+```
+
+The pane then shows `unknown`, which is the only state this plugin can keep true
+without a watcher, and it will **not** follow the pane: it goes stale in both
+directions, so a pane that finished still reads `working` and a pane that started
+still reads `idle`. If you opt out and still want tracking, run it yourself:
 
 ```bash
 bin/mcode-watch.sh <PANE_ID>
 ```
 
-`<PANE_ID>` is the pane running `mcode` — find it with `herdr pane list`. It reads
-that pane's screen every two seconds, works out whether `mcode` is busy or resting,
-and tells Herdr **only when the answer changes**. An unchanged screen produces no
-traffic at all, so this is not a chatty poller.
+`<PANE_ID>` is the pane running `mcode` — find it with `herdr pane list`.
 
 Things worth knowing:
 
-- **It is a foreground process.** Stop it with `Ctrl-C`, or by closing the pane you
-  ran it in. It is deliberately *not* started for you: a detached watcher per pane
-  would be an orphan if Herdr died, whereas a foreground job cannot outlive its pane.
+- **It runs detached, and is tied to the pane rather than to a supervisor.** It is
+  deliberately *not* a foreground job in the pane you launched from — that pane is
+  running `mcode`. It exits when the pane it watches disappears, and that is the
+  whole of its cleanup.
 - **It reports `idle` and `working`, and `unknown` — never `blocked`.** `blocked`
   means Herdr saw an approval prompt, and no such screen has been captured, because
   `mcode` 0.6.2 runs at `Full access` where no prompt appears. That gap is
   deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
   session's permission mode with `/permission` and a prompt becomes reachable, at
   which point the rule can be written from real evidence.
-- **It stops when the pane it watches disappears**, and that is the whole of its cleanup.
-  It deliberately does *not* call `release-agent`: that call **deletes** the agent entry
-  rather than handing authority back, so an earlier version of this watcher made your
-  pane disappear from `herdr agent list` as soon as it exited. There is no `mcode`
-  screen manifest for detection to fall back to, so nothing would resume even if it
-  worked. Registration is pane-scoped and Herdr drops it with the pane.
+- **It deliberately does not call `release-agent`**, and never did once that call
+  was understood: it **deletes** the agent entry rather than handing authority back,
+  so an earlier version of this watcher made your pane vanish from
+  `herdr agent list` as soon as it exited. There is no `mcode` screen manifest for
+  detection to fall back to, so nothing would resume even if it worked.
+  Registration is pane-scoped and Herdr drops it with the pane.
+- **A turn driven by `mcode exec` does not show up here.** The runtime owns that
+  turn and the pane's screen never changes, so a screen watcher cannot see it — a
+  driven pane can read `idle` while it is actually working. State for driven turns
+  would have to come from the session store, which is not implemented.
 - Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
   a real captured screen; the comments record which candidates were rejected and why.
 
@@ -117,6 +134,44 @@ herdr agent wait  <name> --until idle --timeout 5000   # block until a state
 `<name>` is the agent's registered name. `wait` takes `--until` (repeatable) and
 `--timeout` **in milliseconds**; without `--timeout` it waits indefinitely, and
 without `--until` it matches `idle`, `done` or `blocked`.
+
+What a launched pane gets, and what it does not:
+
+| | Status on Herdr 0.9.3 |
+|---|---|
+| Agent entry, so it appears in `herdr agent list` | ✅ registered at launch |
+| A name, so `get` / `read` / `wait` resolve by name | ✅ renamed at launch |
+| `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
+| Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
+| Resume after a Herdr restart | ❌ nothing to resume from, because the session report was discarded |
+| `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
+
+### The session report is attempted, and Herdr throws it away
+
+Launching a pane now also asks Herdr to record a session id and a resume command,
+so all three of this plugin's reporters run at launch instead of one. **It does not
+work on 0.9.3**, and the launch says so on stderr rather than quietly reporting
+success:
+
+```console
+$ bin/mcode-plugin.sh start
+minimax-code: started mcode in pane wZ:p8
+minimax-code: reported session <none> for pane wZ:p8, but could not verify it …
+minimax-code: started the state watcher for pane wZ:p8, so idle/working will follow the pane.
+```
+
+Herdr accepts `pane report-agent-session`, exits 0, and persists nothing — it only
+keeps session identity for the agent kinds it enumerates in `herdr agent start`, and
+`minimax-code` is not one. The launch therefore prints an honest "not persisted"
+line, and resume is unavailable. This is Herdr's ceiling, not a plugin bug, and it is
+confirmed independently in `sparkfn/pc-client#2251`. To check for yourself:
+
+```bash
+herdr agent list | grep -o '"agent_session":{[^}]*}'   # present for herdr:claude / herdr:codex, absent for ours
+```
+
+When Herdr gains `--kind minimax-code`, the launch path already reports identity and
+resume starts working with no change here.
 
 ### `agent prompt` and `agent send-keys` do not work — and that is Herdr's ceiling
 
