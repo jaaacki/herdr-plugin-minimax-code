@@ -658,6 +658,18 @@ case_readback_warns_when_session_dropped() {
   assert_stderr_mentions "$sid"
   # The pane it was lost for, named exactly.
   assert_stderr_mentions "$PANE"
+  # THE ACCURACY PIN, and the reason this case is not merely "a warning appeared".
+  #
+  # Asserted as a whole sentence, not as the fragment "Session identity is NOT
+  # stored". The short form would let a future edit append "…and neither is the
+  # resume command" and stay green — which is precisely the over-claim that
+  # shipped once, asserting a measurement nobody took. The resume command's fate
+  # is not observable through this API: `agent get` exposes no resume field, so
+  # it can only be called unverifiable, never lost. The trailing clause
+  # ("verified by the read-back, not inferred") is what pins that distinction:
+  # it is the difference between a fact this run established and an assumption
+  # it dressed up as one.
+  assert_stderr_mentions "Session identity is NOT stored: that is verified by the read-back, not inferred."
   # The consequence, in the issue's substance rather than its exact prose: the
   # id is gone and so is the resume command, because herdr discarded the whole
   # report rather than one field of it.

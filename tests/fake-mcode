@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# tests/fake-mcode — a stub `mcode` for tests/drive-run.sh.
+#
+# `mcode exec --session <id> --cwd <dir> <prompt>` runs a real turn in a real
+# session. A test suite that did that would send prompts into the owner's live
+# panes, cost real tokens, and produce different results on every run — so the
+# implementation is pointed at this instead, through $MCODE_BIN_PATH.
+#
+# What it does, per invocation:
+#   1. appends one line to $FAKE_MCODE_LOG (TAB-separated argv fields, in order)
+#   2. prints a canned reply on stdout
+#   3. exits 0, unless failure injection matches
+#
+# It does NOT validate the session id or the --cwd. That is deliberate: those are
+# the implementation's responsibility to get right, and a stub that rejected bad
+# input would test the stub. The suite asserts on the argv the implementation
+# built, which is where a wrong id or an un-normalised path shows up.
+#
+# ---- WHY STUBBING THIS IS NOT OPTIONAL ---------------------------------------
+# The whole point of `mcode-drive.sh` is that a driven turn is REAL - it reaches a
+# live runtime and the reply comes back. A test that skipped the stub to "check it
+# really works" would be sending turns into whatever panes the owner has open.
+# Proof that the wiring is right belongs in a manual run, recorded by a person;
+# proof that the argv is right belongs here, and is reproducible.
+#
+# Test-only knobs:
+#   FAKE_MCODE_LOG      file to append the invocation log to (required)
+#   FAKE_MCODE_FAIL     exit non-zero with this code (default: unset → exit 0)
+#   FAKE_MCODE_REPLY    text printed on stdout (default: "PONG")
+
+set -euo pipefail
+
+if [ -z "${FAKE_MCODE_LOG:-}" ]; then
+  printf 'fake-mcode: FAKE_MCODE_LOG is not set\n' >&2
+  exit 64
+fi
+
+{
+  sep=''
+  for arg in "$@"; do
+    printf '%s%s' "$sep" "$arg"
+    sep=$'\t'
+  done
+  printf '\n'
+} >>"$FAKE_MCODE_LOG"
+
+# Announced, never quiet — the same rule tests/fake-herdr follows. A knob the
+# system silently ignores is how a suite ends up green while asserting about a
+# world it no longer controls.
+if [ -n "${FAKE_MCODE_FAIL:-}" ]; then
+  printf 'fake-mcode: FAKE_MCODE_FAIL=%s — failing this invocation\n' "$FAKE_MCODE_FAIL" >&2
+  exit "$FAKE_MCODE_FAIL"
+fi
+
+printf '%s\n' "${FAKE_MCODE_REPLY:-PONG}"
