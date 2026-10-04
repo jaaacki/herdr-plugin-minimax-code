@@ -7,6 +7,12 @@ the watcher was read out of these files rather than assumed.
 Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
 (`~/.local/bin/herdr`), mcode **v0.6.2** (`~/.minimax-code/bin/mcode`).
 
+**One edit was made after capture**, and it is the only one: `not-mcode.txt` contained
+the operator's real home directory inside the captured screen text, now rendered
+`~/…`. These files ship inside the public release tarball. The pane ids, the screen
+contents and every classification in the table below are exactly as captured.
+`tests/fixtures/agent-detection/` holds the same captures under the same rule.
+
 | File | Exact capture command | Pane | Classified |
 |---|---|---|---|
 | `idle.txt` | `herdr pane read wZ:p1A --source detection --lines 40` | `wZ:p1A` — fresh session, never used | `idle` |
