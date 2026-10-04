@@ -80,6 +80,14 @@ jobs:
           #
           # The exec bit is carried through from git's tree mode (100755 on all
           # three); the verification step proves it survived.
+          #
+          # `agent-detection/` ships WITH `tests/`, and the two must move
+          # together. `tests/agent-detection-run.sh` refuses to run without
+          # `agent-detection/minimax-code.toml`, so shipping the suite and not
+          # the manifest puts a test in front of the user that cannot run. The
+          # previous fix added the two Epic 3 scripts and left this out, and the
+          # release still passed — because step 5 ran exactly one suite, and the
+          # one it ran was the one that happened to work.
           git archive \
             --format=tar.gz \
             --output="herdr-plugin-minimax-code-${VERSION}.tar.gz" \
@@ -88,6 +96,7 @@ jobs:
             bin/mcode-plugin.sh \
             bin/mcode-watch.sh \
             bin/mcode-session.sh \
+            agent-detection/ \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -117,7 +126,10 @@ jobs:
           #    is covered without anyone remembering to edit this list.
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
                    bin/mcode-session.sh README.md LICENSE CLAUDE.md \
-                   tests/run.sh tests/fake-herdr; do
+                   agent-detection/minimax-code.toml \
+                   tests/run.sh tests/session-run.sh tests/watch-run.sh \
+                   tests/source-run.sh tests/agent-detection-run.sh \
+                   tests/e2e/run.sh tests/fake-herdr; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
               echo "If this is a user-facing script, add it to the allowlist above." >&2
@@ -172,8 +184,28 @@ jobs:
             bash -n "$work/$f"
           done
 
-          # 5. And the bundled suite must pass from the extracted copy.
-          "$work/tests/run.sh"
+          # 5. And every bundled suite must pass from the extracted copy.
+          #    Not just tests/run.sh. The session and watcher suites are the ones
+          #    that would have caught their own scripts being absent from the
+          #    tarball, and the agent-detection suite is the one that fails when
+          #    agent-detection/ is missing. Running exactly one suite is what let
+          #    a broken artifact through this step: the one suite that ran was
+          #    the one that happened to work.
+          #
+          #    tests/e2e/run.sh is not in this glob and is not run here — bash's
+          #    `*` does not cross `/`, and e2e needs a real herdr server that
+          #    this job does not install. Its coverage is the `e2e` job in
+          #    ci.yml. Required contents above still asserts the file ships.
+          shopt -s nullglob
+          shipped=( "$work"/tests/*run.sh )
+          if [ ${#shipped[@]} -eq 0 ]; then
+            echo "no test suites in the artifact - refusing to pass vacuously" >&2
+            exit 1
+          fi
+          for suite in "${shipped[@]}"; do
+            echo "=== ${suite#"$work"/} ==="
+            "$suite"
+          done
 
           echo "--- artifact contents ---"
           tar -tvzf "herdr-plugin-minimax-code-${VERSION}.tar.gz"
