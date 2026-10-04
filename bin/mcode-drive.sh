@@ -88,9 +88,9 @@
 #   MCODE_STATE_DB            the runtime database, overriding
 #                             MCODE_HOME for the layout below
 #                             (default: $MCODE_HOME/v2/sqlite/runtime-state.sqlite)
-#   MCODE_DRIVE_BINDING       pane->session binding file
-#                             (default: $MCODE_HOME/drive-bindings.json, or
-#                             <plugin state>/mcode-drive/bindings.json when
+#   MCODE_DRIVE_BINDING       pane->session binding file (TSV)
+#                             (default: $MCODE_HOME/drive-bindings.tsv, or
+#                             <plugin state>/mcode-drive/bindings.tsv when
 #                             HERDR_PLUGIN_STATE_DIR is set)
 #   MCODE_DRIVE_SESSION       force a session id, skipping all resolution.
 #                             The escape hatch that makes an ambiguous pane
@@ -99,15 +99,17 @@
 # Dependencies: bash 3.2, jq, sqlite3, coreutils. No network. The only state
 # written is the binding file, and only after a drive that already succeeded.
 #
-# KNOB NAMES ARE mcode-2's, agreed in mcode-2-contract.md before either side wrote
-# code, and the reasoning is theirs: a helper with no seam cannot be tested
-# hermetically, and this repo's whole approach is that the CLI is the API. I had
-# independently used MCODE_BIN_NAME / MCODE_DRIVE_STATE_DIR and a fixed
-# MCODE_HOME-relative database path; theirs are better, chiefly because
-# MCODE_STATE_DB lets a test use a fixture instead of reading a live runtime's
-# state. One divergence I did NOT take, flagged for them rather than silently
-# resolved: they proposed a 4-field TSV binding, I use JSON. The seam name is
-# theirs either way, so their suite can point the path wherever it likes.
+# KNOB NAMES AND THE TSV BINDING ARE mcode-2's, from mcode-2-contract.md, agreed
+# with the architect before either side wrote test code. The reasoning is theirs
+# and it is better than what I first wrote: a helper with no seam cannot be
+# tested hermetically, and this repo's whole approach is that the CLI is the API.
+# I had independently used MCODE_BIN_NAME / MCODE_DRIVE_STATE_DIR and a JSON
+# binding. MCODE_STATE_DB matters most — without it a test must read the owner's
+# real 76 MB runtime database, and a test whose outcome depends on what the
+# owner's panes happen to be doing is not a test. The TSV binding over my JSON is
+# the architect's ruling and mcode-2's format; it needs no parser, and a human
+# can read and hand-edit it, which matters precisely when a workspace turns out
+# ambiguous and someone has to intervene by hand.
 
 
 set -euo pipefail
@@ -171,105 +173,146 @@ sqlite_sessions() { # sqlite_sessions <workspace>
 # binding_file — print the path of the pane->session binding file.
 #
 # MCODE_DRIVE_BINDING when set (a seam, and the whole file path, not a directory).
-# Otherwise, when herdr provides a plugin state dir, under it — NOT under
-# $MCODE_HOME, which is mcode's own directory and not ours to litter. Otherwise a
-# fixed path under ~/.local/state. A fallback that a reboot or a tmp sweep erases
-# is not a binding, and losing one just means the next drive re-infers or refuses.
+# Otherwise $MCODE_HOME/drive-bindings.tsv. Under the plugin state dir only when
+# herdr injects one. A binding that a tmp sweep erases is not a binding, and
+# losing one just means the next drive re-infers or refuses.
 binding_file() {
   if [ -n "${MCODE_DRIVE_BINDING:-}" ]; then
     printf '%s\n' "$MCODE_DRIVE_BINDING"
   elif [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
-    printf '%s/mcode-drive/bindings.json\n' "${HERDR_PLUGIN_STATE_DIR}"
+    printf '%s/mcode-drive/bindings.tsv\n' "${HERDR_PLUGIN_STATE_DIR}"
   else
-    printf '%s\n' "${MCODE_HOME}/drive-bindings.json"
+    printf '%s\n' "${MCODE_HOME}/drive-bindings.tsv"
   fi
 }
 
 # read_binding PANE — print the bound session id for PANE, or nothing.
+#
+# TSV, not JSON: `<pane_id>\t<session_id>\t<workspace>\t<recorded_at_ms>`, one
+# binding per line, and the format is deliberately append-only so the newest
+# line for a pane wins. That needs no parser, survives a half-written line at the
+# tail better than JSON does, and — the reason it was chosen over my JSON — a
+# human can read it and hand-edit it when a workspace turns out ambiguous, which
+# is exactly when someone will need to.
 read_binding() {
-  local file pane="$1"
+  local file pane="$1" p s _ws ms best="" best_ms=-1
   file="$(binding_file)"
   [ -f "$file" ] || return 0
-  # select(type == "string") for the same reason json_field type-checks: a
-  # non-string value must not become an empty-looking but non-empty id.
-  jq -r --arg p "$pane" '.[$p] | select(type == "string")' "$file" 2>/dev/null || true
+  # A workspace path cannot contain a tab, so splitting on tabs is unambiguous
+  # where splitting on spaces would not be. `|| true` because a final line with
+  # no trailing newline makes `read` return non-zero on a perfectly good record.
+  while IFS=$'\t' read -r p s _ws ms || [ -n "$p" ]; do
+    [ "$p" = "$pane" ] || continue
+    [ -n "$s" ] || continue
+    # A missing or non-numeric stamp must not break the comparison; treat it as
+    # oldest so a well-stamped line always wins over an unstampable one.
+    case "$ms" in
+      ''|*[!0-9]*) ms=0 ;;
+    esac
+    # `>=` not `>`, so that on equal stamps the LATER line wins — which is the
+    # one just appended, since the file is append-only.
+    if [ "$ms" -ge "$best_ms" ]; then
+      best_ms="$ms"
+      best="$s"
+    fi
+  done <"$file"
+  if [ -n "$best" ]; then
+    printf '%s\n' "$best"
+  fi
+  return 0
 }
 
-# write_binding PANE SID — record the pair. BEST EFFORT, on purpose.
+# write_binding PANE SID WORKSPACE — append the pair. BEST EFFORT, on purpose.
 #
 # The drive has already happened by the time this runs; the turn is delivered.
 # Failing the command now would report a success as a failure and could make a
 # caller retry the turn — a second prompt into a live session, which is worse
 # than a missing cache entry. So every failure here is a warning, and the next
-# drive simply re-resolves.
+# drive simply re-infers or refuses.
+#
+# Appended, never rewritten in place: one line per drive is a small, honest log
+# of what this script has actually driven, and a rewrite would lose the history
+# that makes newest-wins meaningful.
 write_binding() {
-  local pane="$1" sid="$2" file dir tmp
+  local pane="$1" sid="$2" ws="$3" file dir now_ms
   file="$(binding_file)"
   dir="$(dirname -- "$file")"
   if ! mkdir -p -- "$dir" 2>/dev/null; then
-    log "mcode-drive: could not create ${dir}, so the pane ${pane} -> session ${sid} binding was NOT recorded. The drive succeeded; the next one for this pane will have to resolve again (and may die as ambiguous)."
+    log "mcode-drive: could not create ${dir}, so the pane ${pane} -> session ${sid} binding was NOT recorded. The drive succeeded; the next one for this pane will have to infer again (and may refuse as ambiguous)."
     return 0
   fi
-  if [ ! -f "$file" ]; then
-    printf '{}\n' >"$file" 2>/dev/null || true
-  fi
-  # Write-then-rename, so a concurrent reader never sees a half-written file.
-  # An unreadable or non-object file yields {} and the real write replaces it,
-  # which is better than refusing to cache because of a corrupt cache.
-  if ! tmp=$(jq --arg p "$pane" --arg s "$sid" \
-        'if type == "object" then . else {} end | .[$p] = $s' \
-        "$file" 2>/dev/null); then
-    log "mcode-drive: ${file} is not readable JSON, so the binding was not recorded. The drive succeeded."
-    return 0
-  fi
-  if ! printf '%s\n' "$tmp" >"$file.tmp" 2>/dev/null || ! mv -f -- "$file.tmp" "$file" 2>/dev/null; then
+  # Seconds x 1000, in shell arithmetic, rather than `date +%s%3N` — GNU-only,
+  # and this has to work on the macOS runner. Ties within the same second are
+  # resolved by read_binding's `>=`, so millisecond precision is not needed.
+  now_ms=$(date +%s 2>/dev/null || printf '0')
+  now_ms=$(( now_ms * 1000 ))
+  if ! printf '%s\t%s\t%s\t%s\n' "$pane" "$sid" "$ws" "$now_ms" >>"$file" 2>/dev/null; then
     log "mcode-drive: could not write the binding file ${file}, so pane ${pane} -> session ${sid} was NOT recorded. The drive succeeded."
     return 0
   fi
   log "mcode-drive: recorded binding ${file}: ${pane} -> ${sid}"
 }
 
-# resolve_target TARGET — print the pane id, or fail.
+# resolve_target TARGET — print `pane<TAB>cwd`, or fail.
+#
+# The cwd field is EMPTY on the pane-id path, and that is load-bearing rather than
+# lazy: a pane-id argument must not trigger `agent get` at all (mcode-2's §2, and
+# the house rule that a pane id is taken at face value), so its cwd has to come
+# from `pane get`. The name path gets both from ONE `agent get`, which returns
+# `pane_id` and `cwd` together — measured on herdr 0.9.3. That is one fewer
+# multiplexer round-trip per drive, and it is why this returns a pair rather
+# than just a pane.
 #
 # A pane id and an agent name are told apart by SHAPE, not by trying one and
 # falling back: a herdr pane id always contains the workspace separator `:`
 # (measured: `wZ:p3`), and an agent name cannot contain one. Probing first would
 # mean a name that happens to look like an id silently resolving to something
-# else, and the brief's "contains ':'" rule is the same one bin/mcode-plugin.sh
-# uses to validate a pane id.
+# else, and the "contains ':'" rule is the same one bin/mcode-plugin.sh uses to
+# validate a pane id.
 resolve_target() {
-  local target="$1" out
+  local target="$1" out pane cwd
   case "$target" in
-    *:*) printf '%s\n' "$target"; return 0 ;;
+    *:*) printf '%s\t\n' "$target"; return 0 ;;
   esac
   # Not id-shaped, so it must be a name. See fact 3 in the header: this only
   # works for an agent that has been `agent rename`d.
   if ! out=$("$HERDR" agent get "$target" 2>/dev/null); then
     die "\`${HERDR} agent get ${target}\` failed, so '${target}' is neither a pane id (no ':' in it) nor a resolvable agent name. Measured on herdr 0.9.3: an agent name only becomes addressable after \`herdr agent rename\`; merely registering a pane under a shared label does not make that label addressable, and several panes can share one. Run \`${HERDR} agent list\` to see what IS addressable, or pass the pane id directly (it looks like wZ:p3). No prompt was sent."
   fi
-  local pane
   pane=$(printf '%s' "$out" | json_field '.result.agent.pane_id')
   if [ -z "$pane" ]; then
     die "\`${HERDR} agent get ${target}\` succeeded but its response carried no \`.result.agent.pane_id\`, so '${target}' did not resolve to a pane. Pass a pane id instead. No prompt was sent."
   fi
-  printf '%s\n' "$pane"
+  cwd=$(printf '%s' "$out" | json_field '.result.agent.cwd')
+  printf '%s\t%s\n' "$pane" "$cwd"
 }
 
-# resolve_pane_cwd PANE — print the pane's cwd, realpath'd, or fail.
+# normalize_cwd PANE RAW — print RAW realpath'd, or fail.
+#
+# Shared by both paths so the realpath requirement cannot be applied on one and
+# forgotten on the other. This is correctness, not tidiness: `mcode exec` refuses
+# a `--cwd` that is not an exact match, and on macOS `/tmp` and `/private/tmp`
+# are the same directory under two names, so passing the symlinked form fails.
+normalize_cwd() {
+  local pane="$1" cwd="$2" real
+  if [ -z "$cwd" ]; then
+    die "the workspace for pane ${pane} is unknown, so \`--cwd\` cannot be passed. \`mcode exec\` requires an exact workspace match. No prompt was sent."
+  fi
+  real=$(realpath_dir "$cwd")
+  if [ -z "$real" ]; then
+    die "pane ${pane} reported cwd '${cwd}', which does not resolve to a readable directory, so it cannot be realpath'd. \`mcode exec\` requires an exact workspace match and a wrong one silently aims the turn at the wrong directory. No prompt was sent."
+  fi
+  printf '%s\n' "$real"
+}
+
+# pane_cwd_via_pane_get PANE — the pane-id path's cwd source.
 resolve_pane_cwd() {
-  local pane="$1" out cwd real
+  local pane="$1" out cwd
   if ! out=$("$HERDR" pane get "$pane" 2>/dev/null); then
     die "\`${HERDR} pane get ${pane}\` failed, so the pane's workspace is unknown. \`mcode exec --cwd\` must match the session's workspace EXACTLY, and guessing one would either fail the exec or, worse, run the turn in the wrong workspace. No prompt was sent."
   fi
   cwd=$(printf '%s' "$out" | json_field '.result.pane.cwd')
-  if [ -z "$cwd" ]; then
-    die "\`${HERDR} pane get ${pane}\` succeeded but reported no \`.result.pane.cwd\`, so the workspace is unknown and \`--cwd\` cannot be passed. No prompt was sent."
-  fi
-  real=$(realpath_dir "$cwd")
-  if [ -z "$real" ]; then
-    die "the pane reported cwd '${cwd}', which does not resolve to a readable directory, so it cannot be realpath'd. \`mcode exec\` requires an exact workspace match and a wrong one silently aims the turn at the wrong directory. No prompt was sent."
-  fi
-  printf '%s\n' "$real"
+  normalize_cwd "$pane" "$cwd"
 }
 
 # resolve_session_for_pane PANE CWD — print the session id, or die listing
@@ -393,9 +436,22 @@ main() {
     die "the prompt is empty after removing the target, so there is nothing to send. Usage: $0 ${target} <prompt...>"
   fi
 
-  local pane cwd sid
-  pane=$(resolve_target "$target")
-  cwd=$(resolve_pane_cwd "$pane")
+  local pane cwd sid resolved cwd_from_get
+  resolved=$(resolve_target "$target")
+  # Split on the FIRST tab. `${x%%$'\t'*}` is the part before it, `${x#*$'\t'}`
+  # everything after — so a cwd containing a tab would survive intact, and an
+  # empty second field (the pane-id path) comes back as the empty string.
+  pane="${resolved%%$'\t'*}"
+  cwd_from_get="${resolved#*$'\t'}"
+
+  if [ -n "$cwd_from_get" ]; then
+    # Name path: `agent get` already told us the workspace, so no second call.
+    cwd=$(normalize_cwd "$pane" "$cwd_from_get")
+  else
+    # Pane-id path: `agent get` was deliberately not called, so ask `pane get`.
+    cwd=$(resolve_pane_cwd "$pane")
+  fi
+
   sid=$(resolve_session_for_pane "$pane" "$cwd")
 
   log "mcode-drive: driving pane ${pane}, session ${sid}, cwd ${cwd}"
@@ -450,7 +506,7 @@ main() {
 
   # Cache only after a turn that actually succeeded. Writing before this point
   # would record a pair that has never been shown to work.
-  write_binding "$pane" "$sid"
+  write_binding "$pane" "$sid" "$cwd"
 }
 
 main "$@"

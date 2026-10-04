@@ -198,11 +198,21 @@ rename. `herdr agent list` shows what is addressable.
 Herdr does not record a session id for our panes, so the pane→session mapping has
 to be discovered. This script looks in two places:
 
-1. **A binding file**, `$MCODE_HOME/drive-bindings.json` — that is
-   `~/.minimax/drive-bindings.json` — or `<plugin state>/mcode-drive/bindings.json`
-   when Herdr sets `HERDR_PLUGIN_STATE_DIR`. Written after every drive that
-   succeeded, so the *second* drive of a pane resolves on its own. Override the
-   path with `MCODE_DRIVE_BINDING` if you want it somewhere else.
+1. **A binding file**, `$MCODE_HOME/drive-bindings.tsv` — that is
+   `~/.minimax/drive-bindings.tsv` — or `<plugin state>/mcode-drive/bindings.tsv`
+   when Herdr sets `HERDR_PLUGIN_STATE_DIR`. Override the path with
+   `MCODE_DRIVE_BINDING` if you want it somewhere else.
+
+   It is plain tab-separated text, one line per drive, and it is yours to edit:
+
+   ```
+   pane_id<TAB>session_id<TAB>workspace<TAB>recorded_at_ms
+   wZ:p8	mvs_ae2f6e1c…	/Users/you/your-repo	1791123133419
+   ```
+
+   A drive that succeeded appends a line, so the newest line for a pane is the
+   one that counts — which means you can fix a wrong pairing by hand, or pin a
+   right one, without waiting for anything to re-infer it.
 
 2. **MiniMax Code's own sqlite state**, which does record a session's workspace —
    in a `workspace_dir` column, not in the session manifest. (Issue #36 recorded
