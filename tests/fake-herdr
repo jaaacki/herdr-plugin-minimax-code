@@ -258,7 +258,7 @@ remembered_session_id() { # prints the remembered id, or nothing at all
 #
 #   {"id":"cli:agent:get","result":{"agent":{"agent":"claude",
 #     "agent_session":{…},"agent_status":"working",
-#     "cwd":"/Users/noonoon/Dev/herdr-plugin-minimax-code","focused":true,
+#     "cwd":"/Users/<user>/Dev/<repo>","focused":true,
 #     "foreground_cwd":"…","pane_id":"wZ:p3","revision":4,
 #     "state_change_seq":88,"tab_id":"wZ:t3","terminal_id":"term_…",
 #     "terminal_title":"◑ Repo overview","workspace_id":"wZ"},"type":"agent_info"}}
