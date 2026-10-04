@@ -99,6 +99,28 @@ assert_stderr_mentions() { # assert_stderr_mentions <needle>
   fi
 }
 
+# Case-insensitive extended-regex match. Used only where the issue mandates the
+# SUBSTANCE of a message but deliberately leaves the wording to the
+# implementation — e.g. "say resume is unavailable" does not fix whether that
+# reads "unavailable", "not available" or "no longer available". Every such
+# assertion is paired with an exact-needle assertion on the session id, so
+# breadth here can never make a case pass vacuously.
+assert_stderr_matches() { # assert_stderr_matches <ere>
+  if ! grep -qiE -- "$1" "$STDERR_FILE"; then
+    note "stderr does not match /$1/"
+  fi
+}
+
+# The negative of the above, and the half that stops a read-back which simply
+# always complains. "The warning fired" is only half of issue #71; the other
+# half is "and it stayed quiet when the write actually landed".
+assert_stderr_lacks_match() { # assert_stderr_lacks_match <ere>
+  if grep -qiE -- "$1" "$STDERR_FILE"; then
+    note "stderr matches /$1/ but this case requires silence"
+    grep -iE -- "$1" "$STDERR_FILE" | sed 's/^/          /'
+  fi
+}
+
 assert_stdout_field() { # assert_stdout_field <key> <value>
   local got
   got="$(grep -F "$1	" "$STDOUT_FILE" 2>/dev/null | head -1 | cut -f2-)"
@@ -161,6 +183,34 @@ assert_log_empty() {
 assert_log_lacks() { # assert_log_lacks <needle>
   if grep -qF -- "$1" "$FAKE_HERDR_LOG"; then
     note "invocation log should not contain '$1'"
+  fi
+}
+
+# Issue #71 in one assertion: the script must go back and ASK herdr what it
+# actually stored, after the report it just made.
+#
+# Order, not membership, for the same reason assert_log_order exists — and the
+# stronger point is that an `agent get` *anywhere* in the log proves nothing,
+# because the script already calls it once to re-assert the agent state. Only an
+# `agent get` AFTER the session report is a read-back.
+assert_readback_after_session_report() {
+  local session_line readback_line
+  session_line="$(grep -nF 'pane	report-agent-session' "$FAKE_HERDR_LOG" 2>/dev/null \
+                 | head -1 | cut -d: -f1)"
+  readback_line="$(awk -F'\t' '$1 == "agent" && $2 == "get" { print NR }' \
+                  "$FAKE_HERDR_LOG" 2>/dev/null | tail -1)"
+  if [ -z "$session_line" ]; then
+    note "no report-agent-session call in the log to read back from"
+    return
+  fi
+  if [ -z "$readback_line" ]; then
+    note "no \`agent get\` invocation at all: the report was never verified"
+    return
+  fi
+  if [ "$readback_line" -le "$session_line" ]; then
+    note "the only \`agent get\` is at line $readback_line, at or before the" \
+         "session report at line $session_line — that is the pre-existing" \
+         "state read, not a read-back of what was just written"
   fi
 }
 
@@ -257,7 +307,11 @@ expected_report_sequence() { # expected_report_sequence [session-id]
   printf 'agent\tget\t%s\n' "$PANE"
   printf 'pane\treport-agent\t%s\t--source\t%s\t--agent\t%s\t--state\t%s\t--\tmcode\t--continue\n' \
     "$PANE" "$EXPECTED_SOURCE" "$EXPECTED_LABEL" "$EXPECTED_STATE"
-  printf '%s' "$session_line"
+  printf '%s\n' "$session_line"
+  # The read-back of issue #71, and the reason a session report is no longer
+  # something to take on trust. herdr exits 0 when it discards the write, so
+  # the only way to know the id landed is to ask again afterwards.
+  printf 'agent\tget\t%s\n' "$PANE"
 }
 
 # --- cases -------------------------------------------------------------------
@@ -525,6 +579,108 @@ case_report_aborts_when_state_report_fails() {
   assert_log_lacks "pane	report-agent-session"
 }
 
+# --- issue #71: verify the report actually landed ----------------------------
+# Everything above proves the script SENT the right things. Nothing above proves
+# herdr KEPT them, and that is the defect: `pane report-agent-session` exits 0
+# for an agent kind herdr does not enumerate and persists nothing at all
+# (herdr 0.9.3, measured 2026-10-03/04; confirmed independently in
+# sparkfn/pc-client#2251). A script that reports success there is reporting a
+# write that did not happen.
+#
+# The needles below are chosen so a faithful implementation passes and a
+# plausible wrong one does not:
+#
+#   * the session id, EXACT — mandatory, and the anchor that makes these cases
+#     mutation-proof. Without a read-back the id appears in exactly one line,
+#     "resolved session <id> …", which says nothing about persistence.
+#   * the pane id, EXACT — the issue requires the diagnostic to name the pane.
+#   * the substance of the remaining claims, case-insensitively, because the
+#     issue fixes what the message must SAY and not how it must say it.
+#
+# The stub's session identity lives at `.result.agent.agent_session.value`, not
+# at `.result.agent.agent_session` — the latter is a wrapper object, measured
+# from a live herdr 0.9.3 and recorded at tests/fake-herdr emit_agent_get. A
+# read-back that reads the wrapper cannot tell a landed write from a dropped
+# one, and these cases are shaped so that implementation fails them.
+
+# 15. The write landed, so the script says nothing about it. This is the half of
+#     #71 that stops the cheap fix: a read-back that ALWAYS complains is not a
+#     read-back, and a user who cannot tell a working report from a broken one
+#     has been handed a permanently alarming plugin.
+case_readback_silent_when_session_persists() {
+  setup_case
+  local sid="mvs_4444444444444444444444444444dddd"
+  write_manifest v2 session_D "$sid" 1791059999999 >/dev/null
+  export HERDR_PANE_ID="$PANE"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # The id was sent…
+  assert_log_exactly "$(expected_report_sequence "$sid")"
+  # …herdr was asked whether it kept it…
+  assert_readback_after_session_report
+  # …and the answer was yes, so there is nothing to report.
+  assert_stderr_lacks_match 'not (persist|stored|save)|discard|unavailab|not available'
+  # A panic here would be as wrong as the silence: the registration did happen.
+  assert_stderr_mentions "resolved session $sid"
+}
+
+# 16. THE case issue #71 exists for. herdr accepts the session report, exits 0,
+#     and throws the id away — its measured 0.9.3 behaviour for an agent kind it
+#     does not enumerate. The script must notice, must name what was lost, and
+#     must NOT exit non-zero: the launch and the registration both succeeded, so
+#     a non-zero exit would report a success as a failure and invite a caller to
+#     retry work that already happened.
+case_readback_warns_when_session_dropped() {
+  setup_case
+  local sid="mvs_4444444444444444444444444444dddd"
+  write_manifest v2 session_D "$sid" 1791059999999 >/dev/null
+  export HERDR_PANE_ID="$PANE"
+  export FAKE_HERDR_FAULT="agent-session-dropped"
+
+  run_session report
+  # The decided exit policy: warn, exit 0.
+  assert_rc_zero "$RC"
+
+  assert_readback_after_session_report
+  # The id that was lost, named exactly.
+  assert_stderr_mentions "$sid"
+  # The pane it was lost for, named exactly.
+  assert_stderr_mentions "$PANE"
+  # The consequence, in the issue's substance rather than its exact prose: the
+  # id is gone and so is the resume command, because herdr discarded the whole
+  # report rather than one field of it.
+  assert_stderr_matches 'not (persist|stored|save)|discard|drop|unavailab|not available'
+  assert_stderr_matches 'resume'
+  # And the user is told this is herdr's ceiling, not a plugin fault, so they
+  # do not go looking for a bug here that is not here.
+  assert_stderr_matches 'herdr|0\.9\.3'
+}
+
+# 17. A different failure from a dropped write, and it must not be reported as
+#     one. When `agent get` itself fails the script learned nothing: it cannot
+#     say the id was lost, and it must not claim it was kept. "Could not verify"
+#     is the honest answer, and it is a different sentence from #16 on purpose —
+#     conflating them teaches the user to ignore the warning.
+case_readback_distinguishes_unverifiable_from_dropped() {
+  setup_case
+  local sid="mvs_4444444444444444444444444444dddd"
+  write_manifest v2 session_D "$sid" 1791059999999 >/dev/null
+  export HERDR_PANE_ID="$PANE"
+  export FAKE_HERDR_FAIL="agent get:1"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # The report was still attempted — a read-back failure is not a reason to skip
+  # the write, and skipping it would lose the identity on a herdr that works.
+  assert_log_order "pane	report-agent	" "pane	report-agent-session"
+  # Inability to read is its own message, and it is not a claim of loss.
+  assert_stderr_matches 'could not verify|cannot verify|unable to verify|not be verified'
+  assert_stderr_lacks_match 'not (persist|stored|save)|discard|unavailab|not available'
+}
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -554,6 +710,9 @@ CASES=(
   report-falls-back-when-no-state-recorded:case_report_falls_back_when_no_state_recorded
   report-resume-cmd-is-word-split:case_report_resume_cmd_is_word_split
   report-aborts-when-state-report-fails:case_report_aborts_when_state_report_fails
+  readback-silent-when-session-persists:case_readback_silent_when_session_persists
+  readback-warns-when-session-dropped:case_readback_warns_when_session_dropped
+  readback-distinguishes-unverifiable-from-dropped:case_readback_distinguishes_unverifiable_from_dropped
 )
 
 if [ ! -x "$FAKE_HERDR" ]; then
