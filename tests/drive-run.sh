@@ -76,6 +76,7 @@ BOUND_SID="mvs_4444444444444444444444444444dddd"
 SQL_SID="mvs_5555555555555555555555555555eeee"
 STARTED_SID="mvs_6666666666666666666666666666ffff"
 OTHER_SID="mvs_7777777777777777777777777777aaaa"
+OLD_SID="mvs_8888888888888888888888888888bbbb"
 
 BASE_PATH="$PATH"
 WORK="$(cd -- "$(mktemp -d "${TMPDIR:-/tmp}/mcode-drive-tests.XXXXXX")" && pwd -P)"
@@ -283,6 +284,14 @@ setup_case() {
 write_binding_file() { # write_binding_file <pane> <sid>
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$CASE_DIR/project" 1791059999999 \
     >"$CASE_DIR/drive-bindings.tsv"
+}
+
+# Append one more line, leaving earlier ones in place. The binding file is
+# append-only and doubles as a log, so a pane that has been driven more than once
+# has SEVERAL lines for it and the read rule has to pick between them.
+append_binding_line() { # append_binding_line <pane> <sid> <stamp-ms>
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$CASE_DIR/project" "$3" \
+    >>"$CASE_DIR/drive-bindings.tsv"
 }
 
 # Canned sqlite rows. NEWEST FIRST, matching the query's ORDER BY
@@ -625,6 +634,58 @@ case_session_override_skips_resolution() {
   assert_stderr_mentions "MCODE_DRIVE_SESSION"
 }
 
+# 12. THE APPEND-ONLY RULE, which nothing else here covers. Every other case that
+#     uses a binding writes exactly ONE line, so the rule that makes an append-only
+#     file safe as both a cache and a log — when a pane has been driven more than
+#     once, the NEWEST line wins — had no coverage at all. mcode-1 raised the
+#     question and this is the answer.
+#
+#     It matters more than a cache's worth of lines usually would. The file is never
+#     rewritten, so a stale entry is never erased; if the reader took the first
+#     match rather than the newest, every re-driven pane would keep being sent to
+#     the session it used the first time, silently and indefinitely.
+case_rebinding_uses_the_newest_line_not_the_first() {
+  setup_case
+  # Oldest first, as an append-only log actually grows. The first line is the one a
+  # naive `head -1` or a `>` -comparison reader would pick, and picking it is the
+  # bug this case exists to catch.
+  append_binding_line "$PANE" "$OLD_SID" 1791000000000
+  append_binding_line "$PANE" "$SQL_SID"  1791059999999
+  append_binding_line "$PANE" "$BOUND_SID" 1791160000000
+
+  run_drive "$PANE" "hi"
+
+  assert_rc_zero "$RC"
+  assert_exec_argv "$BOUND_SID" "$(cd -- "$CASE_DIR/project" && pwd -P)" "hi"
+  # The stale entries must not merely lose — they must not have been consulted as
+  # candidates. If the reader kept every match, the ambiguity guard would have
+  # fired instead of driving.
+  assert_stderr_lacks "$OLD_SID"
+}
+
+# 13. The same rule at its sharpest edge: EQUAL stamps, where the later line must
+#     win. This is a one-character difference in the reader — `>=` rather than `>`
+#     — and it is the version that actually holds the property, because the line
+#     just appended is the later one. Flip it to `>` and the file still works for
+#     every distinct stamp, so nothing else in the suite would notice.
+#
+#     It also pins the unstampable-line rule in the same breath: a stamp that is
+#     missing or not a number is treated as oldest, so a corrupt line can never
+#     outrank a good one and strand a pane on a session nothing vouches for.
+case_equal_stamps_take_the_later_line_and_junk_never_wins() {
+  setup_case
+  append_binding_line "$PANE" "$OLD_SID"  1791059999999
+  append_binding_line "$PANE" "$BOUND_SID" 1791059999999   # same stamp, later
+  append_binding_line "$PANE" "$SQL_SID"  not-a-number    # unstampable
+
+  run_drive "$PANE" "hi"
+
+  assert_rc_zero "$RC"
+  # The later of the two equal-stamped lines, and not the unstampable one.
+  assert_exec_argv "$BOUND_SID" "$(cd -- "$CASE_DIR/project" && pwd -P)" "hi"
+  assert_stderr_lacks "$SQL_SID"
+}
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -651,6 +712,8 @@ CASES=(
   missing-jq-dies-naming-it:case_missing_jq_dies_naming_it
   unresolvable-name-fails-before-any-drive:case_unresolvable_name_fails_before_any_drive
   session-override-skips-resolution:case_session_override_skips_resolution
+  rebinding-uses-the-newest-line-not-the-first:case_rebinding_uses_the_newest_line_not_the_first
+  equal-stamps-take-the-later-line-and-junk-never-wins:case_equal_stamps_take_the_later_line_and_junk_never_wins
 )
 
 if [ ! -x "$FAKE_HERDR" ]; then
