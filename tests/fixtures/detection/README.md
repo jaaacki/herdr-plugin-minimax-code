@@ -20,6 +20,7 @@ contents and every classification in the table below are exactly as captured.
 | `idle-after-working.txt` | `herdr pane read wZ:p1A --source detection --lines 40` | `wZ:p1A` — after `herdr pane run wZ:p1A "reply with the single word ok"` completed | `idle` |
 | `not-mcode.txt` | `herdr pane read wZ:p1 --source detection --lines 40` | `wZ:p1` — a `claude` pane, not mcode at all | `unknown` |
 | `stale-scrollback.txt` | **constructed**, see below | — | `idle` |
+| `working-with-tasks-chip.txt` | `herdr pane read wZ:p2W --source detection --lines 40` | `wZ:p2W` — a pane with a background task in flight | `working` |
 
 `wZ:p1A` was created for this issue (`herdr pane split wZ:p4 --direction down --no-focus`, then
 `herdr pane run wZ:p1A "$(command -v mcode)"`) and closed after capture. `wZ:p5` and `wZ:p1`
@@ -88,3 +89,35 @@ permission option), so no snapshot of that state could be produced without guess
 A `blocked` rule that never fires is a lie in the code, so the gap is documented in
 the watcher instead, and `not-mcode.txt` pins the behaviour that an unmatched screen
 reports `unknown` rather than inventing `blocked`.
+
+## `working-with-tasks-chip.txt`, and the capture that does not exist
+
+Captured **2026-10-05** from pane `wZ:p2W`, a pane with one background task in
+flight. It is the only real capture of the `◐ Tasks · N background active · N result
+ready · /tasks details` chip anywhere in this repo, and it is banked because the
+chip is a real part of the mcode status area and a future reader should not have to
+rediscover its exact text.
+
+It carries the chip **and** `Esc stop` **and** `Ctrl+O details`, and it carries
+none of the idle markers. So it classifies `working` — and it classifies `working`
+*because of the other two markers*, not because of the chip. The chip is not in
+`RULES` at all.
+
+That is the whole finding, and it is why this fixture is pinned for drift rather
+than as a contract test. **A chip-alone assertion cannot fail.** Add `◐ Tasks` to
+the working table and this capture still classifies `working`, for the reason it
+already did. Building a chip-bearing capture that also carried an idle marker —
+the only shape that could falsify "the chip does not drag a screen to working" —
+would have required editing a real capture into a shape no real pane was ever
+observed in, which is a fixture that passes against a fiction.
+
+`bg-resting-raw.txt`, captured from the same pane, was offered as that capture. It
+is not: measured, it contains **no `Tasks` line at all**, and its only markers are
+`⠇ Loading … ⚡ tok/s … Ctrl+O details · Esc stop`, so it classifies `working` like
+the others. The two captures that do exist are a chip-bearing *working* pane and a
+chip-less *idle* pane, and they have never been observed together.
+
+So `chip-is-not-a-working-marker` asserts the decision that is actually available
+to pin — the chip is absent from `RULES` — and `chip-bearing-screen-classifies-working`
+pins the captured shape. Neither pretends to be the chip-alone test the brief asked
+for, because that test cannot be written from real captures.
