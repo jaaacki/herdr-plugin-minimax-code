@@ -71,7 +71,15 @@
 #   split-id-no-colon     the split response's pane id is well-formed but has no
 #                         colon, so it is not a pane id at all
 #   agent-get-empty       `agent get` succeeds but records no agent_status, i.e.
-#                         the pane is not registered yet
+#                         the pane is not registered yet. NOT the same defect as
+#                         agent-session-dropped: this one models a pane herdr has
+#                         never registered, that one models a registration whose
+#                         session identity was accepted and thrown away.
+#   agent-session-dropped `pane report-agent-session` exits 0 and persists
+#                         nothing, so the later `agent get` reports
+#                         agent_session: null. This is herdr 0.9.3's MEASURED
+#                         behaviour for an agent kind it does not enumerate —
+#                         see the provenance note on emit_agent_get.
 #   report-agent-session-unsupported
 #                         a Herdr with no `pane report-agent-session` verb
 #
@@ -96,6 +104,10 @@
 #   FAKE_HERDR_FAULT      comma-separated response faults, listed above
 #   FAKE_HERDR_CWD        cwd substituted into `pane get` / `pane current`
 #   FAKE_HERDR_SRC_PANE   pane id substituted into `pane get` / `pane current`
+#   FAKE_HERDR_SESSION_STATE
+#                         file the stub remembers a reported session id in
+#                         (default: "$FAKE_HERDR_LOG.session", so every case is
+#                         isolated and dies with its own sandbox)
 
 set -euo pipefail
 
@@ -166,6 +178,100 @@ has_fault() { # has_fault <name>
 
 announce_fault() { # announce_fault <name> <what-it-did>
   printf 'fake-herdr: FAKE_HERDR_FAULT=%s — %s\n' "$1" "$2" >&2
+}
+
+# --- remembered session identity ---------------------------------------------
+# A real multiplexer REMEMBERS: `pane report-agent-session` writes, and a later
+# `agent get` reads back what was written. This stub is a fresh process per
+# invocation, so "remembers" has to be a file. It hangs off the invocation log's
+# own path, so each test case gets its own memory and loses it with its sandbox —
+# no shared state, no cleanup hook, nothing to leak between cases.
+#
+# Both calls are no-ops in --self-check mode, which touches no state at all.
+session_state_file() { # session_state_file
+  # Nothing to hang state off means there is no state to keep — the --self-check
+  # path sets neither variable. Returning empty here stops that path from
+  # degrading to a bare ".session" in whatever the caller's cwd happens to be,
+  # where it could pick up a stray file and make introspection lie.
+  [ -n "${FAKE_HERDR_SESSION_STATE:-}${FAKE_HERDR_LOG:-}" ] || return 0
+  printf '%s' "${FAKE_HERDR_SESSION_STATE:-${FAKE_HERDR_LOG:-}.session}"
+}
+
+remember_session_id() { # remember_session_id <id>
+  local f
+  f="$(session_state_file)" || return 0
+  [ -n "$f" ] || return 0
+  printf '%s\n' "$1" >"$f"
+}
+
+remembered_session_id() { # prints the remembered id, or nothing at all
+  local f
+  f="$(session_state_file)" || return 0
+  [ -n "$f" ] && [ -f "$f" ] || return 0
+  cat "$f"
+}
+
+# `agent get` — the one response here that is PARSED, and the one that carries
+# the session identity the read-back cases assert on.
+#
+# PROVENANCE, because this file's rule is that nothing is invented. The
+# `agent_session` shape below is MEASURED, not guessed. Captured 2026-10-04 from
+# herdr 0.9.3 with:
+#
+#   herdr agent list | grep -o '"agent_session":{[^}]*}'
+#
+# which returned, for a pane that carries a session:
+#
+#   "agent_session":{"agent":"claude","kind":"id","source":"herdr:claude",
+#                    "value":"94929c8f-8704-4834-9b31-30c53c001c89"}
+#
+# So the session id lives at `.result.agent.agent_session.value`. It is NOT at
+# `.result.agent.agent_session` — that is the wrapper object, and it is exactly
+# how a read-back can appear to succeed while proving nothing: a non-null
+# wrapper says nothing about whether the id that was sent is the id that landed.
+# Issue #71's `jq -r '.result.agent.agent_session'` printed `null` because herdr
+# had discarded the write, not because the field is a bare scalar.
+#
+# The two shapes this can serve are both real:
+#   * key ABSENT      — herdr 0.9.3 on an mcode pane after an accepted-and-
+#                       discarded session report, the measured behaviour, and
+#                       what agent-session-dropped forces
+#   * value: <id>     — a herdr that persisted what it was told, which is what
+#                       lets a suite prove the read-back DETECTS a write that
+#                       landed instead of only ever firing on a write that failed
+#
+# Absent, not `"agent_session": null`. Both make `.result.agent.agent_session.value`
+# read as null, so a jq path cannot tell them apart — but they are not the same
+# response, and a stub that serves the wrong one is a stub encoding a fiction.
+# The key is omitted from the document entirely when herdr holds no session.
+#
+# The `agent`/`agent_status` fields around it are the minimum this stub has
+# always served; they predate the captures and are not themselves a capture.
+emit_agent_get() { # emit_agent_get
+  local sid
+  sid="$(remembered_session_id)"
+  if [ -n "$sid" ]; then
+    jq -cn --arg s "$sid" '{
+      result: {
+        agent: {
+          agent: "mcode",
+          agent_status: "working",
+          agent_session: {agent: "minimax-code", kind: "id",
+                          source: "herdr:minimax-code", value: $s}
+        },
+        type: "agent_info"
+      }
+    }'
+  else
+    # No agent_session key at all — del() is what makes this an absence rather
+    # than a field set to null.
+    jq -cn '{
+      result: {
+        agent: {agent: "mcode", agent_status: "working", agent_session: null},
+        type: "agent_info"
+      }
+    } | del(.result.agent.agent_session)'
+  fi
 }
 
 fixture_path() { # fixture_path <name>; prints the path, or exits non-zero
@@ -252,7 +358,7 @@ if [ "${1:-}" = "--self-check" ]; then
   printf 'pane-run\t%s\n'     '{"result":{"ok":true}}'
   printf 'pane-report-agent\t%s\n' '{"result":{"ok":true}}'
   printf 'pane-report-agent-session\t%s\n' '{"result":{"ok":true}}'
-  printf 'agent-get\t%s\n' '{"result":{"agent":{"agent":"mcode","agent_status":"working"},"type":"agent_info"}}'
+  printf 'agent-get\t%s\n' "$(emit_agent_get)"
   printf 'agent-list\t%s\n'   '{"result":{"agents":[],"type":"agent_list"}}'
   printf 'agent-rename\t%s\n' '{"result":{"agent":{"agent":"mcode","name":"mcode"},"type":"agent_renamed"}}'
   exit 0
@@ -290,25 +396,45 @@ case "$sub" in
     # instead of imposing a placeholder that would overwrite a real one.
     # agent-get-empty models a pane herdr has not registered yet, which is the
     # launch-path case and the only one where the script picks a state itself.
+    # It is a DIFFERENT defect from agent-session-dropped: an unregistered pane
+    # versus a registered pane whose session identity was accepted and dropped.
     if has_fault agent-get-empty; then
       announce_fault agent-get-empty "reporting a pane with no recorded agent state"
       printf '%s\n' '{"result":{"agent":{},"type":"agent_info"}}'
       exit 0
     fi
-    printf '%s\n' '{"result":{"agent":{"agent":"mcode","agent_status":"working"},"type":"agent_info"}}'
+    emit_agent_get
     ;;
   "agent list")
     emit_agent_list
     ;;
   "pane report-agent-session")
-    # Exit status only, on the same grounds as `pane run`: the session id and the
-    # resume command are arguments, and arguments are already in the log the
-    # tests assert on. report-agent-session-unsupported models a Herdr that has
-    # no such verb, a different failure from one that errors.
+    # Exit status is what the entrypoint checks, on the same grounds as
+    # `pane run`: the session id and the resume command are arguments, and
+    # arguments are already in the log the tests assert on.
+    # report-agent-session-unsupported models a Herdr that has no such verb, a
+    # different failure from one that errors.
     if has_fault report-agent-session-unsupported; then
       announce_fault report-agent-session-unsupported "behaving as a Herdr with no report-agent-session verb"
       printf 'fake-herdr: unhandled subcommand: %s\n' "${1:-}" >&2
       exit 64
+    fi
+    # What a persisting herdr would keep, so a later `agent get` can serve it
+    # back. agent-session-dropped is the fault that models 0.9.3 instead: the
+    # call is accepted, exits 0, and nothing is written anywhere. That silence
+    # is the whole defect of issue #71 — a write that reports success and
+    # changes nothing — so it is modelled by NOT remembering, never by failing.
+    if has_fault agent-session-dropped; then
+      announce_fault agent-session-dropped \
+        "accepting the session report, exiting 0 and persisting nothing, as herdr 0.9.3 does for agent kinds it does not enumerate"
+    else
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--agent-session-id" ] && [ "$#" -ge 2 ]; then
+          remember_session_id "$2"
+          break
+        fi
+        shift
+      done
     fi
     printf '%s\n' '{"result":{"ok":true}}'
     ;;
