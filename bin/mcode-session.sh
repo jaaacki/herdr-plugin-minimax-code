@@ -258,8 +258,11 @@ readback_session_id() { # readback_session_id  — reads an `agent get` response
 #                                    a read-back that always warns is as wrong as
 #                                    one that never warns.
 #   * id sent, absent or different → name the id, the pane, the cause, and what
-#                                    is lost. herdr discarded the whole call, so
-#                                    the resume command went with it.
+#                                    is verified lost. Session identity is
+#                                    VERIFIED absent by the read-back; whether
+#                                    herdr kept the resume command is a
+#                                    SEPARATE question this API cannot answer —
+#                                    see the header block.
 #   * id sent, `agent get` failed  → could not confirm. NOT a claim of loss.
 #   * no id sent                    → identity is a different question (nothing
 #                                    was sent), and resume persistence is
