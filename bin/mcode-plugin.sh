@@ -252,7 +252,23 @@ watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
   # does not signal it. Harmless if it fails: nohup already ignores SIGHUP, so
   # disown is belt-and-braces, and a non-interactive shell may legitimately have
   # nothing to disown.
-  MCODE_WATCH_AGENT="$agent_name" nohup "$watcher" "$pane" >/dev/null 2>&1 &
+  #
+  # BOTH NAMES, AND WHY. `MCODE_AGENT_LABEL` is this plugin's established label
+  # knob - it is what `mcode-session.sh` documents and reads - so it is the one
+  # that matters: a watcher (or anything replacing it) that knows only the
+  # documented var must still receive the name the launch chose. `MCODE_WATCH_AGENT`
+  # is passed alongside it as the watcher-specific override, and
+  # `mcode-watch.sh` prefers it, so the two can only disagree if someone
+  # deliberately points the watcher's label away from the session's.
+  #
+  # Either alone is a real defect, and the first pane hides it. Passing only
+  # `MCODE_WATCH_AGENT` looks correct on the very first launch, where the chosen
+  # name is the literal `mcode` and both spellings produce the same string; it
+  # only diverges on the second pane, when the name is `mcode-2` and anything
+  # reading the documented var gets an empty string and reports every state
+  # under an agent name that does not exist.
+  MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
+    nohup "$watcher" "$pane" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 
   log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
