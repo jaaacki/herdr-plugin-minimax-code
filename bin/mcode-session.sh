@@ -226,21 +226,33 @@ readback_session_id() { # readback_session_id  — reads an `agent get` response
     ' 2>/dev/null || true
 }
 
-# Verify a session id that was just reported, and describe the outcome.
+# Verify what herdr actually kept after a session report, and describe it.
 #
-# Three outcomes, per the issue #71 table:
-#   * it reads back            → say nothing. A confirmed write needs no commentary.
-#   * it does not              → name the id, the pane, the cause, and what is lost.
-#   * it cannot be checked     → say that, distinctly. "I could not confirm" and
-#                                "I confirmed it is gone" are different facts and
-#                                collapsing them would be its own small lie.
-verify_session_readback() { # verify_session_readback <pane> <session-id>
-  local pane="$1" sid="$2" out found
+# Outcomes, and the wording is load-bearing — each says a different fact, and
+# collapsing any two of them would be a smaller version of the lie #71 is about:
+#
+#   * id sent, reads back          → say nothing. A confirmed write needs no
+#                                    commentary, and this is the anti-cheat case:
+#                                    a read-back that always warns is as wrong as
+#                                    one that never warns.
+#   * id sent, absent or different → name the id, the pane, the cause, and what
+#                                    is lost. herdr discarded the whole call, so
+#                                    the resume command went with it.
+#   * id sent, `agent get` failed  → could not confirm. NOT a claim of loss.
+#   * no id sent                    → identity is a different question (nothing
+#                                    was sent), and resume persistence is
+#                                    structurally unverifiable either way.
+verify_session_readback() { # verify_session_readback <pane> [session-id]
+  local pane="$1" sid="${2:-}" out found reported
 
   # `if ! out=$(...)` and not a bare capture: under `set -e` a failing assignment
   # aborts before any diagnostic can print, which is the failure mode #71 is about.
   if ! out=$("$HERDR" agent get "$pane" 2>/dev/null); then
-    log "mcode-session: reported session ${sid} for pane ${pane}, but could not verify it: \`${HERDR} agent get ${pane}\` failed. Session identity and the resume command are UNVERIFIED — neither confirmed stored nor confirmed lost. Not a registration failure: the pane is registered. Exiting 0."
+    if [ -n "$sid" ]; then
+      log "mcode-session: reported session ${sid} for pane ${pane}, but could not verify it: \`${HERDR} agent get ${pane}\` failed. Session identity and the resume command are UNVERIFIED — neither confirmed stored nor confirmed lost. Not a registration failure: the pane is registered. Exiting 0."
+    else
+      log "mcode-session: no session id was reported, and \`${HERDR} agent get ${pane}\` failed, so the read-back could not verify what this pane holds. Identity is unconfirmed; whether the resume command was persisted is unverifiable regardless, because \`agent get\` exposes no resume field. Not a registration failure: the pane is registered. Exiting 0."
+    fi
     return 0
   fi
 
@@ -248,20 +260,36 @@ verify_session_readback() { # verify_session_readback <pane> <session-id>
   # not a reason to abort a run whose registration already succeeded.
   found=$(printf '%s' "$out" | readback_session_id)
 
-  if [ "$found" = "$sid" ]; then
-    # Confirmed. Silence is the correct output here; a "yay it worked" line would
-    # be noise on a path that is supposed to be the uneventful one.
+  if [ -n "$sid" ]; then
+    if [ "$found" = "$sid" ]; then
+      # Confirmed. Silence is the correct output here; a "yay it worked" line would
+      # be noise on a path that is supposed to be the uneventful one.
+      return 0
+    fi
+    if [ -n "$found" ]; then
+      reported="a different session ('${found}')"
+    else
+      reported="no session at all (agent_session is absent)"
+    fi
+    log "mcode-session: reported session ${sid} for pane ${pane}, but herdr 0.9.3 did not persist it — \`agent get\` reports ${reported}. Session identity and the resume command are NOT stored, so expect resume to be UNAVAILABLE. This is a herdr limitation for agent kinds it does not enumerate (mcode is not one), not a plugin error, and it is upstream. The pane IS registered; exiting 0 so no caller retries work that cannot succeed."
     return 0
   fi
 
-  local reported
+  # No id was sent, so there is nothing to compare against — but the read-back is
+  # still worth making, because what it finds is attributable: any session on this
+  # pane is one this run did NOT put there. That is a stale registration from an
+  # earlier run or another reporter, and a stale registration is worse than none.
+  # Reading it and saying nothing would be the silent no-op this whole change
+  # exists to remove, so the read-back is made unconditionally.
   if [ -n "$found" ]; then
-    reported="a different session ('${found}')"
+    log "mcode-session: no session id was reported, and the read-back shows pane ${pane} already carries session '${found}', which this run did NOT report — a registration left by an earlier run or by another reporter. Expect resume to be unavailable until that is resolved."
   else
-    reported="no session at all (agent_session is absent)"
+    log "mcode-session: no session id was reported, and the read-back confirms pane ${pane} holds no session — nothing was stored, and nothing was sent to be stored."
   fi
-
-  log "mcode-session: reported session ${sid} for pane ${pane}, but herdr 0.9.3 did not persist it — \`agent get\` reports ${reported}. Session identity and the resume command are NOT stored, so expect resume to be UNAVAILABLE. This is a herdr limitation for agent kinds it does not enumerate (mcode is not one), not a plugin error, and it is upstream. The pane IS registered; exiting 0 so no caller retries work that cannot succeed."
+  # True regardless of what the read-back found, and true for a structural reason
+  # rather than an unlucky one: `herdr agent get` has no resume field at all, so
+  # there is no API through which to check whether herdr kept the resume command.
+  log "mcode-session: whether the resume command '${MCODE_RESUME_CMD}' was persisted is UNVERIFIABLE — \`herdr agent get\` exposes no resume field, and on herdr 0.9.3 the session report is discarded outright. Expect resume to be unavailable. The pane IS registered; exiting 0."
   return 0
 }
 
@@ -365,23 +393,14 @@ cmd_report() {
 
   # Exit 0 from the call above is not evidence the write happened — herdr 0.9.3
   # discards this report and still exits 0 (measurement block at the top). So the
-  # report is read back, and the outcome is stated either way.
+  # pane is read back afterwards, unconditionally.
   #
-  # Only when an id was actually sent. With no id there is nothing to compare
-  # against, and reading the pane back anyway would produce a number we have no
-  # right to attribute to this run — a session on the pane could be a stale one
-  # from an earlier reporter. Claiming a check we cannot make is worse than
-  # saying plainly that there was nothing to check.
-  if [ -n "$sid" ]; then
-    verify_session_readback "$pane" "$sid"
-  else
-    # The honest version of the line above. That one says the resume *command* is
-    # usable by design; this one says what we could not establish about whether
-    # herdr kept anything. Both are true and they are not the same claim, so both
-    # are stated: `agent get` exposes no resume field, so resume_argv persistence
-    # is unverifiable through this API, and with no id sent, identity is too.
-    log "mcode-session: nothing was sent to verify. No session id was reported, so identity is unverifiable; and \`herdr agent get\` exposes no resume field at all, so whether the resume command was persisted is unverifiable too. Neither is confirmed and neither is confirmed lost. The pane IS registered; exiting 0."
-  fi
+  # Unconditional, including when no id was sent. There is nothing to *compare*
+  # against in that case, but the read-back still reports something attributable:
+  # any session already on the pane is one this run did not put there, which is a
+  # stale registration worth naming. Skipping the call would make the no-id path
+  # the one path that reports success without looking.
+  verify_session_readback "$pane" "$sid"
 }
 
 main() {
