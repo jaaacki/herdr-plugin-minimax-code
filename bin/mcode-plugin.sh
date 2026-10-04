@@ -193,8 +193,8 @@ resolve_source_pane() {
 # success as a failure and could make a caller retry, spawning a second pane. So
 # every failure below is a warning and exit 0 - and the warning says what is lost,
 # because "state is not tracked" with no remedy is how this gets misdiagnosed.
-watcher_autostart() { # watcher_autostart <pane-id>
-  local pane="$1"
+watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
+  local pane="$1" agent_name="$2"
   local dir watcher
 
   # Resolved from this script's own directory, NOT $HERDR_PLUGIN_ROOT: the env
@@ -252,7 +252,7 @@ watcher_autostart() { # watcher_autostart <pane-id>
   # does not signal it. Harmless if it fails: nohup already ignores SIGHUP, so
   # disown is belt-and-braces, and a non-interactive shell may legitimately have
   # nothing to disown.
-  nohup "$watcher" "$pane" >/dev/null 2>&1 &
+  MCODE_WATCH_AGENT="$agent_name" nohup "$watcher" "$pane" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 
   log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
@@ -285,8 +285,8 @@ watcher_autostart() { # watcher_autostart <pane-id>
 # execute where they were designed to; (3) the day herdr gains `--kind
 # minimax-code`, the launch path already reports identity and resume works with
 # no further change here.
-session_report() { # session_report <pane-id>
-  local pane="$1"
+session_report() { # session_report <pane-id> <agent-name>
+  local pane="$1" agent_name="$2"
   local dir sibling
 
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
@@ -297,30 +297,32 @@ session_report() { # session_report <pane-id>
     return 0
   fi
 
-  # stderr is DELIBERATELY INHERITED, not captured. The sibling's read-back
-  # diagnostic - "herdr 0.9.3 did not persist it", naming the session and the
-  # pane - is the entire point of calling it from the launch path, and capturing
-  # stderr into a variable to print only on failure would swallow it on the
-  # success path, which is the path it actually takes on 0.9.3.
+  # `attach`, NOT `report` (issue #79, architect ruling). `report` re-asserts the
+  # pane's agent state and so issues its OWN `pane report-agent` — calling it
+  # from here put two claims on one pane in one launch, which is the duplication
+  # the three-reporter split exists to avoid. `attach` issues
+  # report-agent-session only, and this function runs after step 7's report-agent,
+  # so the "reporter must already hold the pane" law is satisfied by the launcher.
   #
-  # HERDR_BIN_PATH is passed through with the value THIS script resolved, so the
-  # sibling talks to the same multiplexer instance as the rest of the launch
-  # rather than re-resolving `herdr` from PATH. It is the same string the
-  # default would use, so passing it is a no-op unless the operator overrode it.
+  # MCODE_AGENT_LABEL is the name step 8 actually chose. Without it the sibling
+  # would fall back to its own default and report under a label this pane does not
+  # have — the same second-pane mismatch the watcher had, one file over.
   #
-  # HERDR_PANE_ID is required by the sibling and is the whole mechanism: it only
-  # reports for the pane the reporter holds. HERDR_PANE_ID in this process is the
-  # SOURCE pane, so exporting it and inheriting would report the wrong one - it is
-  # set per-invocation here, never exported.
+  # stderr is INHERITED, not captured. The sibling's read-back line — "herdr 0.9.3
+  # did not persist it" — is the only thing telling the operator their session was
+  # discarded, and it is the path this actually takes on 0.9.3. Capturing stderr to
+  # print only on failure would swallow it. The verb is otherwise quiet by design.
   #
-  # MCODE_RESUME_CMD and MCODE_HOME are inherited untouched on purpose: an
-  # operator who set either meant it for this session too.
-  if HERDR_PANE_ID="$pane" HERDR_BIN_PATH="$HERDR" "$sibling" report; then
+  # HERDR_BIN_PATH is passed with the value THIS script resolved so the sibling
+  # talks to the same multiplexer. Set per-invocation, never exported: this
+  # process's own HERDR_PANE_ID is the SOURCE pane and must not leak into a
+  # reporter that would then report the wrong pane.
+  if HERDR_PANE_ID="$pane" HERDR_BIN_PATH="$HERDR" MCODE_AGENT_LABEL="$agent_name" \
+       "$sibling" attach; then
     return 0
   fi
-  # The sibling's own stderr has already said why. This line adds the one thing
-  # it cannot know - which pane the launch was for - so a failure is attributable
-  # without scrolling back through interleaved output.
+  # The sibling's own stderr has already said why. This line adds the one thing it
+  # cannot know - which pane the launch was for - so a failure is attributable.
   log "minimax-code: the session report for pane ${pane} failed (the sibling's own diagnostics are above). The pane is still registered and named, and this launch succeeded; what was NOT recorded is the session id and the resume command, so resume will be unavailable for this pane. Nothing was rolled back."
   return 0
 }
@@ -551,8 +553,12 @@ cmd_start() {
   #    one that is invisible, so a failure here is a warning and exit 0 — and the
   #    warning says exactly which commands are lost, because "it half worked"
   #    with no consequence spelled out is how this gets misdiagnosed later.
+  # The name this pane ACTUALLY gets, hoisted so the two reporters spawned below can
+  # be told it rather than each guessing. `next_agent_name` is a pure function of
+  # the agent list, so calling it twice could return the same free slot twice; one
+  # call, one variable, and every reporter downstream uses that same string.
+  local agent_name=""
   if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state unknown; then
-    local agent_name
     agent_name=$(next_agent_name)
     if [ -z "$agent_name" ]; then
       log "minimax-code: could not work out a free name for pane ${new_pane}, so it stays registered but unnamed. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${new_pane} instead, and \`herdr agent prompt\`/\`send-keys\` will not work for it either way on Herdr 0.9.3 (agent_not_ready) — those need an agent Herdr itself started. Naming it later would not change that."
@@ -577,7 +583,7 @@ cmd_start() {
   #    the sibling re-asserts the agent state as its first act, so running it
   #    after a failed step 7 is a second chance at the registration rather than a
   #    wasted call. Best-effort inside: it warns and returns 0.
-  session_report "$new_pane"
+  session_report "$new_pane" "$agent_name"
 
   # 10. Start the state watcher (issue #75), detached.
   #
@@ -591,7 +597,7 @@ cmd_start() {
   #     neither depends on the other. It is last simply because state is the
   #     outermost concern of the three - the pane exists, then it is registered,
   #     then it has identity, then its state is live.
-  watcher_autostart "$new_pane"
+  watcher_autostart "$new_pane" "$agent_name"
 }
 
 main() {

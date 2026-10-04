@@ -21,7 +21,19 @@
 set -euo pipefail
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
-AGENT_LABEL="mcode"
+# The agent label this watcher reports under. It MUST be the name the launcher
+# actually gave the pane, not a guess: the launcher picks the first free name in
+# its `mcode`, `mcode-2`, `mcode-3` sequence, so the first pane is `mcode` and
+# every pane after it is not.
+#
+# This was hard-coded to `mcode`, which was invisible while the watcher was
+# opt-in (an operator running it by hand was usually looking at pane one) and
+# wrong from the moment the launcher started spawning watchers itself (issue #75)
+# — pane two would have been reported under a name it does not have. MCODE_WATCH_AGENT
+# is how the launcher passes the real name; MCODE_AGENT_LABEL is the same knob the
+# other two reporters use, kept as the middle fallback so one variable can drive
+# all three; and `mcode` remains the default so a hand-run still works.
+AGENT_LABEL="${MCODE_WATCH_AGENT:-${MCODE_AGENT_LABEL:-mcode}}"
 # --source namespace. Must match the other two reporters - bin/mcode-plugin.sh
 # and bin/mcode-session.sh - and follows herdr's own `herdr:<agent>` convention,
 # which is what the Claude integration hook uses. herdr uses this to tell
