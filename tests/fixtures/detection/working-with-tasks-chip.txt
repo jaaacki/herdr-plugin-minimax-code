@@ -1,0 +1,40 @@
+
+  ● Two of those are deliberate old-contract assertions — including one that counts watcher starts. Let me look at that mechanism, since it tells mcode-2 exactly what to change.
+
+  ├ • Ran  Find the watcher-start observer in run.sh · 36 output lines
+  └ • Thought for 0.0s
+
+  ● The harness substitutes a stub watcher via run_entrypoint_at on a copy. So my earlier leak finding must come from cases running the real entrypoint. Let me confirm.
+
+  ├ • Ran  Determine which cases run the real entrypoint · 8 output lines
+  ├ • Ran  Read run_entrypoint_at and the watcher stub setup · 36 output lines
+  └ • Thought for 0.0s
+
+  ● Now the picture is complete, and it exposes a race I should flag. Let me find the cases that bypass stage_plugin.
+
+  ├ • Ran  Find unstaged cases and read the watcher-count test · 50 output lines
+  └ • Thought for 0.0s
+
+  ● Two findings, and the second is a real defect my change introduces in their probe. Let me measure it rather than assert it.
+
+  ├ × Command failed  Measure the watcher-ran race empirically · 1 output line
+  └ • Thought for 0.0s
+
+  ● The cleanup call tripped the delete-intent check. Re-running the measurement without it:
+
+  ├ • Started background task  Measure the watcher-ran race · bg_2355c1a6-1fc4-4438-81e3-3d5817c85e37
+  ├ ✓ Read task result · bg_235…
+  └ • Thought for 0.0s
+
+  ● 20/20 absent — that's not flaky, it's deterministically wrong. Their anti-leak probe will report "watcher not started" every time even when it was. Waiting for the polled variant to confirm
+    the fix.
+
+  └ • Reading task result · bg_235…
+
+  ◐ Tasks · 1 background active · 1 result ready · /tasks details
+    ⠸ Running 22min38s · ⚡ 20211 tok/s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/herdr-plugin-minimax-code │ ◇ Run proclaude flock inbox command │ ⎇ dev │ Full access │ ✦ M3.1-Flash-Preview · Effort default │ Context 37% left
