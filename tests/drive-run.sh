@@ -209,7 +209,7 @@ setup_case() {
   CASE_DIR="$WORK/$CURRENT_CASE"
   rm -rf "$CASE_DIR"
   mkdir -p "$CASE_DIR/project"
-  mkdir -p "$CASE_DIR/bin" "$CASE_DIR/home/v2/sqlite" "$CASE_DIR/state"
+  mkdir -p "$CASE_DIR/bin" "$CASE_DIR/home/v2/sqlite"
 
   # The implementation requires the database file to EXIST before it queries it,
   # and refuses to guess when it does not. An empty file is enough: every real
@@ -221,6 +221,21 @@ setup_case() {
   # knob means the suite exercises the same resolution path a user's shell does.
   cp "$FAKE_SQLITE3" "$CASE_DIR/bin/sqlite3"
   chmod +x "$CASE_DIR/bin/sqlite3"
+  # `mcode` ALSO goes on PATH, and this is not belt-and-braces for its own sake.
+  # It exists because a knob name is a guess until the implementation confirms
+  # it: this suite was briefly setting MCODE_BIN_NAME while the implementation
+  # read MCODE_BIN_PATH, and the seam fell through to the REAL mcode. A real
+  # `mcode exec` fired. It failed harmlessly (a fabricated session id, so
+  # "Session not found"), but a suite that can silently shell out to the real
+  # binary can put a prompt in a colleague's live session, which is precisely
+  # the harm these stubs exist to prevent.
+  #
+  # With the stub on PATH as `mcode` AND MCODE_BIN_PATH pointing at it, the
+  # implementation reaches the stub whether it honours the knob, falls back to a
+  # bare `mcode`, or renames the knob again. A seam with one point of failure is
+  # not a seam.
+  cp "$FAKE_MCODE" "$CASE_DIR/bin/mcode"
+  chmod +x "$CASE_DIR/bin/mcode"
   PATH="$CASE_DIR/bin:$BASE_PATH"
 
   FAKE_HERDR_LOG="$CASE_DIR/herdr.log"
@@ -241,21 +256,33 @@ setup_case() {
   export HERDR_BIN_PATH="$FAKE_HERDR"
   # Absolute path to the stub, so the implementation's `command -v` resolves it
   # without this suite depending on where `mcode` happens to be installed.
-  export MCODE_BIN_NAME="$FAKE_MCODE"
+  export MCODE_BIN_PATH="$FAKE_MCODE"
   export MCODE_HOME="$CASE_DIR/home"
-  export MCODE_DRIVE_STATE_DIR="$CASE_DIR/state"
+  # The database is a per-case file. Naming it explicitly means the suite never
+  # queries the real 76 MB runtime store even if the implementation's default
+  # path logic changes under us.
+  export MCODE_STATE_DB="$CASE_DIR/home/v2/sqlite/runtime-state.sqlite"
+  export SQLITE3_BIN="sqlite3"
+  # Explicit binding path, so the suite never depends on where the
+  # implementation would otherwise look and never writes into $HOME.
+  export MCODE_DRIVE_BINDING="$CASE_DIR/drive-bindings.tsv"
   # One pane id and one cwd, coherent across every herdr call, so no case can
   # assert a story in which `agent get` and `pane get` disagree.
   export FAKE_HERDR_SRC_PANE="$PANE"
   export FAKE_HERDR_CWD="$CASE_DIR/project"
   unset FAKE_HERDR_FAULT FAKE_HERDR_FAIL
   unset FAKE_MCODE_FAIL FAKE_MCODE_REPLY FAKE_SQLITE_FAIL
-  unset MCODE_DRIVE_SESSION HERDR_PLUGIN_STATE_DIR
+  unset MCODE_DRIVE_SESSION HERDR_PLUGIN_STATE_DIR MCODE_DRIVE_STATE_DIR
 }
 
 # Write the binding file the implementation will read.
+#
+# TSV, not JSON: <pane> <TAB> <session> <TAB> <workspace> <TAB> <recorded_ms>.
+# A workspace path cannot contain a tab, so splitting on tabs is unambiguous
+# where splitting on spaces would not be. Newest-stamped line for a pane wins.
 write_binding_file() { # write_binding_file <pane> <sid>
-  printf '{"%s":"%s"}\n' "$1" "$2" >"$CASE_DIR/state/bindings.json"
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$CASE_DIR/project" 1791059999999 \
+    >"$CASE_DIR/drive-bindings.tsv"
 }
 
 # Canned sqlite rows. NEWEST FIRST, matching the query's ORDER BY
@@ -314,8 +341,12 @@ case_name_arg_resolves_and_bound_session_is_driven() {
   run_drive "$AGENT_NAME" "hello there"
 
   assert_rc_zero "$RC"
-  # Name -> pane is a real herdr call, and it happens before anything else.
-  assert_herdr_log_exactly "$(printf 'agent\tget\t%s\npane\tget\t%s' "$AGENT_NAME" "$PANE")"
+  # Name -> pane is a real herdr call. Exactly ONE: `agent get` returns pane_id
+  # and cwd together (measured, herdr 0.9.3), so the name path needs no second
+  # call. Pinned because "resolve the name, then look the pane up again" is a
+  # wasted round trip, and because a second call is where a cwd from one response
+  # and a pane from another could stop agreeing.
+  assert_herdr_log_exactly "$(printf 'agent\tget\t%s' "$AGENT_NAME")"
   # A binding hit must NOT go to the database. Re-resolving a pane that is
   # already bound is how a deliberate binding gets silently overridden by a
   # newer-but-wrong session.
@@ -359,36 +390,56 @@ case_no_binding_falls_back_to_sqlite_single_candidate() {
   assert_exec_argv "$SQL_SID" "$(cd -- "$CASE_DIR/project" && pwd -P)" "hi"
 }
 
-# 4. THE CASE THAT REPLACED A SOUNDER-LOOKING ONE. The task brief asked for
-#    "multiple rows, pid-ordering resolves, correct sid". That cannot work, and
-#    the reason is worth keeping: ~/.minimax-code/.mcode-active/*.json contains
-#    exactly two keys — `pid` and `startedAtMs` (verified across every file on
-#    this machine). No pane id, no cwd, no session id. So a live-pid list and a
-#    live-session list can be shown to line up in RANK, but nothing marks which
-#    rank belongs to THIS pane, and `mcode exec` has no guard that stops a wrong
-#    session from accepting the prompt. Zipping a rank onto a named pane is a
-#    one-in-three guess that reports success.
+# 4. THE CASE THAT REPLACED TWO EARLIER ONES, and the strongest in the suite.
 #
-#    What is sound is the narrowing: several candidates, of which exactly one is
-#    'started', is a pane mid-turn and therefore the live one. That is the case
-#    here, and it is the case that would otherwise have been a guess.
-case_multiple_candidates_narrow_to_the_started_one() {
+#    The task brief asked for "multiple rows, pid-ordering resolves, correct sid".
+#    I then proposed replacing it with a `status = 'started'` narrowing. BOTH are
+#    wrong, for the same underlying reason, and it took two rounds to see it:
+#
+#    * pid-ordering cannot work. ~/.minimax-code/.mcode-active/*.json contains
+#      exactly two keys across every file on this machine — `pid` and
+#      `startedAtMs`. No pane id, no cwd, no session id. A live-pid list and a
+#      live-session list line up in RANK, but nothing marks which rank is THIS
+#      pane.
+#
+#    * status-narrowing cannot work either, and this is the correction. `status`
+#      tracks session ACTIVITY, not pane existence: a pane sitting at its prompt
+#      is 'idle'. So narrowing to 'started' would discard the very session you
+#      meant in the most common case there is — an agent waiting for you. I
+#      suggested it; mcode-1 removed it with that argument and the argument is
+#      right.
+#
+#    So this case is built to FAIL any narrowing at all. The fixture is the trap:
+#    exactly one row is 'started' and it is the newest, so an implementation that
+#    filters on status — mine included — selects it confidently and drives.
+#    Refusing is the correct behaviour, because "the only session currently
+#    mid-turn" is not "this pane's session". Two idle sessions are equally
+#    plausible owners of a pane you are looking at.
+case_multiple_candidates_never_narrowed_to_started() {
   setup_case
-  # Newest first, as the query orders them: the idle one is the most tempting
-  # wrong answer, and the newest-started rule has to beat it.
-  write_rows "$OTHER_SID" "idle"    1791160000000
-  write_rows "$SQL_SID"   "aborted" 1791150000000
-  write_rows "$STARTED_SID" "started" 1791059999999
+  write_rows "$STARTED_SID" "started" 1791160000000
+  write_rows "$OTHER_SID"   "idle"    1791150000000
+  write_rows "$SQL_SID"     "idle"    1791140000000
 
   run_drive "$PANE" "hi"
 
-  assert_rc_zero "$RC"
-  # The narrowing is a second, different query — asserted so an implementation
-  # that queried once and guessed cannot pass.
-  assert_sqlite_queried "status = 'started'"
-  # The started one, not the newest one. This is the assertion the whole
-  # narrowing rule exists to make.
-  assert_exec_argv "$STARTED_SID" "$(cd -- "$CASE_DIR/project" && pwd -P)" "hi"
+  assert_rc_nonzero "$RC"
+  assert_mcode_never_called
+  # Every candidate named, so the choice can be made deliberately.
+  assert_stderr_mentions "$STARTED_SID"
+  assert_stderr_mentions "$OTHER_SID"
+  assert_stderr_mentions "$SQL_SID"
+  # And the reason must say WHY it refused, not merely that it did. A user who
+  # cannot tell a refusal from a crash will not trust the next one.
+  assert_stderr_mentions "$PANE"
+  assert_stderr_mentions "MCODE_DRIVE_SESSION="
+  # The single query. A second, status-filtered query would mean the narrowing is
+  # back, and this is what catches it.
+  local queries
+  queries="$(grep -c 'SELECT' "$FAKE_SQLITE_LOG" 2>/dev/null || true)"
+  if [ "${queries:-0}" -ne 1 ]; then
+    note "expected exactly one sqlite query, saw ${queries}; a second one means a status filter crept back in"
+  fi
 }
 
 # 5. THE SAFETY CASE. Two started sessions in one workspace and no binding:
@@ -475,13 +526,13 @@ case_binding_is_written_only_after_a_successful_drive() {
   run_drive "$PANE" "hi"
 
   assert_rc_zero "$RC"
-  local file="$CASE_DIR/state/bindings.json"
+  local file="$CASE_DIR/drive-bindings.tsv"
   if [ ! -f "$file" ]; then
     note "no bindings.json after a successful drive; the next drive re-resolves"
     return
   fi
   local got
-  got="$(jq -r --arg p "$PANE" '.[$p] // empty' "$file" 2>/dev/null)"
+  got="$(awk -F'\t' -v p="$PANE" '$1 == p { print $2 }' "$file" 2>/dev/null)"
   if [ "$got" != "$SQL_SID" ]; then
     note "binding recorded '${got}', expected the session that was actually driven '${SQL_SID}'"
   fi
@@ -493,9 +544,9 @@ case_binding_is_written_only_after_a_successful_drive() {
   export FAKE_MCODE_FAIL=4
   run_drive "$PANE" "hi"
   assert_rc_nonzero "$RC"
-  if [ -f "$CASE_DIR/state/bindings.json" ]; then
+  if [ -f "$CASE_DIR/drive-bindings.tsv" ]; then
     note "a binding was written for a drive that FAILED; it will be trusted next time"
-    sed 's/^/          /' "$CASE_DIR/state/bindings.json"
+    sed 's/^/          /' "$CASE_DIR/drive-bindings.tsv"
   fi
 }
 
@@ -592,7 +643,7 @@ CASES=(
   name-arg-resolves-and-bound-session-is-driven:case_name_arg_resolves_and_bound_session_is_driven
   pane-id-arg-skips-name-resolution:case_pane_id_arg_skips_name_resolution
   no-binding-falls-back-to-sqlite-single-candidate:case_no_binding_falls_back_to_sqlite_single_candidate
-  multiple-candidates-narrow-to-the-started-one:case_multiple_candidates_narrow_to_the_started_one
+  multiple-candidates-never-narrowed-to-started:case_multiple_candidates_never_narrowed_to_started
   ambiguous-pane-dies-and-sends-nothing:case_ambiguous_pane_dies_and_sends_nothing
   symlinked-cwd-is-realpathed-before-exec:case_symlinked_cwd_is_realpathed_before_exec
   exec-failure-passes-exit-through-with-attribution:case_exec_failure_passes_exit_through_with_attribution
