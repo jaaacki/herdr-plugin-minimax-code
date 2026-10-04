@@ -161,13 +161,82 @@ herdr pane report-agent-session --help                 # the resume verb
 An agent showing `agent_session` has a registered session. One without it has
 none. Panes this plugin opened may legitimately show no `agent_session`.
 
+## Driving a launched pane
+
+`agent prompt` does not work, as above. But a pane's mcode session can be driven
+directly, through mcode's own session surface instead of Herdr's:
+
+```bash
+bin/mcode-drive.sh <pane-id> "Reply with exactly: PONG"
+```
+
+```console
+$ bin/mcode-drive.sh wZ:p8 "Reply with exactly: PONG"
+mcode-drive: driving pane wZ:p8, session mvs_ae2f6e1c…, cwd /Users/you/your-repo
+PONG
+mcode-drive: OK pane wZ:p8 session mvs_ae2f6e1c… cwd /Users/you/your-repo
+mcode-drive: last line: PONG
+```
+
+The reply goes to stdout on its own; the pane, session and cwd go to stderr, so a
+driven turn is always attributable to what was actually driven. The exit code is
+mcode's own.
+
+**A session whose pane has been closed is still drivable.** This is the property
+`agent prompt` cannot give you, and it works because the connection is to the
+*mcode runtime*, not to the pane's process.
+
+### Naming the target
+
+Pass a **pane id** (it looks like `wZ:p8`), or the name of an agent that has been
+`herdr agent rename`d. A merely-registered label is *not* addressable — several
+panes can share one, and Herdr resolves names only for agents it was told to
+rename. `herdr agent list` shows what is addressable.
+
+### When it cannot tell which session you mean
+
+Herdr does not record a session id for our panes, so the pane→session mapping has
+to be discovered. This script looks in two places:
+
+1. **A binding file**, `~/.local/state/mcode-drive/bindings.json` (or under
+   `$HERDR_PLUGIN_STATE_DIR` when Herdr sets it). Written after every drive that
+   succeeded, so the *second* drive of a pane resolves on its own.
+2. **MiniMax Code's own sqlite state**, which does record a session's workspace —
+   in a `workspace_dir` column, not in the session manifest. (Issue #36 recorded
+   that manifests carry no cwd; that is still true. It is only in sqlite that the
+   workspace appears.)
+
+When one workspace holds several live sessions — the normal case if you have more
+than one pane on a checkout — **this script stops and lists the candidates rather
+than picking one.** Nothing available to it can say which session belongs to which
+pane, and a wrong pick would deliver your prompt to someone else's session, which
+the exact-cwd check would not catch. Name the one you want:
+
+```bash
+MCODE_DRIVE_SESSION=mvs_ae2f6e1c… bin/mcode-drive.sh wZ:p8 "your prompt"
+```
+
+That drive is cached, and later drives of that pane resolve without the override.
+
+### Honest limits
+
+- **A busy session is unmeasured.** Nothing here has run a turn against a session
+  mid-turn; what that does is unknown, and it is not the same as "it works".
+- **`agent prompt` is still broken.** This is a parallel path, not a fix. It goes
+  away the day Herdr gains `--kind minimax-code`, at which point #73 closes
+  properly and this becomes redundant.
+- **Nothing is written to the session** except the turn you asked for, and the
+  binding file after a successful drive.
+
 ## Three known ceilings
 
 Encountered in normal use, gathered here so you meet them before you go looking:
 
 1. **No `agent prompt` / `agent send-keys`.** Upstream: `agent start --kind` has
    no `minimax-code`, so no agent of ours can be *active*. `get` / `read` /
-   `wait` are unaffected. See above.
+   `wait` are unaffected. See above. There is a plugin-side workaround for
+   *driving* a pane — [Driving a launched pane](#driving-a-launched-pane) — which
+   routes through mcode instead of Herdr and does not lift this ceiling.
 2. **Resume is wired but unverified.** The registration is accepted; that it
    restores a session has not been demonstrated. See above.
 3. **No screen-manifest detection.** `mcode` ships no Herdr manifest, so Herdr
