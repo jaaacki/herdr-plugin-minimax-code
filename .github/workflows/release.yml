@@ -74,6 +74,8 @@ jobs:
             "${VERSION}" \
             herdr-plugin.toml \
             bin/mcode-plugin.sh \
+            bin/mcode-watch.sh \
+            bin/mcode-session.sh \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -94,7 +96,8 @@ jobs:
           tar -xzf "herdr-plugin-minimax-code-${VERSION}.tar.gz" -C "$work"
 
           # 1. Required contents.
-          for f in herdr-plugin.toml bin/mcode-plugin.sh README.md LICENSE CLAUDE.md \
+          for f in herdr-plugin.toml README.md LICENSE CLAUDE.md \
+                   bin/mcode-plugin.sh bin/mcode-watch.sh bin/mcode-session.sh \
                    tests/run.sh tests/fake-herdr; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
@@ -114,7 +117,8 @@ jobs:
           #    installs a plugin that fails at invocation with a permission
           #    error, which is exactly the bug class this repo already shipped
           #    once (see HANDOFF).
-          for f in bin/mcode-plugin.sh tests/run.sh; do
+          for f in bin/mcode-plugin.sh bin/mcode-watch.sh bin/mcode-session.sh \
+                   tests/run.sh; do
             if [ ! -x "$work/$f" ]; then
               echo "EXEC BIT LOST on $f" >&2
               ls -l "$work/$f" >&2
