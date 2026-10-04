@@ -27,7 +27,7 @@
 ⏺ PR #44 has the registration step only — no agent rename, no tests. Gating it as not-ready, and resolving an ownership collision I created.
 
 ⏺ Board check · 16s
-  ⎿  $ sleep 100; cd /Users/noonoon/Dev/herdr-plugin-minimax-code; proclaude flock status fl-20261004-2hys 2>&1 | sed -n '4,12p' (17s)
+  ⎿  $ sleep 100; cd /home/dev/herdr-plugin-minimax-code; proclaude flock status fl-20261004-2hys 2>&1 | sed -n '4,12p' (17s)
      (ctrl+b to run in background)
 
 ✻ Caramelizing… (58m 35s · ↓ 19.6k tokens)
