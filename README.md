@@ -172,9 +172,9 @@ bin/mcode-drive.sh <pane-id> "Reply with exactly: PONG"
 
 ```console
 $ bin/mcode-drive.sh wZ:p8 "Reply with exactly: PONG"
-mcode-drive: driving pane wZ:p8, session mvs_ae2f6e1c…, cwd /Users/you/your-repo
+mcode-drive: driving pane wZ:p8, session mvs_ae2f6e1c…, cwd ~/your-repo
 PONG
-mcode-drive: OK pane wZ:p8 session mvs_ae2f6e1c… cwd /Users/you/your-repo
+mcode-drive: OK pane wZ:p8 session mvs_ae2f6e1c… cwd ~/your-repo
 mcode-drive: last line: PONG
 ```
 
@@ -207,7 +207,7 @@ to be discovered. This script looks in two places:
 
    ```
    pane_id<TAB>session_id<TAB>workspace<TAB>recorded_at_ms
-   wZ:p8	mvs_ae2f6e1c…	/Users/you/your-repo	1791123133419
+   wZ:p8	mvs_ae2f6e1c…	~/your-repo	1791123133419
    ```
 
    A drive that succeeded appends a line, so the newest line for a pane is the
