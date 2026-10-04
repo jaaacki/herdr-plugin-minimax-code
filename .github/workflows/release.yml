@@ -89,6 +89,20 @@ jobs:
           #
           # The exec bit is carried through from git's tree mode (100755 on all
           # three); the verification step proves it survived.
+          #
+          # agent-detection/ IS a decision, not an oversight, and it goes the
+          # other way from the bin/ scripts: no user-facing command points at
+          # it. It ships because it is a deliverable of this epic (#37, the
+          # upstream contribution), and a release that omitted it would ship a
+          # manifest nobody downstream can obtain from the pinned artifact.
+          # It also ships because a SHIPPED suite needs it —
+          # tests/agent-detection-run.sh resolves ../agent-detection/minimax-code.toml
+          # from the extracted copy, and without it the bundle arrives with a
+          # test that fails on arrival.
+          #
+          # It ships INERT: nothing in the plugin installs it into herdr's
+          # agent-detection directory, so its presence cannot change a user's
+          # agent detection. Shipping it and activating it are separate acts.
           git archive \
             --format=tar.gz \
             --output="herdr-plugin-minimax-code-${VERSION}.tar.gz" \
@@ -125,10 +139,21 @@ jobs:
           #    is exactly what drifted. Check 1b below derives the requirement
           #    from the documentation itself, so the next script added to bin/
           #    is covered without anyone remembering to edit this list.
+          #
+          #    The agent-detection entries are here because step 5 now runs that
+          #    suite from the extracted copy, and the suite refuses to run at all
+          #    without the reference manifest it derives its allowed keys from.
+          #    Listing all four keeps a missing one a clear MISSING rather than a
+          #    preflight error from a file nobody named — which is exactly how
+          #    agent-detection/minimax-code.toml went missing in the first place,
+          #    unnoticed because only one of the five shipped suites was ever run
+          #    against the artifact.
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
                    bin/mcode-session.sh README.md LICENSE CLAUDE.md \
                    agent-detection/minimax-code.toml \
-                   tests/run.sh tests/fake-herdr; do
+                   tests/run.sh tests/fake-herdr \
+                   tests/agent-detection-run.sh tests/agent-detection-check.py \
+                   tests/fixtures/agent-detection/reference-claude.toml; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
               echo "If this is a user-facing script, add it to the allowlist above." >&2
@@ -207,12 +232,17 @@ jobs:
             shopt -s nullglob
             suites=(tests/*run.sh)
             if [ ${#suites[@]} -eq 0 ]; then
-              echo "REFUSING TO PUBLISH: the artifact ships no test suite" >&2
+              echo "no test suites found under tests/ in the artifact - refusing to pass vacuously" >&2
               exit 1
             fi
             for suite in "${suites[@]}"; do
               echo "=== $suite ==="
-              "$suite"
+              # Explicit, so the failure names the suite instead of surfacing
+              # as a bare non-zero exit from the subshell under `set -e`.
+              if ! "$suite"; then
+                echo "SUITE FAILED in the extracted artifact: $suite" >&2
+                exit 1
+              fi
             done
           )
 
@@ -254,16 +284,32 @@ jobs:
           #    looked. The same argument that produced checks 1 and 1b applies
           #    here: a leak nobody checks for is a leak that recurs.
           #
-          #    If a legitimate example ever needs a literal /Users/ path, render
-          #    it as `~` like the rest of the fixtures rather than widening this
+          #    If a legitimate example ever needs a literal home path, render it
+          #    as `~` like the rest of the fixtures rather than widening this
           #    check -- a denylist taught to tolerate its own match is how the
           #    allowlist went stale in the first place.
-          if grep -rIl '/Users/' "$work" >/dev/null 2>&1; then
-            echo "LEAK: an absolute /Users/ home path would ship in this artifact:" >&2
-            grep -rIn '/Users/' "$work" | head -20 >&2
-            echo "Render it as ~ instead." >&2
+          #
+          #    There are NO EXEMPTIONS, and that is a deliberate difference from
+          #    the proposal in #66, which exempted the five captured fixtures by
+          #    name on the grounds that rewriting a capture falsifies it. #64
+          #    instead rendered those paths `~` and recorded the edit in the
+          #    fixture READMEs, so the exemption list would be five entries that
+          #    can never match: a hole with no leak behind it. An exemption is
+          #    only as good as its list, and the list is exactly the kind of
+          #    hand-maintained enumeration that check 1 and check 6 exist to stop
+          #    trusting. If a future capture genuinely must keep an absolute
+          #    path, the answer is to decide that here, in the open, when the
+          #    release is refused -- not to pre-approve it in a list.
+          #
+          #    The pattern covers /home/ as well as /Users/, because CI captures
+          #    on Linux too and a home directory there is /home/<user>.
+          if grep -rIlE '/(Users|home)/[A-Za-z0-9._-]+' "$work" >/dev/null 2>&1; then
+            echo "PRIVATE PATH in distributed artifact:" >&2
+            grep -rInE '/(Users|home)/[A-Za-z0-9._-]+' "$work" | head -20 >&2
+            echo "Genericise it the way the fixture provenance headers do." >&2
             exit 1
           fi
+          echo "VERIFY: no home directory in the artifact"
 
           echo "--- artifact contents ---"
           tar -tvzf "herdr-plugin-minimax-code-${VERSION}.tar.gz"
