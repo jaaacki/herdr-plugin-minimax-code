@@ -111,6 +111,7 @@ jobs:
             bin/mcode-plugin.sh \
             bin/mcode-watch.sh \
             bin/mcode-session.sh \
+            bin/mcode-drive.sh \
             agent-detection/ \
             README.md \
             LICENSE \
@@ -149,11 +150,13 @@ jobs:
           #    unnoticed because only one of the five shipped suites was ever run
           #    against the artifact.
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
-                   bin/mcode-session.sh README.md LICENSE CLAUDE.md \
+                   bin/mcode-session.sh bin/mcode-drive.sh README.md LICENSE \
+                   CLAUDE.md \
                    agent-detection/minimax-code.toml \
                    tests/run.sh tests/fake-herdr \
                    tests/agent-detection-run.sh tests/agent-detection-check.py \
-                   tests/fixtures/agent-detection/reference-claude.toml; do
+                   tests/fixtures/agent-detection/reference-claude.toml \
+                   tests/drive-run.sh tests/fake-mcode tests/fake-sqlite3; do
             if [ ! -f "$work/$f" ]; then
               echo "MISSING from artifact: $f" >&2
               echo "If this is a user-facing script, add it to the allowlist above." >&2
@@ -195,7 +198,7 @@ jobs:
           #    tells a user to run the watcher directly, so a non-executable
           #    watcher is a user-facing break, not an internal one.
           for f in bin/mcode-plugin.sh bin/mcode-watch.sh bin/mcode-session.sh \
-                   tests/run.sh; do
+                   bin/mcode-drive.sh tests/run.sh; do
             if [ ! -x "$work/$f" ]; then
               echo "EXEC BIT LOST on $f" >&2
               ls -l "$work/$f" >&2
