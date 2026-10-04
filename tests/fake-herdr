@@ -233,12 +233,17 @@ remembered_session_id() { # prints the remembered id, or nothing at all
 # had discarded the write, not because the field is a bare scalar.
 #
 # The two shapes this can serve are both real:
-#   * value: null  — herdr 0.9.3 after an accepted-and-discarded session report,
-#                    the measured behaviour, and what agent-session-dropped
-#                    forces
-#   * value: <id>  — a herdr that persisted what it was told, which is what
-#                    lets a suite prove the read-back DETECTS a write that
-#                    landed instead of only ever firing on a write that failed
+#   * key ABSENT      — herdr 0.9.3 on an mcode pane after an accepted-and-
+#                       discarded session report, the measured behaviour, and
+#                       what agent-session-dropped forces
+#   * value: <id>     — a herdr that persisted what it was told, which is what
+#                       lets a suite prove the read-back DETECTS a write that
+#                       landed instead of only ever firing on a write that failed
+#
+# Absent, not `"agent_session": null`. Both make `.result.agent.agent_session.value`
+# read as null, so a jq path cannot tell them apart — but they are not the same
+# response, and a stub that serves the wrong one is a stub encoding a fiction.
+# The key is omitted from the document entirely when herdr holds no session.
 #
 # The `agent`/`agent_status` fields around it are the minimum this stub has
 # always served; they predate the captures and are not themselves a capture.
@@ -258,12 +263,14 @@ emit_agent_get() { # emit_agent_get
       }
     }'
   else
+    # No agent_session key at all — del() is what makes this an absence rather
+    # than a field set to null.
     jq -cn '{
       result: {
         agent: {agent: "mcode", agent_status: "working", agent_session: null},
         type: "agent_info"
       }
-    }'
+    } | del(.result.agent.agent_session)'
   fi
 }
 
