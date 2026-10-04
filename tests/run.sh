@@ -902,6 +902,246 @@ case_23() {
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
 }
 
+# --- issue #79: the launch path must actually report the session -------------
+# Written RED against the shipped bin/mcode-plugin.sh, which does neither of
+# these things. That is the point: cmd_start's chain ends at report-agent +
+# rename, so the session reporter never fires and a launched pane carries no
+# session identity and no resume command.
+#
+# The ORDER is the law, not a detail. `pane report-agent` must precede
+# `pane report-agent-session`, or herdr refuses with `resume_not_accepted`
+# (measured, herdr 0.9.3, recorded in bin/mcode-session.sh's header). So these
+# cases assert sequence, never just presence: a launcher that called both in the
+# wrong order would pass a "was it called?" check and fail in production.
+case_24() { # #79: the launch path ATTACHES identity, and attaches it once
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+
+  # ONE report-agent-session. cmd_start already registers the pane, so the
+  # session step is an ATTACH, not a second registration.
+  local n
+  n="$(grep -c "pane	report-agent-session" "$FAKE_HERDR_LOG" || true)"
+  if [ "${n:-0}" -ne 1 ]; then
+    note "expected exactly one report-agent-session, saw ${n:-0}"
+  fi
+  # ONE report-agent. This is the finding that changed the shape: the session
+  # reporter re-asserts state for itself, so calling it wholesale after a rename
+  # issues a SECOND report-agent under a different label (mcode-session.sh's
+  # MCODE_AGENT_LABEL default is `minimax-code`, not the assigned `mcode`/`mcode-N`).
+  # Per #74's measurement a wrong label/source pair does not error - it silently
+  # fails to attach - so the symptom would be a pane whose state quietly stops
+  # landing. Counting is the assertion; presence would not catch it.
+  n="$(grep -c "pane	report-agent	" "$FAKE_HERDR_LOG" || true)"
+  if [ "${n:-0}" -ne 1 ]; then
+    note "expected exactly one report-agent, saw ${n:-0}; a second one means" \
+         "the session path re-registered the pane under a different label"
+  fi
+  # The order herdr demands: report-agent before report-agent-session, or
+  # resume_not_accepted.
+  assert_log_order "pane	report-agent	" "pane	report-agent-session"
+  # And a read-back AFTER the attach - that is #71's, and it is what makes the
+  # one stderr line below trustworthy rather than assumed.
+  local report_line readback_line
+  report_line="$(grep -n "pane	report-agent-session" "$FAKE_HERDR_LOG" | head -1 | cut -d: -f1)"
+  readback_line="$(grep -n "agent	get" "$FAKE_HERDR_LOG" | tail -1 | cut -d: -f1)"
+  if [ -z "$readback_line" ] || [ "$readback_line" -le "$report_line" ]; then
+    note "no \`agent get\` after the session report; nothing verified what herdr stored"
+  fi
+  # The ONE diagnostic, on 0.9.3. Measured cost of this wiring, which is why it
+  # is capped at one line rather than a transcript: every successful launch
+  # otherwise prints five lines saying resume is unavailable, and a warning that
+  # fires on every success is one an operator learns to scroll past.
+  local diag
+  diag="$(grep -c "did not persist\|not stored\|unavailab" "$STDERR_FILE" || true)"
+  if [ "${diag:-0}" -gt 1 ]; then
+    note "the launch emitted ${diag} lines about the discarded write; the ruling" \
+         "is exactly ONE, because this fires on every successful launch"
+  fi
+  # And the launch itself is untouched by any of it.
+  if ! grep -q "pane	run	" "$FAKE_HERDR_LOG"; then
+    note "mcode was never launched into the new pane"
+  fi
+}
+
+case_25() { # #79: a failed session report warns and does not fail the launch
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  printf '#!/bin/sh\nexit 0\n' >"$CASE_DIR/bin/mcode-session.sh"
+  chmod +x "$CASE_DIR/bin/mcode-session.sh"
+  export FAKE_HERDR_FAIL="pane report-agent-session:1"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  # THE PRECONDITION, and the reason this case is not fake. Injected failure of
+  # a call that is never made is indistinguishable from handling it correctly:
+  # the launch exits 0, the pane id is in stderr, mcode ran - all three hold
+  # whether or not the session report was attempted. Without this assertion the
+  # case passes today, against code that does not call the reporter at all, which
+  # is the exact "a test that cannot fail" trap.
+  if ! grep -q 'report-agent-session' "$FAKE_HERDR_LOG"; then
+    note "the injected session-report failure never fired because the" \
+         "session report is never attempted; this case would pass vacuously"
+    return
+  fi
+  assert_stderr_mentions "$(expected_new_pane)"
+  # mcode still ran: a launch that reported failure here would not have typed
+  # into the pane at all, which is the outcome this policy exists to avoid.
+  if ! grep -q "pane	run	" "$FAKE_HERDR_LOG"; then
+    note "the launch was abandoned because the SESSION report failed;" \
+         "only identity is missing, the pane is already running mcode"
+  fi
+}
+
+# --- issue #75: the watcher starts with the launch ---------------------------
+# Three cases, one policy: the watcher is best-effort. Absent, failing, or
+# opted out, none of it may change the launch's exit code — the pane is already
+# running mcode by the time any of this happens.
+case_26() { # #75: the watcher is started for the new pane
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  # MCODE_WATCH_BIN is the seam. Same reasoning as MCODE_BIN_PATH in
+  # bin/mcode-drive.sh: the real watcher polls a real pane on a timer, so a test
+  # that started it would leave a process behind and assert on timing.
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/watcher-ran"\n' "$CASE_DIR" \
+    >"$CASE_DIR/bin/mcode-watch.sh"
+  chmod +x "$CASE_DIR/bin/mcode-watch.sh"
+  export MCODE_WATCH_BIN="$CASE_DIR/bin/mcode-watch.sh"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  if [ ! -f "$CASE_DIR/watcher-ran" ]; then
+    note "the watcher was never started; a launched pane reports no state" \
+         "until somebody runs it by hand"
+    return
+  fi
+
+  # The pane it watches must be the NEW pane, not the source pane the user is
+  # typing in. A watcher pointed at the wrong pane is worse than none: it polls
+  # somebody's window and reports state that is not the launch's.
+  assert_count "$CASE_DIR/watcher-ran" "$(expected_new_pane)" 1 "watcher argv"
+}
+
+case_27() { # #75: MCODE_WATCH_AUTOSTART=0 opts out entirely
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/watcher-ran"\n' "$CASE_DIR" \
+    >"$CASE_DIR/bin/mcode-watch.sh"
+  chmod +x "$CASE_DIR/bin/mcode-watch.sh"
+  export MCODE_WATCH_BIN="$CASE_DIR/bin/mcode-watch.sh"
+
+  # CONTROL FIRST. An off-switch test that only asserts "did not run" passes
+  # today, against code that never runs the watcher for ANY reason - so it would
+  # be green while testing nothing. Running the same launch with the switch
+  # absent proves the watcher really does start, which is what makes the
+  # assertion with the switch present mean something.
+  unset MCODE_WATCH_AUTOSTART
+  run_entrypoint
+  if [ ! -f "$CASE_DIR/watcher-ran" ]; then
+    note "control: the watcher did not run even with autostart enabled, so" \
+         "'MCODE_WATCH_AUTOSTART=0 did not run it' would be vacuous"
+    return
+  fi
+
+  export MCODE_WATCH_AUTOSTART=0
+  run_entrypoint
+  assert_rc_zero "$RC"
+  # The opt-out has to be a real off switch, not a suggestion. An operator who
+  # sets it to 0 is asking not to have a background process appear.
+  if [ "$(wc -l <"$CASE_DIR/watcher-ran" 2>/dev/null || printf 0)" -gt 1 ]; then
+    note "MCODE_WATCH_AUTOSTART=0 and the watcher ran again anyway"
+    sed 's/^/          /' "$CASE_DIR/watcher-ran"
+  fi
+}
+
+case_28() { # #75: a watcher that fails to start is a warning, not a failure
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  # Logs AND fails. A stub that only exits 1 leaves the attempt invisible, and
+  # the case would then pass against code that never starts the watcher at all.
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/watcher-ran"\nexit 1\n' "$CASE_DIR" \
+    >"$CASE_DIR/bin/mcode-watch.sh"
+  chmod +x "$CASE_DIR/bin/mcode-watch.sh"
+  export MCODE_WATCH_BIN="$CASE_DIR/bin/mcode-watch.sh"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  if [ ! -f "$CASE_DIR/watcher-ran" ]; then
+    note "the failing watcher was never invoked; this case would pass" \
+         "vacuously against a launcher that never starts one"
+    return
+  fi
+  assert_stderr_mentions "$(expected_new_pane)"
+  # The pane is still running mcode. State tracking is an add-on to a launch
+  # that already worked.
+  if ! grep -q "pane	run	" "$FAKE_HERDR_LOG"; then
+    note "the launch was abandoned because the WATCHER would not start"
+  fi
+}
+
+# 29. THE WATCHER MUST INHERIT THE LABEL cmd_start CHOSE, NOT A LITERAL.
+#
+#     mcode-watch.sh:24 is a bare `AGENT_LABEL="mcode"`, while the other two
+#     reporters are not: mcode-plugin.sh derives `mcode`, `mcode-2`, `mcode-3`
+#     from the name sequence, and mcode-session.sh reads
+#     ${MCODE_AGENT_LABEL:-minimax-code}. So the watcher reports under `mcode`
+#     regardless of what the launch renamed the pane to. The first pane agrees by
+#     luck; every pane after it does not.
+#
+#     Today that is latent, because per #75's own evidence the watcher is rarely
+#     running and is opt-in. #75 build 1 makes it start on EVERY launch, which
+#     turns a rare edge case into a guaranteed one - and #74 measured that a
+#     wrong label/`--source` pair does not error, it silently fails to attach.
+#     The symptom would be a pane whose state updates quietly stop landing, which
+#     is precisely the stale-state bug #75 exists to fix. Worst shape: it appears
+#     to work on pane one and silently fails from pane two onward.
+#
+#     WHY ONE LAUNCH AND NOT TWO: the natural case is "launch twice, assert the
+#     second is mcode-2", but tests/fake-herdr's `agent list` is a fixed response
+#     per invocation and does not evolve between launches, so the second launch
+#     would be handed the same name again. Making it stateful is a change to
+#     tests/fake-herdr, which is not my file this round. This case gets the same
+#     guarantee from one launch: the fault below makes the assigned name
+#     `mcode-3`, so ANY hardcoded literal - `mcode` or anything else - fails it,
+#     and a correct implementation passes. Same defect, no stub change needed.
+case_29() { # #75: the watcher inherits the label the launch chose, not a literal
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  # Logs argv AND the label the watcher would report under, so the assertion can
+  # see either mechanism. The stub exits 0 so the launch's own exit is untouched.
+  printf '#!/bin/sh\nprintf "%%s\\t%%s\\n" "$*" "${MCODE_AGENT_LABEL:-}" >>"%s/watcher-ran"\n' "$CASE_DIR" \
+    >"$CASE_DIR/bin/mcode-watch.sh"
+  chmod +x "$CASE_DIR/bin/mcode-watch.sh"
+  export MCODE_WATCH_BIN="$CASE_DIR/bin/mcode-watch.sh"
+  # The name the launcher will pick is mcode-3, not mcode.
+  export FAKE_HERDR_FAULT="agent-names-taken"
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+  if [ ! -f "$CASE_DIR/watcher-ran" ]; then
+    note "the watcher was never started; nothing to assert a label on"
+    return
+  fi
+  # The label the launch established, and the name it assigned.
+  local want_name want_label
+  want_name="$(expected_agent_name)"
+  want_label="${MCODE_AGENT_LABEL:-$want_name}"
+  if ! grep -qF "$want_label" "$CASE_DIR/watcher-ran"; then
+    note "the watcher was started without the label the launch chose ('${want_label}');" \\
+         "a hardcoded literal reports state under the wrong agent name and herdr" \\
+         "silently fails to attach it"
+    sed 's/^/          /' "$CASE_DIR/watcher-ran"
+  fi
+  # Stated explicitly, because this is the finding: a watcher that hardcodes
+  # `mcode` looks correct on the very first pane.
+  if grep -qF "mcode"$'\t' "$CASE_DIR/watcher-ran"; then
+    note "the watcher was given the bare label 'mcode' while the pane was" \\
+         "registered as '${want_name}'"
+  fi
+}
+
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
   CASES_RUN=$((CASES_RUN + 1))
@@ -915,7 +1155,7 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -967,6 +1207,12 @@ for name in "${SELECTED[@]}"; do
     case-21) run_case case-21 case_21 ;;
     case-22) run_case case-22 case_22 ;;
     case-23) run_case case-23 case_23 ;;
+    case-24) run_case case-24 case_24 ;;
+    case-25) run_case case-25 case_25 ;;
+    case-26) run_case case-26 case_26 ;;
+    case-27) run_case case-27 case_27 ;;
+    case-28) run_case case-28 case_28 ;;
+    case-29) run_case case-29 case_29 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done
