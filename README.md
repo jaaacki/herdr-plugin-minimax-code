@@ -198,9 +198,12 @@ rename. `herdr agent list` shows what is addressable.
 Herdr does not record a session id for our panes, so the pane→session mapping has
 to be discovered. This script looks in two places:
 
-1. **A binding file**, `~/.local/state/mcode-drive/bindings.json` (or under
-   `$HERDR_PLUGIN_STATE_DIR` when Herdr sets it). Written after every drive that
-   succeeded, so the *second* drive of a pane resolves on its own.
+1. **A binding file**, `$MCODE_HOME/drive-bindings.json` — that is
+   `~/.minimax/drive-bindings.json` — or `<plugin state>/mcode-drive/bindings.json`
+   when Herdr sets `HERDR_PLUGIN_STATE_DIR`. Written after every drive that
+   succeeded, so the *second* drive of a pane resolves on its own. Override the
+   path with `MCODE_DRIVE_BINDING` if you want it somewhere else.
+
 2. **MiniMax Code's own sqlite state**, which does record a session's workspace —
    in a `workspace_dir` column, not in the session manifest. (Issue #36 recorded
    that manifests carry no cwd; that is still true. It is only in sqlite that the
@@ -210,7 +213,12 @@ When one workspace holds several live sessions — the normal case if you have m
 than one pane on a checkout — **this script stops and lists the candidates rather
 than picking one.** Nothing available to it can say which session belongs to which
 pane, and a wrong pick would deliver your prompt to someone else's session, which
-the exact-cwd check would not catch. Name the one you want:
+the exact-cwd check would not catch. Note it does not narrow by session `status`
+either: that tracks whether a session is *busy*, not whether a pane exists, so a
+pane sitting at its prompt is `idle` and narrowing on `started` can discard the
+very session you meant.
+
+Name the one you want:
 
 ```bash
 MCODE_DRIVE_SESSION=mvs_ae2f6e1c… bin/mcode-drive.sh wZ:p8 "your prompt"

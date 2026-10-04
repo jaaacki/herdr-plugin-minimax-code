@@ -77,25 +77,47 @@
 #   does not do it: ambiguity dies, it does not resolve. See
 #   resolve_session_for_pane.
 #
-# Environment (all optional):
+# Environment (all optional). Every external command this script runs is
+# overridable by path, which is what makes it testable hermetically: a suite can
+# point all five at stubs and never touch a real herdr, a real mcode, or — the
+# one that matters most — the owner's live 76 MB runtime database.
 #   HERDR_BIN_PATH            path to the herdr binary
-#   MCODE_BIN_NAME            launcher name to resolve        (default: mcode)
-#   MCODE_HOME                mcode's data dir                (default: $HOME/.minimax)
-#   MCODE_DRIVE_STATE_DIR     binding file directory
-#                             (default: $HERDR_PLUGIN_STATE_DIR, else
-#                              ~/.local/state/mcode-drive)
+#   MCODE_BIN_PATH            path to the mcode binary            (default: mcode)
+#   SQLITE3_BIN               path to the sqlite3 binary          (default: sqlite3)
+#   MCODE_HOME                mcode's data dir                    (default: $HOME/.minimax)
+#   MCODE_STATE_DB            the runtime database, overriding
+#                             MCODE_HOME for the layout below
+#                             (default: $MCODE_HOME/v2/sqlite/runtime-state.sqlite)
+#   MCODE_DRIVE_BINDING       pane->session binding file
+#                             (default: $MCODE_HOME/drive-bindings.json, or
+#                             <plugin state>/mcode-drive/bindings.json when
+#                             HERDR_PLUGIN_STATE_DIR is set)
 #   MCODE_DRIVE_SESSION       force a session id, skipping all resolution.
 #                             The escape hatch that makes an ambiguous pane
 #                             usable; see resolve_session_for_pane.
 #
 # Dependencies: bash 3.2, jq, sqlite3, coreutils. No network. The only state
 # written is the binding file, and only after a drive that already succeeded.
+#
+# KNOB NAMES ARE mcode-2's, agreed in mcode-2-contract.md before either side wrote
+# code, and the reasoning is theirs: a helper with no seam cannot be tested
+# hermetically, and this repo's whole approach is that the CLI is the API. I had
+# independently used MCODE_BIN_NAME / MCODE_DRIVE_STATE_DIR and a fixed
+# MCODE_HOME-relative database path; theirs are better, chiefly because
+# MCODE_STATE_DB lets a test use a fixture instead of reading a live runtime's
+# state. One divergence I did NOT take, flagged for them rather than silently
+# resolved: they proposed a 4-field TSV binding, I use JSON. The seam name is
+# theirs either way, so their suite can point the path wherever it likes.
+
 
 set -euo pipefail
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
-MCODE_BIN_NAME="${MCODE_BIN_NAME:-mcode}"
 MCODE_HOME="${MCODE_HOME:-$HOME/.minimax}"
+# Resolved by `command -v` below rather than trusted as a path, so the default
+# stays a bare name and an explicit MCODE_BIN_PATH is used as given.
+MCODE_BIN_PATH="${MCODE_BIN_PATH:-mcode}"
+SQLITE3_BIN="${SQLITE3_BIN:-sqlite3}"
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "mcode-drive: $*"; exit 1; }
@@ -128,32 +150,38 @@ realpath_dir() {
 # real INTEGER column and is the column the table's own indexes use.
 #
 # $1 is the realpath'd workspace, $2 an optional extra AND-clause.
-sqlite_sessions() { # sqlite_sessions <workspace> [extra-and-clause]
-  local ws="$1" extra="${2:-}"
-  local db="${MCODE_HOME}/v2/sqlite/runtime-state.sqlite"
+sqlite_sessions() { # sqlite_sessions <workspace>
+  local ws="$1"
+  local db="${MCODE_STATE_DB:-$MCODE_HOME/v2/sqlite/runtime-state.sqlite}"
   if [ ! -f "$db" ]; then
     return 1
   fi
   # -readonly: this must never take a write lock on a live runtime's database.
   # The whole point is to read someone else's running state.
-  sqlite3 -readonly "$db" \
+  #
+  # MCODE_STATE_DB is a seam, not a convenience: without it a test would have to
+  # read the owner's real 76 MB runtime database, and a test whose result depends
+  # on whatever the owner's panes happen to be doing is not a test.
+  "$SQLITE3_BIN" -readonly "$db" \
     "SELECT session_id FROM local_runtime_sessions
      WHERE archived = 0 AND workspace_dir = '$(printf '%s' "$ws" | sed "s/'/''/g")'
-     ${extra}
      ORDER BY updated_at_ms DESC;" 2>/dev/null || true
 }
 
 # binding_file — print the path of the pane->session binding file.
 #
-# HERDR_PLUGIN_STATE_DIR when herdr provides one, else a fixed path under
-# ~/.local/state. The fallback is a real path rather than a temp dir on purpose:
-# a binding that a reboot or a tmp sweep erases is not a binding, and losing it
-# just means the next drive re-resolves or dies honestly.
+# MCODE_DRIVE_BINDING when set (a seam, and the whole file path, not a directory).
+# Otherwise, when herdr provides a plugin state dir, under it — NOT under
+# $MCODE_HOME, which is mcode's own directory and not ours to litter. Otherwise a
+# fixed path under ~/.local/state. A fallback that a reboot or a tmp sweep erases
+# is not a binding, and losing one just means the next drive re-infers or refuses.
 binding_file() {
-  if [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
+  if [ -n "${MCODE_DRIVE_BINDING:-}" ]; then
+    printf '%s\n' "$MCODE_DRIVE_BINDING"
+  elif [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
     printf '%s/mcode-drive/bindings.json\n' "${HERDR_PLUGIN_STATE_DIR}"
   else
-    printf '%s\n' "${MCODE_DRIVE_STATE_DIR:-$HOME/.local/state/mcode-drive}/bindings.json"
+    printf '%s\n' "${MCODE_HOME}/drive-bindings.json"
   fi
 }
 
@@ -254,22 +282,32 @@ resolve_pane_cwd() {
 #   3. sqlite, which can only ever produce CANDIDATES for a workspace — never a
 #      single answer, because a workspace routinely holds several sessions.
 #
-# THE AMBIGUITY RULE. One candidate is used. More than one is narrowed to
-# `status='started'` (the TUI-backed ones) and used only if that leaves exactly
-# one. Anything else DIES and prints every candidate.
+# THE AMBIGUITY RULE. Exactly one candidate is used, and stderr says it was
+# INFERRED rather than bound, so the user knows how much to trust it. More than
+# one DIES, printing every candidate. Never guess.
 #
-# The brief proposed breaking a tie by ordering live pids from `.mcode-active`
-# against session `created_at_ms`. Measured, that tiebreak cannot do this job:
-# those files carry no pane id and no cwd, so they say nothing about which pane
-# is which. They establish that the live-pid set and the live-session set line up
-# in rank — they did here, 3 live pids against 3 `started` sessions with strictly
-# decreasing created_at_ms — but nothing marks which rank belongs to the pane
-# being driven. Ranking two sets and handing rank N to a named pane is a 1-in-N
+# The brief proposed breaking a multi-candidate tie by ordering live pids from
+# `.mcode-active` against session `created_at_ms`. Measured, that tiebreak cannot
+# do this job: those files carry no pane id and no cwd, so they say nothing about
+# which pane is which. They establish that the live-pid set and the live-session
+# set line up in rank — they did here, 3 live pids against 3 `started` sessions
+# with strictly decreasing created_at_ms — but nothing marks which rank belongs to
+# the pane being driven. Ranking two sets and handing rank N to a named pane is a
+# 1-in-N guess, and with three panes in one workspace that is a one-in-three
 # guess. The issue calls that coincidence "weak evidence" and says the binding
-# file exists so it never has to be a law; this script takes that literally and
-# declines to guess. MCODE_DRIVE_SESSION is how a user resolves it deliberately.
+# file exists so it never has to be a law; this script takes that literally.
+#
+# AN EARLIER REVISION NARROWED TO status='started' FIRST, and that was a bug
+# worth recording. Narrowing looks safe — it cut 12 candidates to 3 here — but
+# `status` tracks session ACTIVITY, not pane existence: a pane sitting at its
+# prompt is `idle`, not `started`. So narrowing can drop the very session that
+# belongs to the pane being driven, and then, if exactly one `started` session
+# remained, confidently pick a DIFFERENT pane's session. That is the silent wrong
+# answer, reached by a rule that looks like extra caution. The narrowing is gone
+# for the same reason the pid tiebreak is: a filter that can exclude the right
+# answer cannot make an ambiguous question less ambiguous.
 resolve_session_for_pane() { # resolve_session_for_pane <pane> <cwd>
-  local pane="$1" cwd="$2" sid bound candidates started
+  local pane="$1" cwd="$2" sid bound candidates
 
   if [ -n "${MCODE_DRIVE_SESSION:-}" ]; then
     sid="${MCODE_DRIVE_SESSION}"
@@ -292,28 +330,21 @@ resolve_session_for_pane() { # resolve_session_for_pane <pane> <cwd>
   local count
   count=$(printf '%s\n' "$candidates" | grep -c . || true)
   if [ "$count" -eq 1 ]; then
+    # Said out loud because it matters for trust: this pairing was INFERRED from
+    # a shared workspace, not bound. If the pane later moves workspace, or a
+    # second session appears in the old one, the inference was wrong and the
+    # user should have been told it was a guess all along.
+    log "mcode-drive: no binding for pane ${pane}; INFERRED its session from the only mcode session in workspace '${cwd}'. That is an inference, not a recorded pairing - if this pane is not that session, drive it explicitly with MCODE_DRIVE_SESSION=<id> and the correct pairing will be cached."
     printf '%s\n' "$candidates"
     return 0
   fi
 
-  # More than one session shares this workspace. On a multi-pane setup that is
-  # the normal case, not an edge case — three panes in one checkout is exactly
-  # the flock this was built for.
-  started=$(sqlite_sessions "$cwd" "AND status = 'started'")
-  local started_count
-  started_count=$(printf '%s' "$started" | grep -c . || true)
-  if [ "$started_count" -eq 1 ]; then
-    printf '%s\n' "$started"
-    return 0
-  fi
-
-  # Deliberately refusing. See the header and resolve_session_for_pane's
-  # contract: no measurement available to this script can say which of these
-  # sessions belongs to this pane, and picking one means aiming the prompt at
-  # somebody's session.
+  # Deliberately refusing, and note there is no narrowing step above to make this
+  # number smaller. On a multi-pane setup this is the normal case, not an edge
+  # case — three panes in one checkout is exactly the flock this was built for.
   local listed
   listed=$(printf '%s' "$candidates" | sed 's/^/    /')
-  die "ambiguous: ${count} live mcode sessions share workspace '${cwd}' and ${started_count} of them are 'started', so pane ${pane} cannot be told apart from its neighbours. Nothing was guessed, because \`mcode exec\` has no cwd guard that would stop a wrong session from accepting the turn — the wrong pane would simply receive your prompt. Candidates:
+  die "ambiguous: ${count} live mcode sessions share workspace '${cwd}', so pane ${pane} cannot be told apart from its neighbours. Nothing was guessed, because \`mcode exec\` has no cwd guard that would stop a wrong session from accepting the turn — the wrong pane would simply receive your prompt. No status filter is applied to narrow this: \`status\` tracks session activity rather than pane existence, so a pane sitting at its prompt reads 'idle' and narrowing on 'started' can exclude the very session you meant. Candidates:
 ${listed}
   Pick one and re-run with it named explicitly, for example:
     MCODE_DRIVE_SESSION=<id> $0 ${pane} <prompt>
@@ -337,16 +368,18 @@ main() {
   if ! command -v jq >/dev/null 2>&1; then
     die "\`jq\` is required to read Herdr's JSON output but was not found on PATH. Install it (macOS: \`brew install jq\`; Debian/Ubuntu: \`apt-get install jq\`) and retry. No prompt was sent."
   fi
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    die "\`sqlite3\` is required to resolve a pane to its mcode session but was not found on PATH. Install it (macOS: \`brew install sqlite\`; Debian/Ubuntu: \`apt-get install sqlite3\`) and retry, or skip resolution entirely with MCODE_DRIVE_SESSION=<id>. No prompt was sent."
+  # The check is against SQLITE3_BIN, not a hard-coded `sqlite3`, or a suite that
+  # stubs the binary would be told the dependency is missing when it is not.
+  if ! command -v "$SQLITE3_BIN" >/dev/null 2>&1; then
+    die "\`${SQLITE3_BIN}\` is required to resolve a pane to its mcode session but was not found on PATH. Install it (macOS: \`brew install sqlite\`; Debian/Ubuntu: \`apt-get install sqlite3\`) and retry, or skip resolution entirely with MCODE_DRIVE_SESSION=<id>. No prompt was sent."
   fi
 
   local mcode_bin
-  if ! mcode_bin=$(command -v "$MCODE_BIN_NAME" 2>/dev/null); then
-    die "\`${MCODE_BIN_NAME}\` is not on PATH, so there is nothing to drive. Install MiniMax Code, or add it to PATH, then retry. No prompt was sent."
+  if ! mcode_bin=$(command -v "$MCODE_BIN_PATH" 2>/dev/null); then
+    die "\`${MCODE_BIN_PATH}\` is not on PATH, so there is nothing to drive. Install MiniMax Code, or add it to PATH, then retry. No prompt was sent."
   fi
   if [ -z "$mcode_bin" ]; then
-    die "\`${MCODE_BIN_NAME}\` did not resolve to a path, so there is nothing to drive. No prompt was sent."
+    die "\`${MCODE_BIN_PATH}\` did not resolve to a path, so there is nothing to drive. No prompt was sent."
   fi
 
   local target="$1"
