@@ -9,7 +9,7 @@ evidence travel together as one self-contained unit for the upstream contributio
 issue #37. They are the same bytes, copied — not a second capture.
 
 Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
-(`/Users/noonoon/.local/bin/herdr`), **mcode v0.6.2** (`/Users/noonoon/.minimax-code/bin/mcode`).
+(`~/.local/bin/herdr`), **mcode v0.6.2** (`~/.minimax-code/bin/mcode`).
 
 | File | Exact capture command | Pane | What it shows |
 |---|---|---|---|
@@ -30,13 +30,13 @@ manifest **herdr ships**, and it is the only file in this directory that is not
 evidence for a rule — it is the spec the rules are measured against.
 
 It is vendored rather than read from disk because the first version of the checker
-read it from `/Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml`.
+read it from `~/.local/state/herdr/agent-detection/remote/claude.toml`.
 That path exists on exactly one machine, so the suite passed here and failed on both
 CI legs with a `FileNotFoundError` naming somebody's home directory.
 
 | | |
 |---|---|
-| source | `/Users/noonoon/.local/state/herdr/agent-detection/remote/claude.toml` |
+| source | `~/.local/state/herdr/agent-detection/remote/claude.toml` |
 | sha256 | `038d0aa23fee3f9b39cb3c9ca117d0f95b0b3a5873cf0f38284ccbac279c9664` |
 | herdr | 0.9.3 |
 | captured | 2026-10-04 07:11 +0800 |

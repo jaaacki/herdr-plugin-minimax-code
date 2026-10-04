@@ -5,7 +5,7 @@ each file is real output from a real `mcode` or non-mcode pane, and every rule i
 the watcher was read out of these files rather than assumed.
 
 Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
-(`/Users/noonoon/.local/bin/herdr`), mcode **v0.6.2** (`/Users/noonoon/.minimax-code/bin/mcode`).
+(`~/.local/bin/herdr`), mcode **v0.6.2** (`~/.minimax-code/bin/mcode`).
 
 | File | Exact capture command | Pane | Classified |
 |---|---|---|---|
