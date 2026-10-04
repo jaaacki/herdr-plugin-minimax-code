@@ -8,10 +8,20 @@ A [Herdr](https://herdr.dev) community plugin (herdr-plugin.toml workflow) that 
 [MiniMax Code](https://github.com/MiniMax-AI) (`mcode`) in a pane. Platform: `linux`, `macos`
 only — the entrypoint is bash. Requires herdr `>= 0.9.3`.
 
-Two source files only:
+Three entrypoints plus the manifest. Only `bin/mcode-plugin.sh` is on the launch path. The
+other two are user-facing but by different routes — the README names the watcher, the
+release notes name the session registrar — which is why the release tarball must ship all
+three:
 
 - `herdr-plugin.toml` — the whole contract. Actions/event hooks declare an argv command.
-- `bin/mcode-plugin.sh` — the entrypoint, dispatching on `$1`.
+- `bin/mcode-plugin.sh` — the launcher, dispatching on `$1`. Invoked by the manifest action.
+- `bin/mcode-watch.sh` — the state watcher. The README tells users to run this by hand.
+- `bin/mcode-session.sh` — the session registrar, named in the release notes.
+
+`agent-detection/minimax-code.toml` ships in the tarball too, and ships **inert**: nothing
+installs it into herdr's agent-detection directory, so it cannot change a user's detection.
+Shipping it and activating it are separate acts. It exists because `tests/agent-detection-run.sh`,
+which also ships, resolves it.
 
 `HANDOFF.md` is verified research (herdr internals, manifest schema, injected env, exact CLI
 surface) — read it before re-deriving any herdr behavior. `PLAN.md` is the current epic's plan.
@@ -53,6 +63,21 @@ on the *sequence* of calls a multiplexer plugin makes. `shellcheck` is not insta
 
 CI runs `jq --version`, `bash -n` and **every** suite on `ubuntu-latest` and `macos-latest`.
 See the CI-glob gotcha below for how the suite list is built.
+
+### CI also runs a real-herdr end-to-end suite
+
+A second job installs herdr on both runners and drives the real action — `tests/e2e/run.sh`
+is **not** matched by the `tests/*run.sh` glob, because bash's `*` does not cross `/`, and
+that is correct rather than an accident. Widening the glob to `tests/**/run.sh` would run it
+in the stub job, where herdr is absent, and it would exit non-zero on every push. That job
+proves the suite *refuses* to skip when herdr is missing, so it cannot report coverage it
+never had. It is what established that a launched pane appears in `herdr agent list`, and
+that it is addressable both by pane id (`herdr agent get <pane-id>`) and by name
+(`herdr agent get mcode`, installed by `agent rename`).
+
+Resume is wired and **unverified**: `pane report-agent-session` is accepted, but nothing
+demonstrates that a restarted herdr actually restores the session, and the e2e suite makes
+no resume assertion. Treat it as unproven and do not rely on work you cannot redo.
 
 ### How the tests reach the real response shape
 
@@ -130,12 +155,19 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
   release  --source minimax-code       → count 1   (mismatch: no error, no release)
   ```
   No error, no warning — the call just does nothing, so a stale registration outlives the
-  thing that created it. **Always pass the same `--source` you registered with.** `cmd_start`
-  uses `herdr:minimax-code`; `bin/mcode-watch.sh` currently uses `minimax-code`, which does
-  **not** match, so the watcher's `release-agent` does not release a plugin-registered pane.
-  That is a live bug in #46, not a note — tracked in the #48 PR body. A "did my release
-  actually happen" check is `herdr agent list | grep -c <pane-id>`, because the call itself
-  will not tell you.
+  thing that created it. **Always pass the same `--source` you registered with.** All three
+  reporters now declare `herdr:minimax-code` — `bin/mcode-plugin.sh`,
+  `bin/mcode-session.sh` and `bin/mcode-watch.sh` — and `tests/source-run.sh` fails CI if
+  they ever disagree again, so this cannot silently regress. A "did my release actually
+  happen" check is `herdr agent list | grep -c <pane-id>`, because the call itself will not
+  tell you.
+- **`bin/mcode-watch.sh` deliberately does not call `release-agent` at all.** It used to, on
+  every exit path, and that was wrong: the call DELETES the registration rather than handing
+  authority back, so panes vanished from `herdr agent list` as the watcher exited. There is no
+  `mcode` screen manifest to fall back to, so nothing would resume even if it worked;
+  registration is pane-scoped and herdr drops it with the pane. If you ever add the call
+  back, it must use the same `--source` the pane was registered with — see the silent-mismatch
+  measurement above.
 - **Herdr's own Claude integration self-reports session *identity*, never *state*.** Its state
   is screen-detected — `herdr agent explain` names the rule (`osc_title_working`, region
   `osc_title`) — and `explain` refuses outright for a self-reported agent. So there is nothing
