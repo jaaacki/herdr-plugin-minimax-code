@@ -78,6 +78,21 @@
 #     the snapshot's `panes` map is walked in key order and the first insert into
 #     `resumed_sessions` wins. So the second pane silently loses its resume.
 #
+# ONE THING THE EXIT STATUS DOES NOT COVER, and it is not theoretical. herdr
+# accepts this report — 0, not `resume_not_accepted` — and then keeps the resume in
+# memory only. herdr clears a pane's `reported_resume` in three places
+# (src/terminal/state.rs:1920, :2025 and :2047), and if any of them fires between
+# our report and the five-second save debounce, the command is gone before it ever
+# reached the snapshot.
+#
+# Observed ONCE, in a full-suite run, on a box busy enough that the debounce lost
+# the race; the same case passed four times standalone and back to back. Which of
+# the three clearings fires is NOT established, and the honest reading is that
+# persistence here is best-effort even on a 0. So the "resume command recorded"
+# line below means exactly that — recorded — and deliberately claims nothing about
+# what is still there a second later. tests/e2e/run.sh has the reproduction and
+# says the same thing.
+#
 # ---- WHAT IS STILL NOT STORED: the session ID -------------------------------
 # The id half of the old conclusion was right, and stays. `session_ref_from_report`
 # returns None unless the reporter is one of the agent kinds herdr enumerates

@@ -911,8 +911,16 @@ run_case_resume_restored() {
   # like instead of printing "resume did not happen" and leaving it there.
   if [ "$(jq -c '[.workspaces[]?.tabs[]?.panes[]? | select(.agent_resume) | .agent_resume] | length' \
             "$(session_snapshot)" 2>/dev/null)" = "0" ]; then
-    fail "$name" "the resume was never stored, so there was nothing to restore" \
-      "the snapshot holds no agent_resume at all"
+    fail "$name" "the resume was reported and herdr ACCEPTED it, but the snapshot never gained it" \
+      "action log: ${ACTION_LOG}" \
+      "herdr's exit status said the report landed, so this is not a refused report." \
+      "It is the record that went missing, and this case has reproduced it ONCE," \
+      "under full-suite load, after passing four times standalone or back to back." \
+      "NOT ROOT-CAUSED. herdr clears a pane's reported_resume in three places" \
+      "(terminal/state.rs:1920, :2025 and :2047) and any of them firing between the" \
+      "report and the 5s save debounce would produce exactly this. Which one fires" \
+      "is not established. Do not add a retry that hides it: a real regression would" \
+      "hide behind one too."
   elif ! grep -q "client connected" "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" 2>/dev/null; then
     fail "$name" "no client ever connected, so herdr's pending resume had a 0x0 terminal area" \
       "herdr skips deferred agent resumes when no client is attached" \
