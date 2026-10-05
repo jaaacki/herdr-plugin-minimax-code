@@ -608,7 +608,7 @@ main() {
     return 0
   fi
 
-  local chain found sock pane_id rank hook_cwd hook_sid guard_claimed=0
+  local chain found sock pane_id rank hook_cwd hook_sid
   chain="$(chain_walk)"
   log "ancestry chain: $chain"
 

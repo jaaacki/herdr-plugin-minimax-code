@@ -103,9 +103,6 @@ else
     # pane or on "have we reported at all".
     fire_hook "m4-session-a"
     fire_hook "m4-session-b"
-  elif [ "\${3:-}" = "inner" ]; then
-    /bin/sh "$WORK/pane-shell.sh" "\$4" "\$2" hook &
-    wait
   else
     fire_hook "m4-\$1"
   fi
@@ -245,7 +242,18 @@ run_case() { # run_case <name> <function>
   # every later case reusing it. That failure mode is the dangerous one: the suite
   # goes quietly blind on the cases after the first rather than red, and a guard
   # whose own test harness can be silently defeated by it is not much of a guard.
-  /bin/rm -rf "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap/reported" 2>/dev/null
+  #
+  # NO-OP WHEN MINIMAX_DATA_DIR IS UNSET, and that is load-bearing rather than tidiness.
+  # This line is an `rm -rf`, and the export above is exactly what #130 and #131 exist
+  # to catch being removed. Written with the usual ${VAR:-$HOME/...} fallback it would
+  # resolve to the REAL ~/.minimax, so the very mutation those PRs guard against would
+  # delete a maintainer's once-guard marker store. Found by m7 in review, and it is the
+  # worst defect in this PR precisely because it can only fire while testing the fix:
+  # a green run never reaches it, and the mutation run reaches it exactly when the
+  # export is gone.
+  if [ -n "${MINIMAX_DATA_DIR:-}" ]; then
+    /bin/rm -rf "$MINIMAX_DATA_DIR/state/herdr-bootstrap/reported" 2>/dev/null
+  fi
   "$2"
   if [ "$broke" -eq 0 ]; then
     printf 'ok    %s\n' "$CURRENT_CASE"
