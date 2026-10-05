@@ -1,10 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 — one report per session, and the suites stop writing the real home
 
-### Fixed — test isolation
+A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.
 
-- **The test suites wrote into the real `~/.minimax`.** The hook's durable log lives under
+### Fixed
+
+- **The hook reports once per session (#132).** A second `SessionStart` for a session that had already registered its pane reported again. The claim is one directory per session id, taken with `mkdir` after the ancestry proof. No session id, or a marker directory that cannot be created, reports unguarded. A refused report releases the claim, so a later fire retries. A different session in the same pane still reports. Markers older than 24 hours are removed.
+- **The test suites wrote into the real `~/.minimax` (#130).** The hook's durable log lives under
   `${MINIMAX_DATA_DIR:-$HOME/.minimax}`, and of the six places `tests/hook-run.sh` ran it,
   only the two durable-log cases passed their own `MINIMAX_DATA_DIR`; the other four — the
   stand-in pane shell's heredoc, plus three direct call sites — and `tests/e2e/run.sh` ran it
@@ -14,6 +17,10 @@
   is decided by reading it — so the suite was destroying the evidence it exists to produce.
   Both suites now export `MINIMAX_DATA_DIR` once, and a new case fails if that isolation is
   ever removed.
+- **The e2e suite asserts its own export (#131).** `tests/e2e/run.sh` exports
+  `MINIMAX_DATA_DIR` once, and `run_case_hook_bootstrap` fails the run when that variable
+  is unset. CI does not set it, so a green e2e job is the export still being there.
+  Removing the export used to leave the suite green while the hook wrote the real home.
 
 ## 0.6.1 — one watcher per pane, and a doc that stopped lying
 
