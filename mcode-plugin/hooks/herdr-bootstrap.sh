@@ -145,6 +145,8 @@ h_() {
 #
 # Time-bounded on purpose. The hook budget is 5s and mcode kills an overrun by
 # process group, so a slow walk is indistinguishable from a hook that never ran.
+# The bound is a BACKSTOP, not the defence: correctness comes from examining every
+# pane, and the design below is what makes examining every pane cheap enough to do.
 DEADLINE_SECONDS="${MCODE_HOOK_BUDGET_SECONDS:-3}"
 
 now_ms() {
@@ -162,9 +164,116 @@ budget_left() { # budget_left <start_ms>
   [ $(( (now - start) / 1000 )) -lt "$DEADLINE_SECONDS" ]
 }
 
+# ---- why the scan is exhaustive, and why that is now affordable ------------------
+# The outcome must not depend on which session or pane happens to be scanned first.
+# Nothing is preselected and nothing is scored on arrival: the only way to know
+# which match is NEAREST is to look at every pane, and the only way to be sure the
+# answer is not "we ran out of time" is to finish.
+#
+# Session preselection — scan only the session whose SERVER pid is in the hook's
+# ancestry — is NOT possible on herdr 0.9.3. Measured, not assumed:
+#
+#   * `herdr session list --json` answers with `default`, `name`, `running`,
+#     `session_dir` and `socket_path`. No pid. `herdr status server` carries none
+#     either; it reports status, version, protocol and socket.
+#   * The bundled schema (`herdr api schema --json`, 272 KB on 0.9.3) holds exactly
+#     two pid fields in the entire document, and both are PER PANE:
+#     `PaneProcessInfo.shell_pid` and `PaneProcessInfoProcess.pid`. `pane list`
+#     itself carries no pid at all — its keys are agent_session, agent_status,
+#     cwd, focused, foreground_cwd, pane_id, revision, scroll, tab_id, terminal_id,
+#     terminal_title, terminal_title_stripped, workspace_id — and there is no bulk
+#     process-info request, so even a session's worth of anchors costs one call per
+#     pane by design.
+#   * The process table cannot supply the missing link. Every server on the machine
+#     runs the identical argv `herdr server`, with no session dir and no socket
+#     argument (measured: pid 710 under the default-root session). A server pid in
+#     the ancestry — and the server IS in the chain, `hook -> mcode -> pane shell
+#     -> server` — proves THAT a herdr server is an ancestor and never WHICH
+#     session it is.
+#
+# So the scan is bounded by COST, not by selection, and this block spends its
+# effort on cost. Per pane the work is one `pane process-info` call (measured
+# ~10 ms against real herdr) plus one jq. Run sequentially, 300 panes is ~3 s
+# against a 3 s budget, so a pane in the LAST of three 100-pane sessions would be
+# lost to the clock — an answer that depends on scan order, which is the defect
+# this exists to remove. Two things fix that, and both are here:
+#
+#   1. Probing PROBE_LANES panes at a time. Rounded, 300 panes is ~0.5 s.
+#   2. ONE jq per pane that extracts the anchors AND computes the rank. The rank
+#      used to be computed in the shell — `grep -n`, `head`, `cut` per anchor pid
+#      — which was four forks per anchor on top of the herdr call, and forks
+#      dominated the scan. Ranking inside the jq that already had to parse the
+#      response removed them.
+
+# Pane probes run this many at a time. Eight is where a 300-pane scan lands near
+# half a second while leaving ample room inside mcode's 5 s ceiling. Deliberately
+# NOT a knob: m3's standing note is that test-only knobs which read as production
+# settings are a liability, and nothing here needs to vary it.
+PROBE_LANES=8
+
+# Scratch space for the scan: one file per probe verdict. Per-pane files rather
+# than one shared file so two probes can never interleave into one another, which
+# means no assumption about atomic appends is needed anywhere in this file.
+#
+# Created by main(), not by discover_pane(), and that detail is load-bearing:
+# discover_pane is called in a COMMAND SUBSTITUTION, so anything it creates lives
+# in a subshell that exits before main does, and the cleanup trap installed in the
+# parent would never see the path. Created in the parent, it is always removed.
+PROBE_DIR=""
+
+# /bin/rm, never a bare `rm` and never a trash can: issue #109 forbids both. The
+# path is mktemp's own, and the guard refuses to act on anything not under TMPDIR.
+cleanup_probe_dir() {
+  [ -n "$PROBE_DIR" ] || return 0
+  case "$PROBE_DIR" in
+    "${TMPDIR:-/tmp}"/*) /bin/rm -rf "$PROBE_DIR" 2>/dev/null ;;
+    *) : ;;
+  esac
+  PROBE_DIR=""
+  return 0
+}
+trap cleanup_probe_dir EXIT
+
+# rank_for_pane <socket> <pane_id> <chain>
+#
+# Prints the chain rank of the NEAREST anchor this pane owns, or nothing when the
+# pane owns none of them. Anchors, shell_pid first: the foreground group moves per
+# job, so the shell is the stable one, and the foreground pids are what let a pane
+# running mcode match on the mcode process itself.
+#
+# The rank is computed inside the jq that already has to read the response. It used
+# to be a shell loop over `grep -n | head | cut`, one pipeline per anchor pid.
+rank_for_pane() {
+  local sock="$1" pane_id="$2" chain="$3" procs
+
+  # `pane process-info` takes --pane on 0.9.3, not a positional argument.
+  procs="$(h_ "$sock" pane process-info --pane "$pane_id")" || return 0
+
+  printf '%s' "$procs" | jq -r --arg chain "$chain" '
+    # chain position -> index, so a pid can be looked up without a shell loop
+    ($chain | split(" ") | to_entries | map({key: .value, value: .key}) | from_entries) as $at
+    | [ (.result.process_info.shell_pid // empty),
+        (.result.process_info.foreground_process_group_id // empty),
+        ((.result.process_info.foreground_processes // [])[].pid) ]
+    | map(tostring)
+    | map(select(test("^[0-9]+$")))
+    | map($at[.] // empty)
+    | min // empty' 2>/dev/null
+}
+
+# probe_pane_to <socket> <pane_id> <outfile> — probe one pane, record the verdict.
+# Runs in the background, so it touches nothing but its own result file. The chain
+# is inherited from the caller's scope, which a background subshell does inherit.
+probe_pane_to() {
+  local sock="$1" pane_id="$2" out="$3" rank
+  rank="$(rank_for_pane "$sock" "$pane_id" "$chain")"
+  printf '%s\t%s\t%s\n' "${rank:-}" "$pane_id" "$sock" >"$out" 2>/dev/null
+  return 0
+}
+
 discover_pane() { # discover_pane <chain>
   local chain="$1" start_ms best_sock="" best_pane="" best_rank=999999
-  local sock running pane_id procs anchors rank pid idx
+  local sock running pane_id panes_json
   # `definitive` = a match nothing can beat, so the scan may stop. `truncated` =
   # the budget cut the scan short, which must never look like a clean sweep.
   local definitive=0 truncated=0
@@ -181,6 +290,9 @@ discover_pane() { # discover_pane <chain>
     return 1
   fi
 
+  # Index every pane of every RUNNING session. That is one `pane list` per session
+  # and no per-pane work, so the index stays cheap however many sessions exist.
+  #
   # Only RUNNING sessions are probed, and each is addressed by the socket_path the
   # enumeration itself returned — so the socket and the panes come from the same
   # answer, and a session can never be selected by a name this script guessed.
@@ -191,6 +303,7 @@ discover_pane() { # discover_pane <chain>
   # any platform that models one differently, and buys nothing: a socket with no
   # server behind it answers `server_not_running` in about a millisecond, and the
   # deadline below bounds the loop either way.
+  local -a P_SOCK=() P_PANE=()
   while IFS=$'\t' read -r sock running; do
     [ -n "$sock" ] || continue
     case "$sock" in
@@ -200,79 +313,105 @@ discover_pane() { # discover_pane <chain>
     [ "$running" = "true" ] || continue
     budget_left "$start_ms" || { truncated=1; break; }
 
-    local panes_json
     panes_json="$(h_ "$sock" pane list)" || continue
     printf '%s' "$panes_json" | jq -e '.result.panes' >/dev/null 2>&1 || continue
 
     while IFS= read -r pane_id; do
       [ -n "$pane_id" ] || continue
-      budget_left "$start_ms" || { truncated=1; break; }
-      # `pane process-info` takes --pane on 0.9.3, not a positional argument.
-      procs="$(h_ "$sock" pane process-info --pane "$pane_id")" || continue
-
-      # ONE jq, not three. The three values used to be extracted by three separate
-      # forks of jq, and forks — not herdr — dominated the per-pane cost. They now
-      # arrive as one TSV line. Measured on a 32-pane machine: 2 herdr + 3 jq per
-      # pane was ~24 ms, and the whole scan had to fit a 3 s budget.
-      anchors="$(printf '%s' "$procs" | jq -r '
-        [ (.result.process_info.shell_pid // empty),
-          (.result.process_info.foreground_process_group_id // empty),
-          ((.result.process_info.foreground_processes // [])[].pid) ]
-        | map(select(. != null and . != ""))
-        | join(" ")' 2>/dev/null)" || continue
-      [ -n "$anchors" ] || continue
-
-      # Anchors, shell_pid first: the foreground group moves per job, so the shell
-      # is the stable one, and the foreground pids are what let a pane running
-      # mcode match on the mcode process itself.
-      rank=999999
-      for pid in $anchors; do
-        case "$pid" in
-          '' | *[!0-9]*) continue ;;
-        esac
-        idx="$(printf '%s\n' $chain | grep -n "^$pid$" | head -1 | cut -d: -f1)"
-        [ -n "$idx" ] || continue
-        idx=$((idx - 1))
-        [ "$idx" -lt "$rank" ] && rank="$idx"
-      done
-      [ "$rank" -lt 999999 ] || continue
-
-      if [ "$rank" -lt "$best_rank" ]; then
-        best_rank="$rank"
-        best_sock="$sock"
-        best_pane="$pane_id"
-      fi
-
-      # EARLY EXIT, and this is the fix that makes the scan affordable.
-      #
-      # A match at rank 0 is this very process and rank 1 is its `mcode` parent.
-      # Either one is definitive: no other pane can be nearer, because the chain
-      # only gets further away as the index grows. So once one is found, the
-      # remaining panes of this session and every later session cannot improve on
-      # it, and continuing to ask herdr about them is pure cost.
-      #
-      # Without this the loop kept going after it had already proved its pane, and
-      # the cost was O(all panes x all sessions) on EVERY session start. Measured
-      # by m3 with a 3-session x 100-pane fixture and the match at session 2: the
-      # pane was proved on about call 2 and the hook still spent 305. Against real
-      # herdr that is ~24 ms per pane, so a machine with ~85 panes exhausted the
-      # 3 s budget and the hook refused — the worst kind of failure, because the
-      # pane silently never registers, and it fails on exactly the busy machines
-      # where registration matters most.
-      if [ "$best_rank" -le 1 ]; then
-        definitive=1
-        break
-      fi
+      P_SOCK+=("$sock")
+      P_PANE+=("$pane_id")
     done < <(printf '%s' "$panes_json" | jq -r '.result.panes[].pane_id' 2>/dev/null)
-    [ "$definitive" -eq 1 ] && break
   done < <(printf '%s' "$sessions_json" \
     | jq -r '.sessions[] | select(.running == true) | [.socket_path, "true"] | @tsv' 2>/dev/null)
+
+  local total=${#P_SOCK[@]}
+
+  # Probe every indexed pane, in batches, and keep the NEAREST rank seen. Every
+  # pane is a candidate, so the answer cannot depend on the order sessions or panes
+  # came back in.
+  #
+  # The first batch is ONE pane and the batch size then doubles up to PROBE_LANES.
+  # A fixed width would make the common case pay for parallelism it does not need:
+  # with the matching pane first, eight probes are launched before any is read, and
+  # every session start would cost eight herdr round trips where one would do.
+  # Ramping means an ordinary start stops after a single probe while a 300-pane
+  # machine still reaches full width in three batches. The ramp only changes HOW MANY
+  # probes are in flight, never which panes are eligible, so it cannot affect the
+  # answer — only how long the answer takes.
+  local n=0 launched lanes=1 i rank pane cand_sock
+  while [ "$n" -lt "$total" ] && [ "$definitive" -eq 0 ]; do
+    budget_left "$start_ms" || { truncated=1; break; }
+
+    launched=0
+    while [ "$launched" -lt "$lanes" ] && [ $((n + launched)) -lt "$total" ]; do
+      # stdin comes from /dev/null: these run while the parent is mid-loop, and an
+      # inherited stdin would let a probe swallow the parent's input.
+      probe_pane_to "${P_SOCK[$((n + launched))]}" "${P_PANE[$((n + launched))]}" \
+        "$PROBE_DIR/result.$((n + launched))" </dev/null &
+      launched=$((launched + 1))
+    done
+    wait 2>/dev/null
+
+    i=0
+    while [ "$i" -lt "$launched" ]; do
+      rank=""
+      pane=""
+      cand_sock=""
+      if [ -f "$PROBE_DIR/result.$((n + i))" ]; then
+        IFS=$'\t' read -r rank pane cand_sock <"$PROBE_DIR/result.$((n + i))" || true
+      fi
+      case "$rank" in
+        '' | *[!0-9]*) : ;;
+        *)
+          if [ "$rank" -lt "$best_rank" ]; then
+            best_rank="$rank"
+            best_pane="$pane"
+            best_sock="$cand_sock"
+          fi
+          # EARLY EXIT, and this is what keeps the common case cheap.
+          #
+          # A match at rank 0 is this very process and rank 1 is its `mcode`
+          # parent. Either one is definitive: the chain only gets further away as
+          # the index grows, so no unexamined pane can beat it.
+          #
+          # Note what this does NOT do: it is not what makes the answer
+          # order-independent. The scan finishes in full unless it finds a match
+          # that cannot be beaten, so the answer is the same whatever order the
+          # sessions and panes came back in. This only avoids paying for panes that
+          # cannot change the result. Measured by m3 with a 3-session x 100-pane
+          # fixture and the match at session 2: the pane was proved on about call 2
+          # and the hook still spent 305, because the old loop kept asking after it
+          # already had the answer.
+          if [ "$best_rank" -le 1 ]; then
+            definitive=1
+            break
+          fi
+          ;;
+      esac
+      i=$((i + 1))
+    done
+
+    n=$((n + launched))
+    [ "$lanes" -lt "$PROBE_LANES" ] && lanes=$((lanes * 2))
+    [ "$lanes" -gt "$PROBE_LANES" ] && lanes="$PROBE_LANES"
+  done
 
   # A TRUNCATED SCAN MUST SAY SO. If the budget cut the search short, the match we
   # hold may not be the nearest one, and a caller reading only "proved pane X" would
   # take that as a complete search. This is the same failure class as the one this
   # issue already fought — a silent "enabled, nothing happened" — re-entering
   # through a performance ceiling, so it is stated in the log rather than inferred.
+  #
+  # It costs SPEED, never the registration: best_pane is deliberately kept, so a
+  # trip still registers the pane it found and says the answer may not be nearest.
+  # An earlier revision of this file claimed the opposite — that a machine with
+  # ~85 panes "exhausted the budget and the hook refused", leaving the pane never
+  # registered. That was m3's reading of an earlier revision; it was retracted, and
+  # this hook has never done it.
+  #
+  # This block is reached even when the scan examined nothing at all, which is what
+  # a zero budget produces — announcing that is the entire point of the warning, so
+  # it must not sit behind an early return that a truncated scan would take.
   if [ "$truncated" -eq 1 ]; then
     log "WARNING: the ${DEADLINE_SECONDS}s search budget expired mid-scan."
     if [ -n "$best_pane" ]; then
@@ -280,6 +419,8 @@ discover_pane() { # discover_pane <chain>
     else
       log "WARNING: no pane was examined before the budget expired."
     fi
+  elif [ "$total" -eq 0 ]; then
+    log "no running session offered a pane to examine; refusing to register."
   fi
 
   [ -n "$best_pane" ] || return 1
@@ -302,6 +443,17 @@ main() {
   local chain found sock pane_id rank
   chain="$(chain_walk)"
   log "ancestry chain: $chain"
+
+  # Created HERE, in the parent, and not inside discover_pane: discover_pane runs in
+  # a command substitution, so a directory it made would belong to a subshell that
+  # is gone before this line returns, and the EXIT trap would have nothing to clean.
+  # Fail closed if it cannot be made — a scan with nowhere to put its verdicts has
+  # proved nothing, and an unproved pane must never be reported.
+  if ! PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mcode-herdr-probe.XXXXXX" 2>/dev/null)"; then
+    log "cannot create a scratch directory for the pane scan; refusing to register."
+    PROBE_DIR=""
+    return 0
+  fi
 
   if ! found="$(discover_pane "$chain")"; then
     log "no herdr pane is proven by this process ancestry; refusing to register."

@@ -163,6 +163,13 @@ never used to guess. If no pane can be proven, the hook reports nothing and says
 never falls back to the default session, because a registration on the wrong pane is
 worse than no registration.
 
+**On a machine with a great many panes**, the search is time-bounded, because `mcode`
+kills a hook that overruns its budget and a killed hook is indistinguishable from one
+that never ran. If the bound is reached, the hook **still registers the pane it had
+already proved** and logs a warning that the match may not be the nearest one — so
+running out of time costs accuracy, never the registration. The warning appears in
+`mcode`'s hook diagnostics.
+
 Two things it deliberately does **not** do:
 
 - **It does not deregister on exit.** `mcode` never fired `SessionEnd` for us, on a

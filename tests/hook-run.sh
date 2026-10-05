@@ -131,8 +131,22 @@ release_pane() { # release_pane <tag> [inner-tag] — let the hook run, then wai
   PANE_SHELL_PID=""
 }
 
-write_fixture() { printf '%s' "$1" >"$FAKE_HOOK_FIXTURE"; }
+# Writing the fixture also invalidates the stub's pre-rendered cache. The suite owns
+# the fixture's lifecycle, so the suite owns this: the stub cannot detect the change
+# itself, because filesystem timestamps have one-second granularity and two cases
+# written inside the same second are indistinguishable by mtime. A stale cache makes
+# a case probe the PREVIOUS case's pids, which surfaces as "my pane was not
+# reported" and looks exactly like a product bug. /bin/rm, never a bare `rm`
+# (issue #109).
+write_fixture() {
+  printf '%s' "$1" >"$FAKE_HOOK_FIXTURE"
+  /bin/rm -f "$FAKE_HOOK_FIXTURE.proc-cache" 2>/dev/null
+}
 calls() { cat "$FAKE_HOOK_LOG" 2>/dev/null; }
+# A failure note must stay readable. The call log runs to hundreds of lines on the
+# scale cases, and a note that pastes all of it into the report hides the one line
+# that matters.
+calls_digest() { calls | head -c 400 | tr '\n' '|'; }
 reset_log() { : >"$FAKE_HOOK_LOG"; }
 report_calls() { grep -c 'report-agent' "$FAKE_HOOK_LOG" 2>/dev/null || true; }
 
@@ -215,7 +229,7 @@ case_pane_is_found_by_ancestry_not_cwd() {
 
   if ! grep -q 'report-agent w1:p1' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the pane whose shell_pid is our real ancestor (w1:p1) was not reported"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
   if grep -q 'report-agent w9:p9' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "reported w9:p9, which only shares our CWD — cwd is not an identity"
@@ -253,11 +267,11 @@ case_nearest_ancestor_wins() {
   if grep -q 'report-agent w1:p1' "$FAKE_HOOK_LOG" 2>/dev/null &&
     ! grep -q 'report-agent w2:p2' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "reported the OUTER pane; the nearest ancestor must win"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
   if ! grep -q 'report-agent w2:p2' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the inner (nearest) pane was not reported at all"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
 }
 
@@ -319,7 +333,7 @@ case_unproven_pane_refuses_and_reports_nothing() {
 
   if [ "$(report_calls)" != "0" ]; then
     note "reported $(report_calls) time(s) with no proven pane; this must fail closed"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
   if ! grep -q 'refusing to register' "$WORK/stderr" 2>/dev/null; then
     note "no refusal was logged, so the silence would be undiagnosable"
@@ -370,7 +384,7 @@ case_reports_once_with_the_shared_source() {
   n="$(report_calls)"
   if [ "$n" != "1" ]; then
     note "expected exactly 1 report, saw $n"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
   if ! grep -q -- '--source herdr:minimax-code' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the report did not carry --source herdr:minimax-code"
@@ -416,7 +430,7 @@ case_foreground_process_is_an_anchor() {
 
   if [ "$(report_calls)" != "1" ]; then
     note "a pane whose foreground process is the hook's own parent was not matched"
-    note "log: $(calls | tr '\n' '|')"
+    note "log: $(calls_digest)"
   fi
 }
 
@@ -516,7 +530,7 @@ case_scan_stops_at_a_definitive_match() {
   release_pane alpha
 
   if ! grep -q 'report-agent w1:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
-    note "the matching pane was not reported; log: $(calls | tr '\n' '|')"
+    note "the matching pane was not reported; log: $(calls_digest)"
   fi
   calls_made="$(wc -l <"$FAKE_HOOK_LOG" | tr -d ' ')"
   # One session list + one pane list + process-info for the panes scanned up to and
@@ -556,6 +570,119 @@ case_budget_expiry_is_announced() {
   fi
 }
 
+# 15. A budget that expires mid-scan still REGISTERS the pane it already found.
+#
+#     This is the other half of the case above, and the half that was easy to get
+#     backwards. Running out of time costs SPEED, not the registration: the pane
+#     proved before the budget bit is still the best evidence the hook has, and
+#     throwing it away converts "slower" into "invisible" — on exactly the busy
+#     machines where a pane most needs to be seen. The warning still fires, so the
+#     answer is never passed off as a complete search.
+#
+#     The match is at chain rank 2, not 0 or 1, so it is NOT definitive and the
+#     scan does keep going — which is what makes the truncation real rather than
+#     staged. Rank 2 is reached by nesting: hook -> inner pane shell -> outer pane
+#     shell, so the outer shell's pid is two steps up the chain. The fixture is
+#     large enough that the scan cannot finish inside the one-second budget.
+case_budget_trip_still_registers_what_it_found() {
+  reset_log
+  /bin/rm -f "$WORK/slow.pid" "$WORK/slow.go" "$WORK/slow2.pid" "$WORK/slow2.go" 2>/dev/null
+
+  MCODE_HOOK_BUDGET_SECONDS=1 \
+    "$WORK/pane-shell.sh" slow "$WORK" inner slow2 >"$WORK/stderr2" 2>&1 &
+  PANE_SHELL_PID=$!
+  local i=0
+  # The outer shell only SPAWNS the inner one after its own .go file appears, so
+  # the release comes first and the inner pid second. Waiting for the inner pid
+  # before releasing the outer deadlocks until the poll gives up.
+  while [ ! -s "$WORK/slow.pid" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+  : >"$WORK/slow.go"
+  i=0
+  while [ ! -s "$WORK/slow2.pid" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+  local outer inner
+  outer="$(cat "$WORK/slow.pid" 2>/dev/null || echo 0)"
+  inner="$(cat "$WORK/slow2.pid" 2>/dev/null || echo 0)"
+  if [ "$outer" = "0" ] || [ "$inner" = "0" ]; then
+    note "could not start the nested stand-in pane shells"
+    return
+  fi
+
+  # 3 sessions x 500 panes, and the matching pane is FIRST: found at rank 2, then
+  # the scan has 1499 more panes to get through and a one-second budget to do it in.
+  write_fixture "$(jq -nc --argjson pid "$outer" '
+    def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000, fg_pgid:0, fg_pids:[]}];
+    {sessions:[
+       {name:"s1",socket:"/tmp/hpmc-slow/s1.sock",running:true,
+        panes:([{pane_id:"w1:outer",shell_pid:$pid,fg_pgid:0,fg_pids:[]}] + filler(500;"w1f"))},
+       {name:"s2",socket:"/tmp/hpmc-slow/s2.sock",running:true,panes:filler(500;"w2")},
+       {name:"s3",socket:"/tmp/hpmc-slow/s3.sock",running:true,panes:filler(500;"w3")}
+     ]}')"
+
+  : >"$WORK/slow2.go"
+  wait "$PANE_SHELL_PID" 2>/dev/null
+  PANE_SHELL_PID=""
+
+  if ! grep -q 'budget expired' "$WORK/stderr2" 2>/dev/null; then
+    note "expected the scan to be cut short by the 1s budget, but it finished;"
+    note "this case cannot prove what it exists to prove unless it truncates"
+  fi
+  if ! grep -q 'report-agent w1:outer' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the budget expired and the pane it had ALREADY proved was discarded;"
+    note "a trip must cost speed, never the registration"
+  fi
+  if grep -q 'report-agent' "$FAKE_HOOK_LOG" 2>/dev/null &&
+    [ "$(grep -c 'report-agent' "$FAKE_HOOK_LOG" 2>/dev/null)" != "1" ]; then
+    note "registered more than once; one registration per session, always"
+  fi
+}
+
+# 15. The answer does not depend on WHERE the matching pane sits.
+#
+#     This is the case that exists because the scan is order-independent BY
+#     DESIGN and that has to be kept true by a test rather than by intent. The
+#     fixture is 3 sessions x 100 panes with the matching pane LAST — the most
+#     expensive position for any strategy that stops early, and the position that
+#     used to lose: a sequential scan needs 300 herdr calls at a measured ~10 ms
+#     each, which is past the 3 s budget, so the hook gave up and the pane was
+#     never registered.
+#
+#     Both halves are asserted. The pane must be reported — that is the
+#     order-independence claim. And the scan must have examined every pane, which
+#     is the reason it can be reported at all: a hook that quietly settled for the
+#     first plausible pane would pass the first assertion while being exactly the
+#     defect this case exists to kill.
+case_match_in_the_last_of_three_sessions() {
+  local pid calls_made
+  spawn_pane late
+  pid="$(pane_pid late)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+
+  # 3 sessions x 100 panes; the match is the LAST pane of the LAST session.
+  write_fixture "$(jq -nc --argjson pid "$pid" '
+    def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000, fg_pgid:0, fg_pids:[]}];
+    {sessions:[
+       {name:"s1",socket:"/tmp/hpmc-last/s1.sock",running:true,panes:filler(100;"w1")},
+       {name:"s2",socket:"/tmp/hpmc-last/s2.sock",running:true,panes:filler(100;"w2")},
+       {name:"s3",socket:"/tmp/hpmc-last/s3.sock",running:true,
+        panes:(filler(99;"w3") + [{pane_id:"w3:real",shell_pid:$pid,fg_pgid:0,fg_pids:[]}])}
+     ]}')"
+  reset_log
+  release_pane late
+
+  if ! grep -q 'report-agent w3:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the matching pane in the LAST session was not reported; log: $(calls_digest)"
+  fi
+
+  calls_made="$(wc -l <"$FAKE_HOOK_LOG" | tr -d ' ')"
+  # 1 session list + 3 pane list + 300 process-info = 304 when the scan is
+  # exhaustive. Anything materially below that means panes went unexamined, and an
+  # unexamined pane is a pane that might have been the nearer one.
+  if [ "$calls_made" -lt 290 ]; then
+    note "only $calls_made herdr calls for 300 panes; the scan stopped early,"
+    note "so the match it reported is not proven to be the nearest pane"
+  fi
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
@@ -569,7 +696,9 @@ CASES=(
   survives-a-missing-herdr-and-bad-json:case_survives_a_missing_herdr_and_bad_json
   foreground-process-is-an-anchor:case_foreground_process_is_an_anchor
   scan-stops-at-a-definitive-match:case_scan_stops_at_a_definitive_match
+  match-in-the-last-of-three-sessions:case_match_in_the_last_of_three_sessions
   budget-expiry-is-announced:case_budget_expiry_is_announced
+  budget-trip-still-registers-what-it-found:case_budget_trip_still_registers_what_it_found
   install-never-uses-a-bare-rm:case_install_never_uses_a_bare_rm
 )
 
