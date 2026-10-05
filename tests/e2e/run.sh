@@ -197,6 +197,12 @@ cleanup() {
     done
     "$HERDR" --session "$SESSION" plugin log list --plugin "$PLUGIN_ID" \
       >"$ev/plugin-log.json" 2>/dev/null
+    # The watcher's own stderr. A count of 0 does not say whether the process
+    # exited on its own or was never started; the log is the only record.
+    if [ -n "${MCODE_WATCH_LOG_DIR:-}" ] && [ -d "$MCODE_WATCH_LOG_DIR" ]; then
+      mkdir -p "$ev/watch" 2>/dev/null
+      cp -R "$MCODE_WATCH_LOG_DIR/." "$ev/watch/" 2>/dev/null
+    fi
     printf 'e2e: FAILING RUN — evidence kept at %s\n' "$ev" >&2
     printf 'e2e:   server log: %s/herdr-server.log\n' "$ev" >&2
   fi
@@ -495,6 +501,62 @@ agent_row() { # $1 = pane id
     | jq -c --arg p "$1" '.result.agents[]? | select(.pane_id == $p)' 2>/dev/null
 }
 
+# How long a single read of registration state may wait. cmd_start makes the
+# pane visible before report-agent returns, and a name can be absent for a
+# moment between two herdr calls (issue #120). The rest of this suite already
+# polls; these reads did not. The bound is a ceiling: a row that is already
+# there returns on the first try.
+AGENT_WAIT_S=10
+
+await_agent_row() { # await_agent_row <pane> <seconds>
+  local pane="$1" seconds="$2" deadline row
+  deadline=$(( $(date +%s) + seconds ))
+  while :; do
+    row="$(agent_row "$pane")"
+    if [ -n "$row" ]; then
+      printf '%s' "$row"
+      return 0
+    fi
+    [ "$(date +%s)" -le "$deadline" ] || return 1
+    sleep 0.25
+  done
+}
+
+await_agent_get() { # await_agent_get <target> <seconds>
+  local target="$1" seconds="$2" deadline
+  deadline=$(( $(date +%s) + seconds ))
+  while :; do
+    if "$HERDR" --session "$SESSION" agent get "$target" 2>/dev/null \
+        | jq -e '.result.agent' >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$(date +%s)" -le "$deadline" ] || return 1
+    sleep 0.25
+  done
+}
+
+# Run one herdr agent command. If it answers agent_not_found, try again until
+# the deadline: that code is a flap of the registration, and a single sample
+# of it is how the tripwire reported a vanished agent between prompt and
+# send-keys. Any other code is returned immediately, including agent_not_ready,
+# which is the ceiling that case must keep seeing. Prints the last output.
+agent_call_settled() { # agent_call_settled <seconds> <herdr args...>
+  local seconds="$1" deadline out code
+  shift
+  deadline=$(( $(date +%s) + seconds ))
+  out=""
+  while :; do
+    out="$("$HERDR" --session "$SESSION" "$@" 2>&1)" || true
+    code="$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null || true)"
+    if [ "$code" != "agent_not_found" ]; then
+      break
+    fi
+    [ "$(date +%s)" -le "$deadline" ] || break
+    sleep 0.25
+  done
+  printf '%s' "$out"
+}
+
 # The most recent plugin command record, reduced to the fields that explain a
 # failure: status, exit code, and whatever the command wrote to stderr.
 #
@@ -601,7 +663,7 @@ run_case_registered() {
     return
   fi
   local row
-  row="$(agent_row "$NEW_PANE")"
+  row="$(await_agent_row "$NEW_PANE" "$AGENT_WAIT_S" || true)"
   if [ -z "$row" ]; then
     fail "$name" "pane $NEW_PANE is not in agent list" \
       "if #34's registration is missing, this is the expected red"
@@ -629,8 +691,7 @@ run_case_readable() {
     fail "$name" "no new pane recorded by the launch case"
     return
   fi
-  if ! "$HERDR" --session "$SESSION" agent get "$NEW_PANE" 2>/dev/null \
-      | jq -e '.result.agent' >/dev/null 2>&1; then
+  if ! await_agent_get "$NEW_PANE" "$AGENT_WAIT_S"; then
     fail "$name" "herdr agent get $NEW_PANE did not resolve"
     return
   fi
@@ -661,8 +722,7 @@ run_case_readable() {
 run_case_name_addressable() {
   local name="addressability: the launch is reachable by the name 'mcode'"
 
-  if ! "$HERDR" --session "$SESSION" agent get "$AGENT_LABEL" 2>/dev/null \
-      | jq -e '.result.agent' >/dev/null 2>&1; then
+  if ! await_agent_get "$AGENT_LABEL" "$AGENT_WAIT_S"; then
     fail "$name" "herdr agent get $AGENT_LABEL did not resolve — the rename is missing or was taken"
     return
   fi
@@ -696,8 +756,8 @@ run_case_tripwire() {
   #   agent_not_ready  -> today's ceiling. This is the case that must hold.
   #   anything else    -> herdr changed. That is the good news this watches for.
   local out code
-  out="$("$HERDR" --session "$SESSION" agent prompt "$AGENT_LABEL" "hello" 2>&1)"
-  code="$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)"
+  out="$(agent_call_settled "$AGENT_WAIT_S" agent prompt "$AGENT_LABEL" "hello")"
+  code="$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null || true)"
 
   if [ "$code" = "agent_not_found" ]; then
     fail "$name" \
@@ -715,8 +775,8 @@ run_case_tripwire() {
     return
   fi
 
-  out="$("$HERDR" --session "$SESSION" agent send-keys "$AGENT_LABEL" Enter 2>&1)"
-  code="$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)"
+  out="$(agent_call_settled "$AGENT_WAIT_S" agent send-keys "$AGENT_LABEL" Enter)"
+  code="$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null || true)"
   if [ "$code" = "agent_not_found" ]; then
     fail "$name" \
       "the agent '$AGENT_LABEL' vanished between the prompt and send-keys calls." \
@@ -809,12 +869,21 @@ run_case_event_watcher() {
     return
   fi
 
-  # Exactly one. Two would be the spawn loop the lock exists to prevent, and it
-  # is the failure that would not show up in any other assertion here.
-  local n
-  n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
+  # Exactly one survivor. The first pgrep hit can land while the watcher is
+  # still being exec'd, so count for a short settle and fail only if two
+  # processes are still there. The command lines go in the failure: a count of
+  # 2 does not say whether that is two watchers or one watcher plus its parent.
+  local n i procs
+  n=0
+  for i in $(seq 1 10); do
+    n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${n:-0}" -eq 1 ] && break
+    sleep 0.1
+  done
   if [ "${n:-0}" -ne 1 ]; then
-    fail "$name" "$n watchers were started for one pane; it must be exactly 1"
+    procs="$(ps -ax -o pid=,command= | grep -F "mcode-watch.sh $pane" | grep -v grep || true)"
+    fail "$name" "$n watchers were started for one pane; it must be exactly 1" \
+      "processes: $(printf '%s' "$procs" | tr '\n' '; ')"
     return
   fi
 
@@ -826,7 +895,9 @@ run_case_event_watcher() {
   sleep 3
   n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
   if [ "${n:-0}" -ne 1 ]; then
-    fail "$name" "$n watchers after a second status change; the hook must be idempotent"
+    procs="$(ps -ax -o pid=,command= | grep -F "mcode-watch.sh $pane" | grep -v grep || true)"
+    fail "$name" "$n watchers after a second status change; the hook must be idempotent" \
+      "processes: $(printf '%s' "$procs" | tr '\n' '; ')"
     return
   fi
 
@@ -852,7 +923,7 @@ run_case_foreign_pane_untouched() {
   # from the case above it, so when that case failed early this one failed too
   # and a scoping regression looked like two separate failures. It splits its
   # own pane now, and the two cases can be read and run independently.
-  local src pane
+  local src pane procs
   src="$(pane_ids | head -1)"
   if [ -z "$src" ]; then
     fail "$name" "no source pane to split from"
@@ -873,8 +944,10 @@ run_case_foreign_pane_untouched() {
   sleep 3
 
   if pgrep -f "mcode-watch.sh $pane" >/dev/null 2>&1; then
-    fail "$name" "a watcher was started for a claude pane; the event is session-wide" \
-      "and acting on it makes this plugin poll panes it does not own"
+    procs="$(ps -ax -o pid=,command= | grep -F "mcode-watch.sh $pane" | grep -v grep || true)"
+    fail "$name" "a watcher was started for claude pane $pane; the event is session-wide" \
+      "and acting on it makes this plugin poll panes it does not own" \
+      "processes: $(printf '%s' "$procs" | tr '\n' '; ')"
     return
   fi
   pass "$name"
