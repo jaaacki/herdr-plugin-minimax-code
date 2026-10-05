@@ -242,6 +242,27 @@ setup_case() {
   # pane's id, and the result would depend on where it was launched from rather
   # than on the case. Each `report` case sets the variable deliberately.
   unset HERDR_PANE_ID
+
+  # Aim the resume read-back at a sandbox session dir, seeded with the real
+  # capture. Three reasons, and the first one is not optional:
+  #
+  #   1. WITHOUT THIS THE SUITE READS THE DEVELOPER'S OWN ~/.config/herdr. The
+  #      script asks `herdr session list --json` for the running session's
+  #      directory, and the fake herdr answers with its canned reply, so the
+  #      fallback lands on the real config dir. A test suite must never read — let
+  #      alone assert against — someone's live session state, and on a machine
+  #      where a real mcode pane exists the read-back would be answering questions
+  #      about the developer's real panes.
+  #   2. It keeps the invocation log free of a `session list --json` line, so the
+  #      `assert_log_exactly` cases keep asserting on exactly the sequence they
+  #      are about.
+  #   3. The seeded capture is the HAPPY path — the resume is stored — so by
+  #      default the resume read-back has nothing to complain about and the
+  #      identity cases stay about identity. The cases that care about the resume
+  #      replace this file; see write_session_snapshot.
+  export MCODE_HERDR_SESSION_DIR="$CASE_DIR/herdr-session"
+  mkdir -p "$MCODE_HERDR_SESSION_DIR"
+  write_session_snapshot stored >/dev/null
 }
 
 # `resolve` and `report` both resolve against the *current* working directory,
@@ -284,6 +305,54 @@ set_mtime() { # set_mtime <file> <YYYYMMDDhhmmss>
   touch -t "$2" "$1"
 }
 
+# The herdr session snapshot the resume read-back reads. Seeded from a REAL
+# capture — a live herdr 0.9.3, named session, launcher sequence, byte-for-byte —
+# rather than written by hand, because the whole point of the read-back is that it
+# parses herdr's actual on-disk format. Provenance, including the exact commands,
+# is in tests/e2e/fixtures/README.md.
+#
+# `stored`    the capture as captured: one pane holding our agent_resume.
+# `no-resume` the same document with that pane's agent_resume removed, which is
+#             what a snapshot looks like when herdr did not keep the command.
+# `foreign`   agent_resume present but belonging to another reporter, so a
+#             read-back that matched loosely instead of on the reporter tuple
+#             would wrongly call this a match.
+#
+# The capture's `cwd` is deliberately left alone. It reads /private/tmp/… because
+# that is where it was made, and the read-back does not match on cwd, so leaving
+# it is more faithful than rewriting it to the sandbox — and it is what proves the
+# read-back does not depend on cwd matching.
+SNAPSHOT_CAPTURE="$here/e2e/fixtures/session-snapshot-agent-resume.json"
+write_session_snapshot() { # write_session_snapshot stored|no-resume|foreign [source] [agent] [argv...]
+  local variant="$1"; shift
+  local src="${1:-$EXPECTED_SOURCE}" agent="${2:-$EXPECTED_LABEL}"
+  shift 2 2>/dev/null || shift $#
+  local -a argv=("$@")
+  if [ "${#argv[@]}" -eq 0 ]; then
+    # shellcheck disable=SC2206  # matches how the script word-splits this
+    argv=($DEFAULT_RESUME_CMD)
+  fi
+  local argv_json
+  argv_json=$(printf '%s\n' "${argv[@]}" | jq -R . | jq -sc .)
+
+  case "$variant" in
+    stored)   cp "$SNAPSHOT_CAPTURE" "$MCODE_HERDR_SESSION_DIR/session.json" ;;
+    no-resume)
+      jq --arg src "$src" --arg agent "$agent" \
+         'del(.workspaces[].tabs[].panes[] | select(.agent_resume.source == $src
+                                                    and .agent_resume.agent == $agent)
+              | .agent_resume)' \
+         "$SNAPSHOT_CAPTURE" > "$MCODE_HERDR_SESSION_DIR/session.json" ;;
+    foreign)
+      jq --arg src "$src" --arg agent "$agent" --argjson argv "$argv_json" '
+          .workspaces[].tabs[].panes |= with_entries(
+            .value.agent_resume = {source: $src, agent: $agent, argv: $argv})
+        ' "$SNAPSHOT_CAPTURE" > "$MCODE_HERDR_SESSION_DIR/session.json" ;;
+    *) note "unknown snapshot variant '$variant'"; return 1 ;;
+  esac
+  printf '%s' "$MCODE_HERDR_SESSION_DIR/session.json"
+}
+
 # --- expectations ------------------------------------------------------------
 # The agent state herdr already records for the pane, as the stub serves it.
 EXPECTED_STATE="working"
@@ -293,6 +362,12 @@ EXPECTED_STATE="working"
 # wrong one. This is the value the other two reporters use too.
 EXPECTED_SOURCE="herdr:minimax-code"
 EXPECTED_LABEL="mcode"
+# The resume command the script sends unless a case overrides it. Written as a
+# literal here rather than read out of the script under test: a test that derived
+# its own expectation from the implementation would agree with any value,
+# including the wrong one. It is also the exact argv inside the captured snapshot
+# in tests/e2e/fixtures, which is what lets the seeded happy path match.
+DEFAULT_RESUME_CMD="mcode --continue"
 
 expected_report_sequence() { # expected_report_sequence [session-id]
   local sid="${1:-}"
@@ -663,21 +738,38 @@ case_readback_warns_when_session_dropped() {
   # Asserted as a whole sentence, not as the fragment "Session identity is NOT
   # stored". The short form would let a future edit append "…and neither is the
   # resume command" and stay green — which is precisely the over-claim that
-  # shipped once, asserting a measurement nobody took. The resume command's fate
-  # is not observable through this API: `agent get` exposes no resume field, so
-  # it can only be called unverifiable, never lost. The trailing clause
+  # shipped once, asserting a measurement nobody took. The trailing clause
   # ("verified by the read-back, not inferred") is what pins that distinction:
   # it is the difference between a fact this run established and an assumption
   # it dressed up as one.
-  assert_stderr_mentions "Session identity is NOT stored: that is verified by the read-back, not inferred."
-  # The consequence, in the issue's substance rather than its exact prose: the
-  # id is gone and so is the resume command, because herdr discarded the whole
-  # report rather than one field of it.
-  assert_stderr_matches 'not (persist|stored|save)|discard|drop|unavailab|not available'
-  assert_stderr_matches 'resume'
-  # And the user is told this is herdr's ceiling, not a plugin fault, so they
-  # do not go looking for a bug here that is not here.
+  #
+  # CHANGED BY ISSUE #85, and the change is the point. The sentence used to end
+  # there, and everything after it was the bug: "Whether herdr kept the resume
+  # command is a separate question this API cannot answer … so ASSUME herdr
+  # restart-restore is unavailable rather than rely on it." That was an
+  # assumption presented as a finding. herdr DOES keep the resume command, in
+  # `agent_resume` in the session snapshot, and a restart DOES run it. So the
+  # sentence now stops at the id, says the id's absence is expected rather than a
+  # fault, and hands the resume command to a read-back of its own.
+  #
+  # The pin is now on the SCOPE: the message must point at the resume command
+  # being checked separately, and must NOT tell the user to assume restart-restore
+  # is unavailable. That last half is asserted negatively below, because it is the
+  # sentence that has to stay gone.
+  assert_stderr_mentions "Session identity is NOT stored: that is verified by the read-back, not inferred"
+  assert_stderr_matches 'resume command is a separate field'
+  # The id's absence is EXPECTED for mcode — herdr keeps a session id only for the
+  # agent kinds it enumerates — and the user is told so, so they do not go looking
+  # for a bug here that is not here.
   assert_stderr_matches 'herdr|0\.9\.3'
+  assert_stderr_matches 'enumerat'
+  # The retired claim, asserted absent. "assume herdr restart-restore is
+  # unavailable" is false and was the defect; a future edit must not bring it back
+  # in any wording, which is why the needle is the verb and not the sentence.
+  assert_stderr_lacks_match 'assume.{0,40}(restart-restore|resume).{0,30}unavailab'
+  # …and the resume half must now be reported as AVAILABLE from the seeded
+  # capture, which is the whole of issue #85's behaviour change.
+  assert_stderr_matches 'restart-restore is AVAILABLE'
 }
 
 # 17. A different failure from a dropped write, and it must not be reported as
@@ -738,6 +830,184 @@ case_readback_unverifiable_when_no_id_sent() {
   # failed a correct implementation for saying the true thing.
 }
 
+# --- the resume read-back: issue #85 -----------------------------------------
+# Everything above checks the session ID. These check the RESUME COMMAND, which
+# is a different field in a different file, and which the old read-back never
+# looked at — it read `agent_session`, found nothing (herdr only stores an id
+# for the agent kinds it enumerates), and generalised "nothing was stored" to a
+# command herdr had in fact kept. So each case below states which of the two
+# things it is about, and the AVAILABLE/UNVERIFIED cases are the ones that go red
+# if the read-back ever goes back to the wrong field.
+
+# 19. The happy path, and the whole of #85's behaviour change. The seeded
+#     snapshot is a real herdr capture holding OUR agent_resume, so the read-back
+#     must find it there and say restart-restore is available.
+case_readback_finds_resume_in_the_session_snapshot() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  write_session_snapshot stored >/dev/null
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # The file it actually read is named, so the claim is checkable rather than
+  # asserted. A read-back that says "available" without saying where it looked
+  # is the same failure as one that looks in the wrong place, just quieter.
+  #
+  # Asserted as the bare path, not as "session snapshot <path>": the message puts
+  # the two apart ("The herdr session snapshot X holds ..."), and a needle that
+  # requires them adjacent tests the sentence's layout rather than the fact. That
+  # is what the first version of this assertion did, and it failed against a
+  # read-back that was working perfectly.
+  assert_stderr_mentions "$MCODE_HERDR_SESSION_DIR/session.json"
+  assert_stderr_mentions "restart-restore is AVAILABLE"
+  # The argv it matched on, so a read-back matching on something incidental
+  # (any resume at all, any argv) cannot pass this.
+  assert_stderr_mentions "$DEFAULT_RESUME_CMD"
+  assert_stderr_mentions "$EXPECTED_SOURCE"
+  assert_stderr_mentions "$EXPECTED_LABEL"
+  # And it must not ALSO be claiming the resume is unverifiable, which is the
+  # sentence this replaces.
+  assert_stderr_lacks_match 'cannot be checked|unverifiable from here'
+}
+
+# 20. A snapshot that does not hold our resume, with the session directory
+#     PINNED. herdr debounces session saves by five seconds, so on a real run the
+#     snapshot usually has not caught up when the read-back runs. That is not a
+#     finding about herdr, and the message must not dress it as one.
+case_readback_resume_not_confirmed_when_pinned() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  write_session_snapshot no-resume >/dev/null
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # Said about the file that was actually read.
+  assert_stderr_mentions "$MCODE_HERDR_SESSION_DIR/session.json"
+  # THE PIN. "NOT a claim that herdr discarded it" is the clause that keeps this
+  # from regressing into the #71 defect in mirror image: reporting a write as
+  # lost when it is merely not flushed yet.
+  assert_stderr_mentions "NOT a claim that herdr discarded it"
+  assert_stderr_matches 'debounce|five seconds'
+  # What to do about it: read again shortly, and know that manual resume is
+  # unaffected either way.
+  assert_stderr_matches 'again in a few seconds'
+  assert_stderr_matches 're-resolves by workspace'
+  # With the directory already pinned, telling the user to pin it would be noise,
+  # so that sentence belongs to the unpinned case and only there.
+  assert_stderr_lacks_match "Set MCODE_HERDR_SESSION_DIR"
+  # Neither of the other two outcomes may leak in.
+  assert_stderr_lacks_match 'restart-restore is AVAILABLE'
+  assert_stderr_lacks_match 'no herdr session snapshot could be read'
+}
+
+# 21. The same absent resume, but with NO session directory pinned — the state of
+#     every pane in a NAMED session, and of every pane whose session this process
+#     simply cannot name. Absence here is weaker still, because the file read may
+#     not even be this pane's session, and the message has to say so rather than
+#     quietly reaching the same conclusion.
+case_readback_resume_not_confirmed_when_session_unknown() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  unset MCODE_HERDR_SESSION_DIR
+  local xdg="$CASE_DIR/xdg"
+  mkdir -p "$xdg/herdr"
+  # A snapshot that exists, holds nothing of ours, and stands in for the default
+  # session — the only file this path can read.
+  jq 'del(.workspaces[].tabs[].panes[] | select(.agent_resume) | .agent_resume)' \
+    "$SNAPSHOT_CAPTURE" > "$xdg/herdr/session.json"
+  export XDG_CONFIG_HOME="$xdg"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  assert_stderr_mentions "$xdg/herdr/session.json"
+  # The two reasons absence is not a finding, both named. The session one is the
+  # one a reader is most likely to miss and most likely to be wrong about.
+  assert_stderr_matches 'debounce|five seconds'
+  assert_stderr_mentions "not known from inside a pane"
+  assert_stderr_mentions "MCODE_HERDR_SESSION_DIR"
+  assert_stderr_lacks_match 'restart-restore is AVAILABLE'
+  # A named session's real snapshot is a DIFFERENT file, and saying the default
+  # one is what got read is what keeps this from being a false alarm.
+  assert_stderr_mentions "default session"
+}
+
+# 22. A resume that is present but is NOT ours. herdr's snapshot can hold resumes
+#     from several reporters, and a Claude or Codex pane in the same session will
+#     have one. A read-back that matched loosely would call this a match and
+#     report availability for a command it never sent.
+case_readback_ignores_another_reporters_resume() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  write_session_snapshot foreign herdr:claude claude claude --resume abc123 >/dev/null
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # Herdr holds a resume; it is simply not the one this run reported.
+  assert_stderr_lacks_match 'restart-restore is AVAILABLE'
+  # It is not silently ignored either — the snapshot was read and did not match,
+  # so the absence is reported rather than passed over.
+  assert_stderr_matches 'NOT CONFIRMED|does not hold it'
+  # The other reporter's identity is never quoted back as if it were ours.
+  assert_stderr_lacks_match 'herdr:claude'
+}
+
+# 23. No snapshot at all. This is the "could not confirm" outcome, and it is
+#     different from both 20 and 21: nothing was learned either way. It must not
+#     borrow either of their wording.
+case_readback_unverifiable_when_no_snapshot_readable() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  rm -f "$MCODE_HERDR_SESSION_DIR/session.json"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  assert_stderr_matches 'no herdr session snapshot could be read'
+  assert_stderr_matches 'UNVERIFIED'
+  # Neither of the other two outcomes may leak in.
+  assert_stderr_lacks_match 'NOT CONFIRMED'
+  assert_stderr_lacks_match 'restart-restore is AVAILABLE'
+}
+
+# 24. THE REASON THERE IS NO `herdr session list` CALL. An earlier draft asked
+#     herdr which session was running, which found the right directory and cost a
+#     herdr invocation on every launch — and broke tests/run.sh, which asserts the
+#     launch path's exact argv sequence and belongs to another member. This case
+#     pins the consequence so the call cannot be reintroduced casually: with no
+#     session directory pinned, the read-back reads herdr's default config
+#     location and issues NO herdr call to do it.
+#
+#     XDG_CONFIG_HOME is aimed at the sandbox so this is deterministic AND the
+#     suite never reads the developer's real ~/.config/herdr.
+case_readback_reads_xdg_default_without_calling_herdr() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  unset MCODE_HERDR_SESSION_DIR
+  local xdg="$CASE_DIR/xdg"
+  mkdir -p "$xdg/herdr"
+  cp "$SNAPSHOT_CAPTURE" "$xdg/herdr/session.json"
+  export XDG_CONFIG_HOME="$xdg"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  # The full sequence, and nothing else. A `session list --json` line here is the
+  # regression this case exists to prevent, and it is also what broke another
+  # member's suite the first time.
+  assert_log_exactly "$(expected_report_sequence)"
+  assert_log_lacks "session	list"
+  # It read the right file, and said so.
+  assert_stderr_mentions "$xdg/herdr/session.json"
+  assert_stderr_mentions "restart-restore is AVAILABLE"
+  # The real config dir is nowhere in the output.
+  assert_stderr_lacks_match "$HOME/.config/herdr"
+}
+
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -771,6 +1041,12 @@ CASES=(
   readback-warns-when-session-dropped:case_readback_warns_when_session_dropped
   readback-distinguishes-unverifiable-from-dropped:case_readback_distinguishes_unverifiable_from_dropped
   readback-unverifiable-when-no-id-sent:case_readback_unverifiable_when_no_id_sent
+  readback-finds-resume-in-the-session-snapshot:case_readback_finds_resume_in_the_session_snapshot
+  readback-resume-not-confirmed-when-pinned:case_readback_resume_not_confirmed_when_pinned
+  readback-resume-not-confirmed-when-session-unknown:case_readback_resume_not_confirmed_when_session_unknown
+  readback-ignores-another-reporters-resume:case_readback_ignores_another_reporters_resume
+  readback-unverifiable-when-no-snapshot-readable:case_readback_unverifiable_when_no_snapshot_readable
+  readback-reads-xdg-default-without-calling-herdr:case_readback_reads_xdg_default_without_calling_herdr
 )
 
 if [ ! -x "$FAKE_HERDR" ]; then

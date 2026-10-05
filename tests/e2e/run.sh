@@ -50,6 +50,12 @@ repo="$(cd -- "$here/../.." && pwd)"
 PLUGIN_ID="jaaacki.minimax-code"
 ACTION_ID="$PLUGIN_ID.minimax-code-start"
 AGENT_LABEL="mcode"
+# The plugin action's own log, captured from the FIRST server while it still has
+# it in memory. Declared here, not inside the case, because a case that fails
+# before it gets that far must still be able to quote it — and under `set -u`
+# referencing it unassigned kills the case with "unbound variable", which is a
+# worse failure than the one being reported.
+ACTION_LOG=""
 
 CASES_RUN=0
 CASES_FAILED=0
@@ -75,6 +81,14 @@ fail() {
 # Every resource this suite creates is recorded here and torn down in reverse.
 # The brief's criterion 6 is "leave no panes, no sessions, no registry changes",
 # so cleanup is not best-effort: a failure below is reported, never swallowed.
+#
+# KEEP_E2E=1 keeps the workdir AND the named session's directory, and prints both.
+# Same escape hatch tests/session-run.sh offers as KEEP_TMP, and it earns its keep
+# here for a specific reason: this suite deletes the session directory, which is
+# also where herdr-server.log and the plugin's own command log live. Those two
+# files are the only way to tell "the action never reported a resume" apart from
+# "it reported one and herdr dropped it", and guessing between them from a red
+# result alone is how a race gets misdiagnosed as a missing feature.
 cleanup() {
   local rc=$?
   set +e
@@ -90,6 +104,22 @@ cleanup() {
       kill "$wp" 2>/dev/null
     done
   done
+
+  # BEFORE the server is killed, and that ordering is the whole point of the
+  # escape hatch: the plugin's command log lives in the server's memory, so a
+  # kept-but-stopped session has thrown away the one artifact that says whether
+  # the action reported a resume at all.
+  if [ "${KEEP_E2E:-0}" = "1" ] && [ -n "$SESSION" ]; then
+    printf 'e2e: KEEP_E2E=1, session %s left RUNNING at %s\n' \
+      "$SESSION" "$HERDR_CONFIG_DIR/sessions/$SESSION" >&2
+    printf 'e2e:   plugin log:  herdr --session %s plugin log list --plugin %s\n' \
+      "$SESSION" "$PLUGIN_ID" >&2
+    printf 'e2e:   server log:  %s\n' "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" >&2
+    printf 'e2e:   workdir:     %s\n' "$WORKDIR" >&2
+    printf 'e2e:   stop it:     herdr --session %s server stop; herdr session delete %s\n' \
+      "$SESSION" "$SESSION" >&2
+    return $rc
+  fi
 
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null
@@ -220,6 +250,14 @@ STUB
   chmod +x "$WORKDIR/bin/$AGENT_LABEL"
   PATH="$WORKDIR/bin:$PATH"
   export PATH
+
+  # The resume command the plugin will record, overridden for the same PATH
+  # reason and at the same moment as the stub: the action is spawned by the
+  # server, so anything the action must see has to be in the server's environment
+  # before it starts. See run_case_resume_restored for why this is not the
+  # plugin's real default.
+  MCODE_RESUME_CMD="echo $RESUME_PROOF"
+  export MCODE_RESUME_CMD
 }
 pane_ids() {
   "$HERDR" --session "$SESSION" pane list 2>/dev/null \
@@ -588,6 +626,167 @@ run_case_foreign_pane_untouched() {
 
 herdr_version() { "$HERDR" --version 2>/dev/null | head -1 | awk '{print $2}'; }
 
+# ── the resume restart, and the only assertion that can prove it ─────────────
+# Everything above this line is checked against a running server. This case stops
+# the server and starts it again, which is the only way to observe the thing issue
+# #85 is about: herdr re-creates a pane from the snapshot and re-runs the resume
+# command the plugin recorded on it.
+#
+# SAFE FOR THE DEVELOPER'S MACHINE, and that is not an accident of the harness —
+# it is the named session. `herdr --session <name>` keeps its socket, its state
+# and its session.json in <config_dir>/sessions/<name>/ (src/session.rs:163,
+# data_dir_for), and `server stop` there stops that server and no other. The
+# default session is never stopped, reconfigured or even contacted: every call in
+# this case carries --session, and the plugin registry is the one shared global
+# this suite already snapshots and restores.
+#
+# WHY THE RESUME COMMAND IS OVERRIDDEN. The plugin's real default is
+# `mcode --continue`, and a CI runner has no mcode, so the restore would type a
+# command that fails and the case would be asserting on a failure. The override is
+# `echo <token>`, chosen because `echo` is a shell builtin in every login shell —
+# PATH-independent, which matters because a RESTORED pane resolves commands from
+# its own login environment and not from the server's (measured: a stub placed on
+# the server's PATH was not found by the restored pane). The token is the argv, so
+# finding it in the pane proves herdr restored OUR argument rather than merely
+# starting a shell. The plugin's real default is asserted separately, as a literal,
+# in tests/session-run.sh.
+#
+# A CLIENT MUST ATTACH. See tests/e2e/attach-pty.py. Without one, herdr's pending
+# resume has a 0x0 terminal area to work with and quietly does nothing.
+RESUME_PROOF="MCODE_RESUME_PROOF_$$"
+
+session_snapshot() { printf '%s' "$HERDR_CONFIG_DIR/sessions/$SESSION/session.json"; }
+
+# herdr debounces session saves by five seconds, so a snapshot read immediately
+# after the launch is a snapshot from before it. Polling is the honest way to
+# wait for the write instead of sleeping a guessed interval.
+#
+# THE SUCCESS TEST IS DELIBERATELY STRICT, and the first draft of it was not —
+# which cost a full debugging round trip and is worth writing down. It read
+#
+#     if [ "$(jq -c '…' "$snap")" != "0" ]; then return 0; fi
+#
+# and `session.json` does not exist for the first ~8 seconds of a session, so jq
+# failed, wrote NOTHING to stdout, and the empty string compared unequal to "0".
+# The function reported success on its first iteration, ~8 seconds before the
+# snapshot existed, and the case went on to assert a restore of a resume that had
+# not been written yet. It failed, and it failed for a reason that had nothing to
+# do with the thing under test.
+#
+# So: jq must SUCCEED, and its output must be a number, and that number must be
+# above zero. A missing file, an unreadable file and malformed JSON are all
+# "not yet", never "found".
+await_resume_in_snapshot() { # await_resume_in_snapshot <seconds>
+  local deadline=$(( $(date +%s) + $1 )) n
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if n=$(jq -e --arg src "herdr:minimax-code" --arg agent "$AGENT_LABEL" \
+            --arg proof "$RESUME_PROOF" \
+            '[.workspaces[]? | .tabs[]? | .panes | to_entries[]?
+              | select(.value.agent_resume != null)
+              | select(.value.agent_resume.source == $src)
+              | select(.value.agent_resume.agent == $agent)
+              | select(.value.agent_resume.argv == ["echo", $proof])] | length' \
+            "$(session_snapshot)" 2>/dev/null); then
+      case "$n" in
+        ''|*[!0-9]*) : ;;
+        0) : ;;
+        *) return 0 ;;
+      esac
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+run_case_resume_restored() {
+  local name="resume: a restart re-runs the recorded resume command in the recreated pane"
+
+  if [ -z "${NEW_PANE:-}" ]; then
+    fail "$name" "no new pane recorded by the launch case"
+    return
+  fi
+
+  # Taken FIRST, before anything this case does, because the action's log lives in
+  # the server's memory and this case is about to stop that server. Reading it
+  # after the restart is how I spent a debugging round trip staring at
+  # `{"logs":[]}` and concluding the action had never run, when the restart had
+  # simply thrown the log away.
+  ACTION_LOG="$(action_log_tail)"
+
+  # 1. STORED. The plugin reported the resume, and herdr kept it — in
+  #    `agent_resume` in the session snapshot, which is the field the old
+  #    read-back never looked at.
+  if ! await_resume_in_snapshot 25; then
+    fail "$name" "herdr's session snapshot never gained an agent_resume for this pane" \
+      "snapshot: $(session_snapshot)" \
+      "agent_resume entries: $(jq -c '[.workspaces[]?.tabs[]?.panes[]? | select(.agent_resume) | .agent_resume]' \
+                    "$(session_snapshot)" 2>/dev/null)" \
+      "action log: ${ACTION_LOG}" \
+      "the action log is what separates 'the plugin never reported a resume' from" \
+      "'the plugin reported one and herdr dropped it'. Those are different bugs."
+    return
+  fi
+
+  # 2. STOPPED. Only this session's server; the default session is not touched.
+  if ! "$HERDR" --session "$SESSION" server stop >/dev/null 2>&1; then
+    fail "$name" "\`herdr --session $SESSION server stop\` failed, so nothing was restarted" \
+      "note: this stops the NAMED session only; the default session is a different server"
+    return
+  fi
+  sleep 2
+
+  # 3. RESTARTED.
+  "$HERDR" --session "$SESSION" server </dev/null >"$WORKDIR/server-restart.log" 2>&1 &
+  SERVER_PID=$!
+  local i ready=""
+  for i in $(seq 1 40); do
+    ready="$("$HERDR" --session "$SESSION" status server 2>/dev/null | sed -n 's/^status: //p')"
+    [ "$ready" = "running" ] && break
+    sleep 0.25
+  done
+  if [ "$ready" != "running" ]; then
+    fail "$name" "the session did not come back up after the restart" \
+      "log: $(head -3 "$WORKDIR/server-restart.log" 2>/dev/null | tr '\n' ' ')"
+    return
+  fi
+
+  # 4. A CLIENT ATTACHES, which is what gives the server a terminal area big
+  #    enough to act on a pending resume.
+  if ! python3 "$here/attach-pty.py" 50 160 12 \
+        "$HERDR" session attach "$SESSION" >"$WORKDIR/attach.log" 2>&1; then
+    fail "$name" "the pty helper could not attach a client" \
+      "output: $(head -3 "$WORKDIR/attach.log" 2>/dev/null | tr '\n' ' ')"
+    return
+  fi
+
+  # 5. THE ASSERTION. The token only appears in the pane if herdr restored the
+  #    resume command we recorded and typed it into the recreated pane.
+  local content
+  content="$("$HERDR" --session "$SESSION" pane read "$NEW_PANE" 2>/dev/null)"
+  if printf '%s' "$content" | grep -qF "$RESUME_PROOF"; then
+    pass "$name"
+    return
+  fi
+
+  # A failure here has three quite different causes and they must not be
+  # collapsed, because the fix for each is different. So say which one it looks
+  # like instead of printing "resume did not happen" and leaving it there.
+  if [ "$(jq -c '[.workspaces[]?.tabs[]?.panes[]? | select(.agent_resume) | .agent_resume] | length' \
+            "$(session_snapshot)" 2>/dev/null)" = "0" ]; then
+    fail "$name" "the resume was never stored, so there was nothing to restore" \
+      "the snapshot holds no agent_resume at all"
+  elif ! grep -q "client connected" "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" 2>/dev/null; then
+    fail "$name" "no client ever connected, so herdr's pending resume had a 0x0 terminal area" \
+      "herdr skips deferred agent resumes when no client is attached" \
+      "see tests/e2e/attach-pty.py"
+  else
+    fail "$name" "the resume was stored and a client connected, but the token never appeared" \
+      "expected token: $RESUME_PROOF" \
+      "action log: ${ACTION_LOG}" \
+      "pane tail: $(printf '%s' "$content" | tail -c 200 | tr -d '\000')"
+  fi
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 printf 'e2e: driving a REAL herdr (%s)\n' "$HERDR"
 
@@ -622,6 +821,9 @@ run_case_name_addressable
 run_case_tripwire
 run_case_event_watcher
 run_case_foreign_pane_untouched
+# LAST, and it has to be. It stops and restarts the session server, so every case
+# above it must already have run against the first server.
+run_case_resume_restored
 
 printf -- '---\n'
 if [ "$WARNINGS" != "[]" ] && [ -n "$WARNINGS" ]; then
