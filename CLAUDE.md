@@ -249,8 +249,25 @@ registerable. Five traps, all measured, none of them guessable:
   "or create" help wording; a name is still rejected because it is not a proof.
 - **The hook's cwd is the PROJECT directory and the plugin is a read-only snapshot.**
   `PLUGIN_ROOT=~/.minimax/v2/plugin-hook-cache/sha256-tree-v1-<content-digest>`. So a hook
-  command must be anchored on `$CLAUDE_PLUGIN_ROOT` (which does expand), and nothing may be
-  written next to the hook. The digest changes whenever the content does.
+  command must be anchored on `${PLUGIN_ROOT}` — **braced** — and nothing may be written
+  next to the hook. The digest changes whenever the content does.
+  This is a correction. The previous wording said `$CLAUDE_PLUGIN_ROOT`, unbraced, "which
+  does expand". **It does not**, and that sentence is why #122 shipped broken: mcode sets
+  both `PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` in the hook environment, but it
+  text-substitutes only the **braced** literal and then spawns — with no shell that would
+  expand a bare `$VAR`. A bare `$CLAUDE_PLUGIN_ROOT` therefore reaches `bash` as literal
+  text and the run dies at `exit 127` on `No such file or directory`, with its stderr
+  consumed by the TUI, so an installed, enabled, loaded plugin silently registers nothing.
+  Measured on mcode 0.6.2: the braced form resolves to the real `plugin-hook-cache`
+  directory at exec time. `tests/hook-run.sh` grades this
+  (`manifest-command-uses-braced-plugin-root`), and note the trap that case exists to
+  catch — see the `manifest-command-actually-executes` case, which used to export the
+  variable itself and so stayed green through an entire release in which the hook never
+  fired once.
+  Do not confuse this with `HERDR_PLUGIN_ROOT`, which behaves the **opposite** way and
+  is documented above: Herdr's manifest `command` array does not expand it at all and
+  needs a shell wrapper, whereas mcode substitutes the braced `${PLUGIN_ROOT}`. Two
+  manifests, two rules, opposite answers — read which one you are editing.
 - **Invoke the hook with `bash`, not `/bin/sh`.** `/bin/sh` is bash in POSIX mode on macOS
   and `dash` on Linux, and the hook uses process substitution — a syntax error in both. The
   manifest loaded cleanly and mcode reported no warning, so the hook would have failed on
