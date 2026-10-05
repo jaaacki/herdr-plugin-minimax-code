@@ -380,17 +380,27 @@ case_detached_doc_matches_launcher() {
     bad "$plugin is missing, so the launcher half of this case cannot be checked"
     return
   fi
-  # The launcher's own spawn: nohup, the watcher path, backgrounded. Checked as
-  # separate greps rather than one pattern, because the two statements are on
-  # separate lines with a line continuation between them.
-  if ! grep -qF 'nohup "$watcher"' "$plugin"; then
-    bad "the launcher no longer nohups the watcher; if the watcher is no longer" \
-        "detached, the header must say so, and this case wants a human decision" \
-        "about which way it moved"
+  # The launcher's own spawn: nohup, the watcher path, backgrounded, then disown.
+  #
+  # ANCHORED TO THE START OF THE LINE, AND THAT IS THE WHOLE POINT. An earlier
+  # revision of this case used `grep -qF 'disown'`, which matched the COMMENT at
+  # mcode-plugin.sh:251-254 explaining what disown does - so deleting the real
+  # `disown` call at :272 left this case green. A guard that a comment can satisfy
+  # is not a guard, and it is worse than no guard: it reads like the lifecycle is
+  # pinned when nothing is. Every comment in that file starts with `#`, so
+  # requiring the token to open a line (after optional indent) matches the
+  # statement and cannot match the prose about it. The `&` is required for the
+  # same reason: `nohup` without `&` would still run in the foreground.
+  if ! grep -qE '^[[:space:]]*nohup[[:space:]]+"?\$watcher"?.*&[[:space:]]*$' "$plugin"; then
+    bad "the launcher no longer starts the watcher as a detached nohup background" \
+        "job. If the watcher is no longer detached, the header must say so, and this" \
+        "case wants a human decision about which way it moved."
     return
   fi
-  if ! grep -qF 'disown' "$plugin"; then
-    bad "the launcher no longer disowns the watcher"
+  if ! grep -qE '^[[:space:]]*disown([[:space:]]|$)' "$plugin"; then
+    bad "the launcher no longer disowns the watcher. Watched on: a matching comment" \
+        "is not a call, and this case is anchored to the start of the line so it can" \
+        "only be satisfied by the statement itself."
     return
   fi
   ok
