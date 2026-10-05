@@ -119,6 +119,56 @@ wait_for_count() { # wait_for_count <path> <min> [max-ms]
   [ "${got:-0}" -ge "$want" ]
 }
 
+# wait_for_file_content PATH NEEDLE [max-ms] - bounded poll until PATH contains
+# NEEDLE.
+#
+# Distinct from wait_for_file on purpose. A redirected handle means the log file
+# can EXIST the instant the watcher is forked and still be empty a moment later,
+# because the writer had not been scheduled yet. Checking for existence alone
+# would pass against an implementation that opened the file and wrote nothing to
+# it — which is what the /dev/null defect looked like from the outside: a
+# watcher that ran, and no record of what it said.
+wait_for_file_content() { # wait_for_file_content <path> <needle> [max-ms]
+  local path="$1" needle="$2" max_ms="${3:-1000}" waited=0
+  while [ "$waited" -lt "$max_ms" ]; do
+    if [ -f "$path" ] && grep -qF -- "$needle" "$path" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.05
+    waited=$((waited + 50))
+  done
+  [ -f "$path" ] && grep -qF -- "$needle" "$path" 2>/dev/null
+}
+
+# assert_one_watcher FILE LABEL - FILE records one line per watcher started, and
+# this asserts exactly one, AFTER a fair chance for a duplicate to appear.
+#
+# The poll waits for the FAILURE SIGNAL rather than sleeping a fixed time or
+# reading the count straight away, and the direction of the wait is the whole
+# point. Every "only one watcher" case in this file has the same shape: trigger
+# something once, then assert nothing started a second watcher. A detached stub
+# has not necessarily been scheduled when the triggering command returns, so:
+#
+#   * an immediate read passes against a duplicate that had not written yet —
+#     a green that means nothing, and the most likely way this whole file lies;
+#   * a fixed sleep is a coin flip on a loaded CI runner.
+#
+# So: poll for the SECOND line up to the bound, and fail if it ever lands. The
+# bound is the same one the rest of the suite uses; the stub writes its line as
+# its first act, so a watcher that is going to start at all has started well
+# inside it.
+assert_one_watcher() { # assert_one_watcher <file> <label>
+  local file="$1" label="$2" total
+  wait_for_count "$file" 2 1000 || true
+  total="$(grep -c . "$file" 2>/dev/null || printf 0)"
+  if [ "${total:-0}" -ne 1 ]; then
+    note "$label: expected exactly 1 watcher, found ${total:-0}"
+    sed 's/^/          /' "$file" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
 # --- assertions --------------------------------------------------------------
 assert_rc_zero() { # assert_rc_zero <rc>
   if [ "$1" -ne 0 ]; then
@@ -236,8 +286,17 @@ setup_case() {
   export FAKE_HERDR_CWD="$CASE_DIR/project"
   export HERDR_BIN_PATH="$FAKE_HERDR"
   export PATH="$CASE_DIR/bin:$BASE_PATH"
+  # Per-case watcher state dir (issue #84). The entrypoint puts the per-pane
+  # watcher log and the per-pane lock under MCODE_WATCH_LOG_DIR, and WITHOUT
+  # this both would land in the shared TMPDIR - where the lock for pane wZ:p8
+  # survives from one case to the next, and where a case can only pass or fail
+  # depending on whether an earlier case's stub watcher has finished dying.
+  # That is cross-case coupling through the filesystem, and it is the kind that
+  # passes locally and flakes in CI. One case, one state dir.
+  export MCODE_WATCH_LOG_DIR="$CASE_DIR/watch-state"
   # Neutralise ambient herdr context so a case only ever sees what it sets.
   unset HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_CONTEXT_JSON
+  unset HERDR_PLUGIN_STATE_DIR
   unset FAKE_HERDR_FAIL FAKE_HERDR_FAULT
   # OFF by default, and this is not tidiness. Cases 1-20 run the REAL checkout,
   # and once cmd_start auto-starts the watcher they would each spawn a detached
@@ -259,6 +318,27 @@ run_entrypoint() {
 # cases 21-23 use this, and only with the copy stage_plugin hands them.
 run_entrypoint_at() { # run_entrypoint_at <entrypoint>
   "$1" start >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  RC=$?
+}
+
+# run_event_handler_at <entrypoint> - invoke the manifest's EVENT subcommand
+# rather than the launch one. Separate from run_entrypoint_at on purpose: the
+# two entry paths are the thing issue #84 is about, and a helper that let a case
+# accidentally drive the launcher instead of the handler would let the whole
+# event path go untested while every case stayed green.
+#
+# The event payload is written to a file and exported, because it has to survive
+# being passed through an environment variable intact - including its quotes and
+# braces - which is exactly the kind of thing a hand-built string gets wrong.
+run_event_handler_at() { # run_event_handler_at <entrypoint> <pane-id> <agent-label>
+  local entry="$1" pane="$2" agent="$3"
+  FAKE_HERDR_EVENT_JSON="$(jq -cn --arg p "$pane" --arg a "$agent" \
+    '{event:"pane_agent_status_changed",
+      data:{type:"pane_agent_status_changed",pane_id:$p,workspace_id:"wZ",
+            agent_status:"working",agent:$a}}')"
+  export HERDR_PLUGIN_EVENT_JSON="$FAKE_HERDR_EVENT_JSON"
+  export HERDR_PLUGIN_EVENT="pane.agent_status_changed"
+  "$entry" ensure-watcher >"$STDOUT_FILE" 2>"$STDERR_FILE"
   RC=$?
 }
 
@@ -490,6 +570,25 @@ STUB
 #!/bin/sh
 printf '%s\t%s\n' "$*" "${MCODE_AGENT_LABEL:-}" >>"$(dirname -- "$0")/../watcher-ran"
 sleep 5
+STUB
+      chmod +x "$root/bin/mcode-watch.sh"
+      ;;
+    hook)
+      # The event path's stub. Writes BOTH a marker line and a line on stdout:
+      # the marker proves the watcher ran, and the stdout line is what the
+      # per-pane LOG is asserted on, so "output went to a file" is checked by
+      # looking at the file rather than by inferring it from the absence of
+      # output somewhere else.
+      #
+      # It stays alive. The idempotency assertion depends on the first watcher
+      # still running when the second event arrives - a stub that exited
+      # immediately would make every "a second trigger starts nothing" test pass
+      # for the wrong reason, because the first lock would already look dead.
+      cat >"$root/bin/mcode-watch.sh" <<'STUB'
+#!/bin/sh
+echo "ran $1" >>"$(dirname -- "$0")/../watcher-ran"
+echo "mcode-watch: watching $1"
+sleep 30
 STUB
       chmod +x "$root/bin/mcode-watch.sh"
       ;;
@@ -1117,19 +1216,24 @@ case_23() {
   : >"$FAKE_HERDR_LOG"
   run_entrypoint_at "$copy"
   assert_rc_zero "$RC"
-  # Waited for the count to REACH 2, not for the file to exist: the file already
-  # holds the first launch's line, so a file-presence poll returns instantly and
-  # the second launch's watcher is counted as the first's.
-  wait_for_count "$root/watcher-ran" 2 1000 || true
-  # Two launches, two panes, two watchers: one each. Not a duplicate on one pane
-  # (case 22's job) and not a shared one polling both (which would make the
-  # second pane's state depend on the first).
-  local total
-  total="$(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)"
-  if [ "${total:-0}" -ne 2 ]; then
-    note "two launches started the watcher ${total:-0} time(s); it must be 2," \
-         "one per pane (was ${after_first:-0} after the first launch)"
-  fi
+  # ONE watcher, not two — and this expectation was WRONG until #84.
+  #
+  # What this case always claimed to test was "two launches, two panes, two
+  # watchers: one each". It could not test that, because tests/fake-herdr serves
+  # the captured pane-split.json for every split, so BOTH launches register the
+  # SAME new pane (wZ:p8). CLAUDE.md is explicit that the split's pane id is the
+  # one value that must never be faked, so the two-pane case cannot be modelled
+  # on this path at all — and the assertion was passing for a reason unrelated
+  # to its stated intent.
+  #
+  # What it actually exercised was one pane launched twice, expecting two
+  # watchers. Issue #84 makes that the opposite of the contract: a pane gets
+  # exactly one watcher however it was launched, and a second trigger starts
+  # nothing. So the expectation is corrected rather than the stub faked, and the
+  # genuinely-two-panes property is asserted in case_38, where the pane id comes
+  # from an event payload and a test may legitimately choose it.
+  assert_one_watcher "$root/watcher-ran" \
+    "two launches of the SAME pane (was ${after_first:-0} after the first)"
   assert_log_exactly "$(expected_sequence "$SRC_PANE" "$CASE_DIR/bin/mcode" yes full)"
 }
 
@@ -1409,7 +1513,412 @@ run_case() { # run_case <name> <function>
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29)
+# ===========================================================================
+# Issue #84 — a watcher for EVERY minimax-code pane, not just action-launched
+# ones, with logs that are not /dev/null.
+#
+# The defect being pinned: the watcher only ever started from cmd_start's step
+# 10, so a pane adopted by flock, a hand-run `mcode`, or a pane from before
+# 0.4.1 kept whatever state herdr last saw — frozen, and frozen in both
+# directions. Every case below drives the manifest's EVENT subcommand, which is
+# the path that reaches those panes.
+# ===========================================================================
+
+# The pane these cases pretend flock adopted. Deliberately NOT the pane id the
+# launch path produces: if the event handler only worked on panes cmd_start had
+# just created, these cases would pass without testing the fix at all.
+ADOPTED_PANE="wZ:p42"
+
+case_30() { # #84: an adopted pane gets a watcher even though we never launched it
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  # setup_case defaults this to 0 so no case spawns a detached process by
+  # accident, and the event path honours that opt-out exactly as the launch path
+  # does. These cases are about the opt-out being ON.
+  export MCODE_WATCH_AUTOSTART=1
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the event handler did not start a watcher for an adopted minimax-code" \
+         "pane. This is issue #84 itself: without a watcher, ${ADOPTED_PANE} shows" \
+         "whatever state herdr last saw and never moves again."
+    return
+  fi
+  # For the RIGHT pane. A watcher started for some other pane - the launch path's
+  # pane, or nothing at all - would also produce a marker file.
+  if ! grep -qF "$ADOPTED_PANE" "$root/watcher-ran"; then
+    note "a watcher started, but not for ${ADOPTED_PANE};" \
+         "the event payload's pane id is the one that must be watched."
+    sed 's/^/          /' "$root/watcher-ran"
+  fi
+  # Once, for one event.
+  assert_one_watcher "$root/watcher-ran" "one event for one pane"
+}
+
+case_31() { # #84: a second trigger for a pane with a LIVE watcher starts nothing
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  # setup_case defaults this to 0 so no case spawns a detached process by
+  # accident, and the event path honours that opt-out exactly as the launch path
+  # does. These cases are about the opt-out being ON.
+  export MCODE_WATCH_AUTOSTART=1
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the first event did not start a watcher, so this case would pass" \
+         "vacuously against an implementation that never starts one"
+    return
+  fi
+  # The first watcher sleeps 30s in the hook stub, so it is provably still
+  # alive here. Assert that, because the whole case rests on it: if it were
+  # dead, "a second trigger started nothing" would be true for the wrong reason.
+  local first_pid
+  first_pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
+  if [ -z "$first_pid" ] || ! kill -0 "$first_pid" 2>/dev/null; then
+    note "the first watcher is not recorded as running (pid='${first_pid}')," \
+         "so the idempotency assertion below would be vacuous"
+    return
+  fi
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  # A second event while the watcher lives. This is not hypothetical: the hook
+  # fires on the watcher's OWN first report, so in production this happens on
+  # every single transition.
+  #
+  # CONTROL, and it has to be a control rather than a wait: "still one line" is
+  # what a correctly-idempotent implementation produces AND what a stub that
+  # records nothing at all would produce. Those are opposite findings wearing the
+  # same output, so before concluding "started nothing", confirm the first line
+  # really was written by this stub for this pane.
+  if ! grep -qF "$ADOPTED_PANE" "$root/watcher-ran" 2>/dev/null; then
+    note "control: the marker holds no record of ${ADOPTED_PANE}, so 'a second" \
+         "trigger started nothing' would be indistinguishable from a stub that" \
+         "never records anything"
+    return
+  fi
+  assert_one_watcher "$root/watcher-ran" \
+    "two events for one pane whose watcher is still alive"
+  # The original watcher must be the one still running, not a replacement.
+  local now_pid
+  now_pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
+  if [ "$now_pid" != "$first_pid" ]; then
+    note "the recorded watcher pid changed from '${first_pid}' to '${now_pid}';" \
+         "a second trigger must not replace a live watcher"
+  fi
+}
+
+case_32() { # #84: an event about someone else's agent starts nothing at all
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+
+  # Measured on herdr 0.9.3: this hook fires for agents this plugin has never
+  # launched. A `claude` pane in the same session triggers it exactly as
+  # reliably as one of ours does, so "do not act on it" has to be a real branch
+  # and not an assumption about who is subscribing.
+  #
+  # The opt-out is explicitly ON here, and that is load-bearing rather than
+  # incidental. With the sandbox's default the handler would stop at the opt-out
+  # before reaching the scope gate at all, so removing the gate would change
+  # nothing and this case would pass against an implementation that watches
+  # every agent in the session. Asking for a watcher is what makes the gate the
+  # only thing that can stop one.
+  export MCODE_WATCH_AUTOSTART=1
+  run_event_handler_at "$copy" "wZ:p99" "claude"
+  assert_rc_zero "$RC"
+
+  if [ -e "$root/watcher-ran" ]; then
+    note "the event handler started a watcher for a 'claude' pane. The event is" \
+         "session-wide; acting on it would have this plugin polling panes it" \
+         "does not own."
+    sed 's/^/          /' "$root/watcher-ran"
+  fi
+  # The scope gate must come BEFORE any herdr call. Not tidiness: `agent get`
+  # per foreign status change is this plugin adding load to a session it has no
+  # business in, on every agent transition in it.
+  if [ -s "$FAKE_HERDR_LOG" ]; then
+    note "the handler made herdr calls for an agent that is not ours, before or" \
+         "instead of scoping the event out"
+    sed 's/^/          /' "$FAKE_HERDR_LOG"
+  fi
+}
+
+case_33() { # #84: the watcher's output goes to a per-pane log, not /dev/null
+  setup_case
+  local copy root logf
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  logf="$MCODE_WATCH_LOG_DIR/$ADOPTED_PANE.log"
+  # See case_30: setup_case defaults the opt-out ON and the event path honours
+  # it, so a case about a watcher existing has to ask for one.
+  export MCODE_WATCH_AUTOSTART=1
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "no watcher ran, so there is no output to have been logged"
+    return
+  fi
+
+  # The defect in the issue: output went to /dev/null, so a watcher that died
+  # left no trace. The marker is written by the stub's own redirect and would
+  # appear even with stdout discarded, so the log has to be checked directly.
+  if ! wait_for_file "$logf" 1000; then
+    note "the watcher ran but ${logf} does not exist; its output went nowhere" \
+         "discoverable, which is the /dev/null defect #84 was filed about"
+    return
+  fi
+  if ! wait_for_file_content "$logf" "mcode-watch: watching" 1000; then
+    note "the per-pane log exists but does not contain what the WATCHER printed;" \
+         "a log file the watcher never writes to is no better than /dev/null." \
+         "The needle is the stub's own line, not the word 'watching' — the" \
+         "launcher's header line also says 'watching pane', and matching that" \
+         "would pass against a watcher whose every byte is discarded."
+    sed 's/^/          /' "$logf"
+  fi
+  # A header naming the pane, so a user with six of these can tell them apart.
+  if ! grep -qF "$ADOPTED_PANE" "$logf"; then
+    note "the log never names the pane it belongs to, so it cannot be matched" \
+         "to a pane in \`herdr agent list\`"
+  fi
+  # Named after the pane, not a shared file: a shared log would interleave six
+  # watchers' output into one unreadable stream.
+  if [ -e "$MCODE_WATCH_LOG_DIR/all.log" ] || [ -e "$MCODE_WATCH_LOG_DIR/mcode-watch.log" ]; then
+    note "the watcher log is a shared file; per-pane logs are what make the" \
+         "output attributable"
+  fi
+}
+
+case_34() { # #84: a DEAD watcher's lock is reclaimed, not a permanent block
+  setup_case
+  local copy root pid
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  # See case_30: the opt-out defaults ON in the sandbox and the event path
+  # honours it, so this case has to ask for a watcher explicitly.
+  export MCODE_WATCH_AUTOSTART=1
+
+  # A lock left behind by a watcher that is gone: the pane closed, the machine
+  # rebooted, the process was killed. This is the ordinary way locks go stale,
+  # and the failure it causes is the worst one in this file - a pane that can
+  # NEVER get a watcher again, with no error anywhere, because the handler
+  # reports it already has one.
+  mkdir -p "$MCODE_WATCH_LOG_DIR/lock"
+  # 4194304 is above the default pid_max on both platforms in scope, so this
+  # cannot accidentally be a live process.
+  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid"
+  if kill -0 4194304 2>/dev/null; then
+    note "control: pid 4194304 is unexpectedly alive on this machine, so the" \
+         "stale-lock setup does not model a dead watcher"
+    return
+  fi
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "a stale lock from a dead watcher permanently blocked a new watcher for" \
+         "${ADOPTED_PANE}; the pane's state is frozen forever with no error"
+    return
+  fi
+  # The new watcher, not the stale pid.
+  pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
+  if [ "$pid" = "4194304" ]; then
+    note "the lock still records the dead pid, so the next trigger will also" \
+         "decline and this pane can never be watched again"
+  fi
+}
+
+case_35() { # #84: the launch path and the event path together start ONE watcher
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+
+  # The launch path first, exactly as the action does it.
+  run_entrypoint_at "$copy"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the launch path started no watcher, so the cross-path assertion below" \
+         "would pass vacuously"
+    return
+  fi
+
+  # Now the event hook fires for that same pane. In production this is not a
+  # hypothetical ordering: cmd_start's step 7 registers the pane, and that
+  # registration is itself a `pane report-agent`, which is exactly what the hook
+  # subscribes to. Without a shared lock the pane gets two watchers polling it.
+  run_event_handler_at "$copy" "wZ:p8" "mcode"
+  assert_rc_zero "$RC"
+
+  assert_one_watcher "$root/watcher-ran" \
+    "a launch plus an event for the same pane"
+}
+
+case_36() { # #84: the event handler refuses a payload with no usable pane id
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+
+  # The pane id is used to build a filesystem path and to name a process, and it
+  # arrives from a JSON payload — which is data, not a trusted argument. A value
+  # carrying a path separator is the one that would actually do damage.
+  run_event_handler_at "$copy" "wZ:p42/../../etc" "minimax-code"
+  assert_rc_nonzero "$RC"
+  if [ -e "$root/watcher-ran" ]; then
+    note "a watcher was started for a pane id containing a path separator," \
+         "from an untrusted event payload"
+    sed 's/^/          /' "$root/watcher-ran"
+  fi
+  # And it must say why, rather than exiting non-zero in silence.
+  assert_stderr_nonempty
+  if ! grep -qiF "pane id" "$STDERR_FILE"; then
+    note "the refusal does not explain that the pane id was the problem"
+  fi
+}
+
+case_37() { # #84: the manifest really declares the hook, in the dotted vocabulary
+  # A manifest entry that parses is not a working hook — that conflation is the
+  # Epic 1 defect, and it is invisible to every other case here because they all
+  # invoke the entrypoint directly and never consult the manifest.
+  setup_case
+  local manifest="$repo/herdr-plugin.toml"
+
+  if [ ! -f "$manifest" ]; then
+    note "no manifest at $manifest"
+    return
+  fi
+  # The underscored spelling parses and warns at runtime; only the dotted
+  # subscription vocabulary binds. A grep for `pane.agent_status_changed`
+  # would not catch `pane_agent_status_changed`, so both are checked.
+  if ! grep -q 'on[[:space:]]*=[[:space:]]*"pane\.agent_status_changed"' "$manifest"; then
+    note "the manifest does not subscribe to pane.agent_status_changed; without" \
+         "it the event handler is unreachable and every #84 case above tests" \
+         "a code path herdr will never run"
+    return
+  fi
+  if grep -q 'on[[:space:]]*=[[:space:]]*"pane_agent_status_changed"' "$manifest"; then
+    note "the manifest subscribes with the UNDERSCORED event name, which herdr" \
+         "accepts as a parse and then warns about at runtime"
+  fi
+  # And it must name the subcommand this suite just tested, or the manifest and
+  # the code disagree about what the hook runs.
+  # The inner quotes are TOML-escaped on disk (mcode-plugin.sh\" ensure-watcher),
+  # so the pattern has to tolerate the backslash. Matching the unescaped form
+  # would report a correct manifest as missing its handler.
+  if ! grep -q 'mcode-plugin\.sh\\\" ensure-watcher' "$manifest"; then
+    note "the event hook does not invoke \`mcode-plugin.sh ensure-watcher\`, so" \
+         "the handler the cases above exercise is not the one herdr would run"
+  fi
+}
+
+case_38() { # #84: the lock is PER PANE, not per session
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+
+  # The property case_23 could not test, asserted where it CAN be tested: the
+  # event path takes its pane id from the payload, so a test may legitimately
+  # choose it, and two distinct ids are two distinct panes as far as the handler
+  # is concerned.
+  #
+  # This is the half of "exactly one watcher per pane" that a session-wide lock
+  # would silently break. With one lock for the whole session, the first pane's
+  # watcher would suppress every other pane's forever - which looks like the
+  # idempotency working, and leaves panes 2..N frozen exactly as #84 describes.
+  run_event_handler_at "$copy" "wZ:p42" "minimax-code"
+  run_event_handler_at "$copy" "wZ:p43" "mcode"
+
+  if ! wait_for_count "$root/watcher-ran" 2 1500; then
+    note "two distinct panes produced $(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)" \
+         "watcher(s); each pane needs its own, or every pane after the first is" \
+         "frozen with no error anywhere"
+    sed 's/^/          /' "$root/watcher-ran"
+    return
+  fi
+  # Each pane watched by its own watcher, not one of them watched twice.
+  if ! grep -qF "wZ:p42" "$root/watcher-ran"; then
+    note "no watcher was started for wZ:p42"
+  fi
+  if ! grep -qF "wZ:p43" "$root/watcher-ran"; then
+    note "no watcher was started for wZ:p43"
+  fi
+  local total
+  total="$(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)"
+  if [ "${total:-0}" -ne 2 ]; then
+    note "two panes started ${total:-0} watchers; it must be exactly 2"
+  fi
+  # Two locks, not one: this is the mechanical check behind the assertion above.
+  local locks
+  locks="$(find "$MCODE_WATCH_LOG_DIR/lock" -name '*.pid' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${locks:-0}" -ne 2 ]; then
+    note "expected one lock per pane (2), found ${locks:-0}; a shared lock would" \
+         "make this 1 and would suppress the second pane's watcher permanently"
+  fi
+}
+
+case_39() { # #84: dead lock files are pruned, so the state dir does not grow forever
+  setup_case
+  local copy root
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+
+  # Reclaiming the lock on the pane you are watching is not the same thing as
+  # clearing the locks of panes you are not. Every closed pane otherwise leaves
+  # a file behind, and the state dir grows by one entry per pane the user has
+  # ever watched, forever.
+  #
+  # This case exists because that pruning was silently broken and NO other case
+  # noticed: a stale, directory-based copy of the prune function was left behind
+  # when the lock moved from a directory to a file, and in bash the LAST
+  # definition wins, so the dead one was the live one. It iterated directories
+  # (`[ -d "$d" ] || continue`) when the lock is a file, so it skipped
+  # everything and removed nothing — while calling a function that no longer
+  # existed. Every other case stayed green.
+  mkdir -p "$MCODE_WATCH_LOG_DIR/lock"
+  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/wZ:p1.pid"   # dead, other pane
+  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/wZ:p2.pid"   # dead, other pane
+  mkdir -p "$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid"               # a live lock
+  printf '%s\n' "$$" >"$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid"
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "no watcher started, so the prune never had a chance to run"
+    return
+  fi
+  # Give the prune a moment; it runs before the spawn, so by now it has.
+  sleep 0.3
+
+  if [ -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p1.pid" ] || [ -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p2.pid" ]; then
+    note "dead lock files were not pruned; the state dir grows by one entry per" \
+         "pane the user has ever watched and nothing ever clears it"
+    ls "$MCODE_WATCH_LOG_DIR/lock" | sed 's/^/          /'
+  fi
+  # A LIVE lock must survive, or the prune is just a race that will eventually
+  # delete a running watcher's claim and let a second watcher start.
+  if [ ! -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid" ]; then
+    note "the prune removed a lock whose owner is alive; that is the opposite bug"
+  fi
+  # And the pane we are actually watching keeps its own.
+  if [ ! -e "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" ]; then
+    note "the pane that was just watched has no lock file"
+  fi
+}
+
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -1467,6 +1976,16 @@ for name in "${SELECTED[@]}"; do
     case-27) run_case case-27 case_27 ;;
     case-28) run_case case-28 case_28 ;;
     case-29) run_case case-29 case_29 ;;
+    case-30) run_case case-30 case_30 ;;
+    case-31) run_case case-31 case_31 ;;
+    case-32) run_case case-32 case_32 ;;
+    case-33) run_case case-33 case_33 ;;
+    case-34) run_case case-34 case_34 ;;
+    case-35) run_case case-35 case_35 ;;
+    case-36) run_case case-36 case_36 ;;
+    case-37) run_case case-37 case_37 ;;
+    case-38) run_case case-38 case_38 ;;
+    case-39) run_case case-39 case_39 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

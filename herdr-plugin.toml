@@ -26,66 +26,69 @@ contexts = ["workspace", "pane"]
 command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]
 
 # ---------------------------------------------------------------------------
-# There is deliberately NO [[events]] block. This is a decision, not an
-# oversight. Issue #41 asked for a `pane.agent_status_changed` hook; the
-# answer after measuring herdr 0.9.3 is that no hook is the correct amount of
-# hook. Four independent reasons, each sufficient on its own.
+# Lifecycle, NOT notification. Read this before adding a second event or
+# repurposing this one.
 #
-# 1. IT WOULD DUPLICATE A NOTIFICATION HERDR ALREADY SENDS.
-#    herdr has a native semantic notification system with two named categories
-#    in its own config (herdr --default-config, [ui.sound]):
-#        done_path     = "sounds/done.mp3"    # "overrides only finished notifications"
-#        request_path  = "sounds/request.mp3" # "overrides only needs-attention notifications"
-#    A notification on mcode becoming idle restates "finished". A notification
-#    on mcode becoming blocked restates "needs-attention". The user already
-#    gets both from herdr itself, so a plugin hook would be a second, noisier
-#    copy of a message they are already being sent.
+# Issue #41 asked for a `pane.agent_status_changed` hook to send a
+# NOTIFICATION, and the answer after measuring herdr 0.9.3 was no. That
+# decision was written down in this file with four reasons, and the block was
+# deleted by #84 - which is not a case of someone relitigating it, so here is
+# exactly what changed and what did not.
 #
-# 2. THE ONE NOTIFICATION HERDR *CANNOT* SEND HAS NOTHING TO FIRE ON.
-#    The signal herdr cannot infer for mcode is `blocked` - no screen
-#    detection manifest exists, so herdr never classifies mcode as needing
-#    attention on its own. But bin/mcode-watch.sh deliberately never reports
-#    `blocked` either: mcode runs at Full access in the environments this
-#    plugin targets, so no blocked screen has ever been captured and guessing
-#    one would be a lie. A blocked-notification hook would therefore never
-#    fire - a dead hook, which is the thing #41 exists to avoid.
+# WHAT #84 CHANGED. Reason 3 said the event is a mirror of this plugin's own
+# reporting: every pane that reports mcode state was launched by this plugin,
+# so a hook could only tell the plugin what the plugin had just told herdr.
+# That was true, and it stopped being true. `pane.agent_status_changed` fires
+# for reporters this plugin does NOT own - flock's `adopt --agent minimax-code`
+# and a hand-run `mcode` in any pane. Issue #84 is the report: 6 minimax-code
+# panes in `herdr agent list`, zero watchers, states frozen in both directions.
+# Those panes need a watcher and nothing in this plugin was going to start one,
+# because this plugin never saw them.
 #
-# 3. THE EVENT IS A MIRROR OF THIS PLUGIN'S OWN REPORTING.
-#    `pane.agent_status_changed` fires when *someone* calls
-#    `pane report-agent`. Everything that reports mcode state is this plugin:
-#    bin/mcode-plugin.sh registers the pane as `idle` at launch,
-#    bin/mcode-session.sh attaches the session identity, and
-#    bin/mcode-watch.sh reports transitions. So a hook could only tell the
-#    plugin what the plugin had just told herdr. It carries no information the
-#    reporters lack, and it cannot replace the watcher's polling - the polling
-#    is what produces the event.
+# MEASURED, herdr 0.9.3, isolated throwaway instance (issue #84, in the PR):
+#   self-report via `--source flock:adopt`  -> hook FIRED, payload carries
+#                                              agent "minimax-code"
+#   state change by that reporter          -> hook FIRED
+#   our own `--source herdr:minimax-code`  -> hook FIRED
+#   control, agent "claude", unrelated src  -> hook FIRED
+#   three IDENTICAL re-reports of one state -> 0 extra events
+# That last line is the one that makes a hook safe here: the event fires on a
+# TRANSITION, not per report, so a watcher polling a steady pane does not
+# re-trigger the hook that started it.
 #
-# 4. THE HOOK IS SESSION-WIDE AND THE PLUGIN CANNOT SCOPE IT.
-#    Measured: a hook on `pane.agent_status_changed` fires for an agent this
-#    plugin never launched - a pane reported as `agent: "claude"` by an
-#    unrelated source triggered it. The reporters above do namespace themselves
-#    (bin/mcode-plugin.sh uses `--source herdr:minimax-code`, bin/mcode-session.sh
-#    defaults to `jaaacki.minimax-code` - two different namespaces, worth
-#    reconciling separately), but a namespace is NOT carried on the event. The
-#    payload is pane_id, workspace_id, agent_status and agent, and nothing else,
-#    so a handler cannot ask "did I report this?" - only "is the label the one I
-#    use?", which any other reporter can produce. Every notification this plugin
-#    emitted would be a claim about a pane it may not own.
+# WHAT #84 DID NOT CHANGE. Reasons 1, 2 and 4 were all about NOTIFICATIONS and
+# none of them is an argument against a lifecycle hook, which sends nothing to
+# anyone. They still stand, unchanged, and a notification hook must still not
+# be added on this reasoning:
+#   1. herdr already has semantic notifications (done_path / request_path in
+#      its own [ui.sound]); a second copy of "finished" is noise.
+#   2. the signal herdr cannot infer for mcode is `blocked`, and
+#      bin/mcode-watch.sh deliberately never reports it - no blocked screen has
+#      ever been captured, so the hook would be a dead hook.
+#   4. the hook is session-wide. STILL TRUE, and still handled rather than
+#      waved at: the event carries no `--source`, so a handler cannot ask "did I
+#      report this?". It CAN ask "is the agent label mine?", and that is what
+#      `ensure-watcher` gates on before it does anything. A `claude` pane is
+#      named in the payload and is left alone.
 #
-# WHAT WOULD CHANGE THIS DECISION. If mcode ever grows a screen shape that
-# means "waiting on the user" (a permission prompt, a question), the watcher
-# can classify it, `blocked` becomes real, and reason 2 stops applying - a
-# notification there would be a capability herdr genuinely cannot supply.
-# That is the case worth building for, and it needs an mcode snapshot first.
+# WHY A HOOK RATHER THAN THE SUPERVISOR #84 allowed. #84 permits a singleton
+# supervisor "if the event does not fire for a self-reported registration". It
+# does fire - see the measurement above - so the supervisor is not needed, and
+# a daemon is a strictly worse answer: PID bookkeeping, reaping and an orphan
+# sweep, to learn a fact herdr will simply hand us.
 #
-# IF YOU ADD AN [[events]] BLOCK ANYWAY - the two gates, both required:
-#   a) `herdr plugin list --json` shows an EMPTY `.warnings` array for this
-#      plugin. The field is `warnings`, PLURAL - querying `.warning` returns
-#      nothing and looks like "no warnings" for a hook that does not exist.
-#      A misspelled event name warns: e.g. `pane_agent_status_changed`
-#      (underscored) yields ["unknown event 'pane_agent_status_changed'"].
-#      Only the dotted subscription vocabulary binds.
-#   b) The hook is proven to RUN against a real event. A manifest entry that
-#      parses is not a working hook; that conflation is the Epic 1 defect.
-# See issue #41 for the measurements behind every claim above.
+# THE TWO GATES FROM #41, BOTH NOW SATISFIED. Kept because they are the reason
+# this block is trustworthy at all:
+#   a) `herdr plugin list --json` shows NO `warnings` for this plugin. The field
+#      is `warnings`, PLURAL - querying `.warning` returns nothing and looks
+#      like "no warnings" for a hook that does not exist. A misspelled event
+#      name warns, e.g. the underscored `pane_agent_status_changed`. Only the
+#      dotted subscription vocabulary binds.
+#   b) The hook is PROVEN TO RUN against a real event. A manifest entry that
+#      parses is not a working hook; that conflation is the Epic 1 defect. The
+#      measurement above is gate (b) - the payload lines are real captured
+#      output, not a manifest that loaded cleanly.
 # ---------------------------------------------------------------------------
+[[events]]
+on = "pane.agent_status_changed"
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" ensure-watcher"]

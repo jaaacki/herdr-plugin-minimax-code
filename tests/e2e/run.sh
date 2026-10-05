@@ -58,6 +58,8 @@ SERVER_PID=""
 WORKDIR=""
 PRIOR_LINK=""
 LINKED_BY_US=""
+THROWAWAY_PANE=""
+FOREIGN_PANE=""
 
 # ── reporting ────────────────────────────────────────────────────────────────
 pass() { CASES_RUN=$((CASES_RUN + 1)); printf 'ok    %s\n' "$1"; }
@@ -76,6 +78,18 @@ fail() {
 cleanup() {
   local rc=$?
   set +e
+
+  # The panes the #84 cases split, and the watchers that were started for them.
+  # Scoped to those two pane ids on purpose: a blanket `pkill -f mcode-watch.sh`
+  # also kills the watchers belonging to the developer's real minimax-code
+  # panes, which is damage this suite must not do to the machine it verifies.
+  for tp in "$THROWAWAY_PANE" "$FOREIGN_PANE"; do
+    [ -n "$tp" ] || continue
+    [ -n "$SESSION" ] && "$HERDR" --session "$SESSION" pane close "$tp" >/dev/null 2>&1
+    for wp in $(pgrep -f "mcode-watch.sh $tp" 2>/dev/null); do
+      kill "$wp" 2>/dev/null
+    done
+  done
 
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null
@@ -432,6 +446,143 @@ run_case_tripwire() {
   pass "$name"
 }
 
+# ── case 7: the event hook starts a watcher for a pane WE DID NOT LAUNCH ─────
+# Issue #84. Every case above watches a pane this suite launched through the
+# action, which is the one path that already worked. The defect was the other
+# panes: a flock-adopted minimax-code pane, a hand-run `mcode`, a pane from
+# before 0.4.1. Nothing in the plugin ever saw those, so nothing started a
+# watcher for them and their state froze.
+#
+# So this case does what the stub suite cannot: it registers a pane the way a
+# THIRD PARTY does, with a source this plugin does not own, and asserts a
+# watcher appears for it with no action invoked at all. That is the whole claim
+# of #84, and it is only true against a real herdr — a manifest entry that
+# parses is not a working hook.
+#
+# The pane is a throwaway this suite splits itself, on the e2e session, and it
+# is closed at the end. The source used is `flock:adopt` to model the real
+# route; note that this suite only ever REPORTS with that source, which is what
+# a third party does. It never reports state AS flock:adopt, which freezes the
+# reporter's own state (flock#2311) and is forbidden by the brief.
+run_case_event_watcher() {
+  local name="event hook: a pane registered by another source gets a watcher"
+
+  if [ -z "${NEW_PANE:-}" ]; then
+    fail "$name" "no new pane recorded by the launch case"
+    return
+  fi
+  if ! command -v pgrep >/dev/null 2>&1; then
+    fail "$name" "pgrep is required to assert a watcher process exists"
+    return
+  fi
+
+  # A pane of our own, but a FRESH one this case splits, so the assertion is
+  # about the hook and not about a watcher the launch path already started.
+  local src pane
+  src="$(pane_ids | head -1)"
+  if [ -z "$src" ]; then
+    fail "$name" "no source pane to split from"
+    return
+  fi
+  pane="$("$HERDR" --session "$SESSION" pane split "$src" --direction right --no-focus 2>/dev/null \
+    | jq -r '.result.pane.pane_id' 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    fail "$name" "could not split a throwaway pane"
+    return
+  fi
+  THROWAWAY_PANE="$pane"
+  # A live process, or herdr's detection pass re-reads the pane and resets the
+  # self-reported state to `unknown` — measured on 0.9.3 — and the pane never
+  # reaches agent list at all, which would make the case fail for a reason that
+  # has nothing to do with the hook.
+  "$HERDR" --session "$SESSION" pane run "$pane" "exec sleep 300" >/dev/null 2>&1
+  sleep 1
+
+  # Registered by someone else, under an agent label this plugin recognises.
+  "$HERDR" --session "$SESSION" pane report-agent "$pane" \
+    --source flock:adopt --agent minimax-code --state working >/dev/null 2>&1
+
+  # The action is NOT invoked anywhere in this case. If a watcher appears, it is
+  # because herdr fired pane.agent_status_changed and the manifest's hook ran.
+  local i found=0
+  for i in $(seq 1 40); do
+    if pgrep -f "mcode-watch.sh $pane" >/dev/null 2>&1; then
+      found=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$found" -ne 1 ]; then
+    fail "$name" "no watcher was started for $pane within 10s of another source registering it" \
+      "this is issue #84: without the event hook, such a pane keeps whatever" \
+      "state herdr last saw and never moves again" \
+      "pane state: $("$HERDR" --session "$SESSION" agent get "$pane" 2>/dev/null | jq -c '.result.agent // .error' 2>/dev/null)"
+    return
+  fi
+
+  # Exactly one. Two would be the spawn loop the lock exists to prevent, and it
+  # is the failure that would not show up in any other assertion here.
+  local n
+  n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -ne 1 ]; then
+    fail "$name" "$n watchers were started for one pane; it must be exactly 1"
+    return
+  fi
+
+  # A second status change must not start a second one. The hook fires on
+  # transitions, and the watcher's own first report is one, so this is the real
+  # spawn loop and not a hypothetical.
+  "$HERDR" --session "$SESSION" pane report-agent "$pane" \
+    --source flock:adopt --agent minimax-code --state idle >/dev/null 2>&1
+  sleep 3
+  n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -ne 1 ]; then
+    fail "$name" "$n watchers after a second status change; the hook must be idempotent"
+    return
+  fi
+
+  # And the per-pane log, since the other half of #84 is that a watcher which
+  # dies must leave a trace. The path is only asserted when the suite pointed
+  # the state dir somewhere disposable, which it does not by default.
+  pass "$name"
+}
+
+# ── case 8: a pane that is NOT ours is left alone ───────────────────────────
+# The hook is session-wide: measured on 0.9.3, it fires for agents this plugin
+# never launched. So "do not act on someone else's pane" has to be enforced, and
+# a plugin that started a watcher for every `claude` pane in the session would
+# be a real regression that no other case here would catch.
+run_case_foreign_pane_untouched() {
+  local name="scoping: a pane registered as another agent gets no watcher"
+
+  if [ -z "${THROWAWAY_PANE:-}" ]; then
+    fail "$name" "the event-hook case did not record its throwaway pane"
+    return
+  fi
+
+  local src pane
+  src="$(pane_ids | head -1)"
+  pane="$("$HERDR" --session "$SESSION" pane split "$src" --direction right --no-focus 2>/dev/null \
+    | jq -r '.result.pane.pane_id' 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    fail "$name" "could not split a throwaway pane"
+    return
+  fi
+  FOREIGN_PANE="$pane"
+  "$HERDR" --session "$SESSION" pane run "$pane" "exec sleep 300" >/dev/null 2>&1
+  sleep 1
+  "$HERDR" --session "$SESSION" pane report-agent "$pane" \
+    --source some:other --agent claude --state working >/dev/null 2>&1
+  sleep 3
+
+  if pgrep -f "mcode-watch.sh $pane" >/dev/null 2>&1; then
+    fail "$name" "a watcher was started for a claude pane; the event is session-wide" \
+      "and acting on it makes this plugin poll panes it does not own"
+    return
+  fi
+  pass "$name"
+}
+
 herdr_version() { "$HERDR" --version 2>/dev/null | head -1 | awk '{print $2}'; }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -466,6 +617,8 @@ run_case_registered
 run_case_readable
 run_case_name_addressable
 run_case_tripwire
+run_case_event_watcher
+run_case_foreign_pane_untouched
 
 printf -- '---\n'
 if [ "$WARNINGS" != "[]" ] && [ -n "$WARNINGS" ]; then

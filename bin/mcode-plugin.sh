@@ -127,49 +127,302 @@ resolve_source_pane() {
   printf '%s\n' "$pane"
 }
 
-# WHY THIS PRINTS A COMMAND INSTEAD OF STARTING THE WATCHER (issue #47).
+# ---------------------------------------------------------------------------
+# THE SINGLE WATCHER SPAWN PATH (issue #84).
 #
-# Issue #47 asked for `bin/mcode-watch.sh <pane>` to be running after every
-# launch, and explicitly invited the alternative. The alternative won, on
-# evidence, not on effort:
+# Everything that can start a watcher goes through `ensure_watcher`: the
+# launcher's autostart AND the manifest's `pane.agent_status_changed` event
+# hook. One function, one lock, one place that can fail. That is deliberate and
+# it is the whole reason a pane cannot end up with two watchers: "exactly one"
+# is a property of the code's shape, not of two independent call sites happening
+# to agree. When the event hook landed, the launcher would otherwise have had
+# its own spawn (step 10) racing a hook that had already started one for the
+# very same pane.
+
+# Per-pane log root, printed for the user. Under herdr's plugin state dir when
+# there is one, which is where a plugin's own state belongs and where herdr
+# expects to find it.
 #
-#   1. The watcher's own exit path deletes the thing we just created.
-#      mcode-watch.sh calls `pane release-agent` from its INT/TERM/EXIT traps
-#      and when the watched pane dies, and `release-agent` REMOVES the agent
-#      entry - measured and reproduced live (register + rename, run one
-#      `mcode-watch.sh --once`, and the entry is gone from `agent list`).
-#      Auto-starting it would unregister every pane it watched the moment that
-#      pane closed or the operator hit Ctrl-C. That is worse than the stale
-#      `idle` claim, because a missing registration also costs `get`, `read`,
-#      `wait` and the name. The defect is in bin/mcode-watch.sh, not here, so
-#      wiring the watcher before that is fixed means shipping a known bug and
-#      calling it a feature.
+# Resolution order, and why each fallback exists:
+#   1. MCODE_WATCH_LOG_DIR  an explicit override, so a test can point the logs
+#                          somewhere disposable. Never consulted from the
+#                          event path in normal use.
+#   2. HERDR_PLUGIN_STATE_DIR   injected by herdr for actions AND for event
+#                          handlers - measured, both. It resolves to
+#                          ~/.local/state/herdr/plugins/<plugin-id>.
+#   3. ${TMPDIR:-/tmp}/minimax-code-state   hand-run. Falling back to /dev/null
+#                          is what issue #84 is about, and it is why a watcher
+#                          that died left no trace.
+watch_log_dir() {
+  if [ -n "${MCODE_WATCH_LOG_DIR:-}" ]; then
+    printf '%s\n' "$MCODE_WATCH_LOG_DIR"
+    return 0
+  fi
+  if [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
+    printf '%s/watch\n' "$HERDR_PLUGIN_STATE_DIR"
+    return 0
+  fi
+  printf '%s/minimax-code-state/watch\n' "${TMPDIR:-/tmp}"
+}
+
+# Cap the per-pane log. A watcher that runs for a week at 2s intervals writing
+# one line per transition is not large, but "not large" is a property of the
+# traffic, not of the file, and the cost of being wrong is a silently
+# unreadable multi-gigabyte file in the user's state dir. Truncate to the last
+# 200 KiB once it passes 1 MiB. Best-effort throughout: a log that cannot be
+# rotated is a nuisance, never a reason to skip starting the watcher.
+trim_log() { # trim_log <path>
+  local path="$1" size
+  [ -f "$path" ] || return 0
+  size="$(wc -c <"$path" 2>/dev/null || printf 0)"
+  [ "${size:-0}" -gt 1048576 ] || return 0
+  tail -c 204800 "$path" >"$path.trimmed" 2>/dev/null && mv -f "$path.trimmed" "$path" 2>/dev/null
+  rm -f "$path.trimmed" 2>/dev/null || true
+}
+
+# pane_lock_file - the per-pane lock: a single file holding the pid of whatever
+# is currently responsible for watching that pane.
 #
-#   2. A detached watcher has no honest way to learn that Herdr exited. The
-#      foreground design was precisely the answer to that: a watcher the human
-#      can see, and stop with Ctrl-C. Backgrounding it means inventing a
-#      supervisor - PID bookkeeping, reaping, an orphan sweep - to answer a
-#      question the foreground form already answers for free. That is a much
-#      larger change than this issue, in a file this member does not own.
+# A FILE, created with `set -C` (noclobber), not a directory created with mkdir.
+# Both are atomic "create or fail" primitives, and the file wins for a reason
+# that only showed up on a real machine: reclaiming a directory lock means
+# `rm -rf` on it, and `rm` is a program a user can replace. On the machine this
+# was developed on, `rm` is a shim that PRINTS ITS SUCCESS MESSAGE TO STDOUT -
+# so `lock="$(acquire_pane_lock ...)"` captured that message along with the
+# path, and every write to "$lock/pid" then went to a filename that did not
+# exist. The lock survived without a pid, which reads as "a start is in
+# progress", and the pane could never be watched again. Overwriting one small
+# file needs no delete at all, so no `rm` sits on the path that decides whether a
+# pane gets a watcher.
+pane_lock_file() { # pane_lock_file <pane-id>
+  printf '%s/lock/%s.pid\n' "$(watch_log_dir)" "$1"
+}
+
+# A pane id is used to build a PATH here, so it is validated rather than
+# trusted. Same shape rule cmd_start applies to a split response, and for the
+# same reason: these strings come from a JSON payload, and a payload is data.
+# `:` is legal in a POSIX filename; `/` is not, and that is the character that
+# would actually hurt.
+valid_pane_id() { # valid_pane_id <value>
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+    *:*)                   return 0 ;;
+    *)                     return 1 ;;
+  esac
+}
+
+# lock_owner_pid <lockfile> - print the pid recorded in the lock, or nothing.
+lock_owner_pid() { # lock_owner_pid <lockfile>
+  local pid
+  [ -f "$1" ] || return 1
+  pid="$(cat "$1" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$pid"
+}
+
+# pid_is_alive <pid>
+pid_is_alive() { # pid_is_alive <pid>
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$1" 2>/dev/null
+}
+
+# claim_pane_lock <pane-id> - succeed only if this process now owns the pane.
 #
-#   3. The actual harm #47 names - "the agent claims `idle` forever while it is
-#      working" - is fixed by the `--state unknown` change at the report-agent
-#      call, not by the watcher. With `unknown` there is no stale lie to
-#      prevent, so the missing watcher costs accuracy the user has to opt into,
-#      rather than accuracy the user was given and can trust.
+# Three-step protocol, and each step exists because the two before it were not
+# enough:
 #
-# So the watcher stays opt-in and discoverable: one line, on stderr, next to
-# the line that already says the pane started. The same failure policy as
-# registration applies - a hint that cannot be produced is a warning, and the
-# launch still exits 0, because the launch is what the user asked for and it
-# already worked.
-# WHY THE WATCHER IS STARTED NOW RATHER THAN ONLY SUGGESTED (issue #75).
+#   1. Create the lock with noclobber. Atomic: exactly one caller wins, and the
+#      winner is the one allowed to start a watcher.
+#   2. If it already exists, read the owner. A LIVE owner means someone is
+#      already doing the job - decline, and start nothing.
+#   3. If the owner is gone (or was never written), take it over by overwriting
+#      the pid, then READ IT BACK. The read-back is the part that makes takeover
+#      safe: two handlers can both see a dead owner and both write, so the write
+#      alone proves nothing. Whoever's pid is in the file afterwards is the
+#      winner, and the loser declines. Without this, "exactly one watcher" would
+#      hold only when two events never arrived at the same instant.
+#
+# On success the file holds the CLAIMING shell's pid for the moment between the
+# claim and the fork, so a second handler arriving in that window sees a live
+# pid and declines. The real watcher pid overwrites it immediately after.
+claim_pane_lock() { # claim_pane_lock <pane-id>
+  local pane="$1" lockfile owner
+  lockfile="$(pane_lock_file "$pane")"
+  mkdir -p "$(dirname -- "$lockfile")" 2>/dev/null || return 1
+
+  # Step 1. `$$` in a subshell is still this shell's pid, which is what we want
+  # recorded: it is a process that is definitely alive right now.
+  if ( set -C; printf '%s\n' "$$" >"$lockfile" ) 2>/dev/null; then
+    return 0
+  fi
+
+  # Step 2.
+  owner="$(lock_owner_pid "$lockfile" || true)"
+  if [ -n "$owner" ] && pid_is_alive "$owner"; then
+    return 1
+  fi
+
+  # Step 3. Nobody home, or a lock from a process that died without cleaning up.
+  printf '%s\n' "$$" >"$lockfile" 2>/dev/null || return 1
+  # Step 3b, the read-back that makes the takeover a contest rather than a
+  # race. An unreadable or unparseable file counts as NOT ours.
+  owner="$(lock_owner_pid "$lockfile" || true)"
+  [ "$owner" = "$$" ]
+}
+
+# Drop lock files whose watcher is gone. Without this a pane that closes leaves
+# its lock behind forever, and the state dir accumulates one file per pane the
+# user has ever watched. `rm -f` on a single file, so a replacement `rm` that
+# prints to stdout cannot corrupt anything here - nothing captures this output.
+prune_dead_locks() { # prune_dead_locks
+  local root f owner
+  root="$(watch_log_dir)"
+  root="${root%/watch}/lock"
+  [ -d "$root" ] || return 0
+  for f in "$root"/*.pid; do
+    [ -f "$f" ] || continue
+    owner="$(lock_owner_pid "$f" || true)"
+    if [ -z "$owner" ] || ! pid_is_alive "$owner"; then
+      rm -f "$f" 2>/dev/null || true
+    fi
+  done
+}
+
+# ensure_watcher - THE spawn path. Starts bin/mcode-watch.sh for a pane, at
+# most one watcher per pane, logging to a per-pane file.
+#
+#   ensure_watcher <pane-id> <agent-name> [log-line]
+#
+# The optional third argument is the one line the LAUNCH path prints to the
+# user's terminal. The event path passes none: it runs detached inside the herdr
+# server with nobody reading its stderr, so anything it printed there would be
+# lost - which is the same reason the watcher itself now writes to a file.
+#
+# Both names are passed for the reason documented at the old autostart call
+# site: MCODE_AGENT_LABEL is the knob the other two reporters read, and
+# MCODE_WATCH_AGENT is the watcher's own override. Passing only one of them is
+# a real defect, and only the SECOND pane reveals it - on pane one the chosen
+# name is the literal `mcode` and both spellings produce the same string.
+ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
+  local pane="$1" agent_name="$2" launch_line="${3:-}"
+  local dir watcher logdir log lock
+
+  if ! valid_pane_id "$pane"; then
+    [ -n "$launch_line" ] && log "minimax-code: refused to start a watcher for $(printf '%q' "$pane"): not a pane id."
+    return 0
+  fi
+
+  # Resolved from this script's own directory, NOT $HERDR_PLUGIN_ROOT: the env
+  # var is only injected when herdr runs an ACTION, so a hand-run of the
+  # entrypoint would resolve an empty string. The event hook does get it, but
+  # relying on that would make the two entry paths disagree for no reason.
+  #
+  # `..` because this file IS bin/mcode-plugin.sh, so its own directory is
+  # `bin/` and the watcher sits one level up. Getting this wrong yields
+  # <root>/bin/bin/mcode-watch.sh - short enough to look right and `-x`-false.
+  # `pwd -P` collapses the `..` and resolves symlinks.
+  #
+  # `|| true` matters under `set -e`: a failing `cd` in this substitution would
+  # abort the caller.
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
+  watcher="${dir}/bin/mcode-watch.sh"
+
+  if [ -z "$dir" ]; then
+    [ -n "$launch_line" ] && log "minimax-code: could not resolve this plugin's own directory, so the state watcher was not started and pane ${pane} will stay 'unknown' in \`herdr agent list\`. The launch itself succeeded."
+    return 0
+  fi
+  if [ ! -x "$watcher" ]; then
+    [ -n "$launch_line" ] && log "minimax-code: could not start the state watcher - ${watcher} is missing or not executable - so pane ${pane} will stay 'unknown' in \`herdr agent list\`. The launch itself succeeded."
+    return 0
+  fi
+  # Checked rather than assumed: this is a POSIX tool, but a stripped-down
+  # install may not carry it, and a missing nohup would produce a watcher that
+  # dies the moment this script exits - the worst failure mode, because it
+  # looks started.
+  if ! command -v nohup >/dev/null 2>&1; then
+    [ -n "$launch_line" ] && log "minimax-code: \`nohup\` is not on PATH, so the state watcher was not started and pane ${pane} will stay 'unknown'. Start it in another terminal to get real states: ${watcher} ${pane}. The launch itself succeeded."
+    return 0
+  fi
+
+  logdir="$(watch_log_dir)"
+  if ! mkdir -p "$logdir" 2>/dev/null; then
+    [ -n "$launch_line" ] && log "minimax-code: could not create ${logdir} for the state watcher's log, so pane ${pane}'s watcher output will be discarded. The watcher will still start. The launch itself succeeded."
+    logdir=""
+  fi
+  # /dev/null as the WHOLE path, not as a directory to append a filename to.
+  # "${logdir:-/dev/null}/${pane}.log" would expand to /dev/null/wZ:p1.log, whose
+  # redirect fails with ENOTDIR - so the watcher would never start at all, and
+  # the `2>/dev/null` on the append would hide the reason. A silent dead watcher
+  # is precisely the defect #84 is filed about.
+  if [ -n "$logdir" ]; then
+    log="${logdir}/${pane}.log"
+  else
+    log="/dev/null"
+  fi
+
+  # Prune OTHER panes' dead locks BEFORE taking this one, and take this one's
+  # before forking. Both orderings are load-bearing; see the comments on
+  # prune_dead_locks and claim_pane_lock.
+  prune_dead_locks
+
+  # The lock is claimed BEFORE anything is spawned and held by a live pid, so a
+  # second trigger for a pane that already has a live watcher starts nothing.
+  # This is the half of #84 that the event hook makes necessary: the hook fires
+  # on the watcher's own first report, so without this every state transition
+  # would double the watcher.
+  if ! claim_pane_lock "$pane"; then
+    [ -n "$launch_line" ] && log "minimax-code: pane ${pane} already has a state watcher, so none was started."
+    return 0
+  fi
+  local lockfile
+  lockfile="$(pane_lock_file "$pane")"
+
+  if [ -n "$logdir" ]; then
+    trim_log "$log"
+    printf -- '--- %s watching pane %s as agent %s (source %s) ---\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf 'unknown-time')" \
+      "$pane" "${agent_name:-mcode}" "${MCODE_AGENT_SOURCE:-herdr:minimax-code}" \
+      >>"$log" 2>/dev/null || true
+  fi
+
+  # WHY NOT /dev/null ANY MORE (issue #84). It was defended here on the grounds
+  # that herdr already records every transition, so a detached writer is
+  # "writing to a void". That was true about herdr's record and wrong about the
+  # failure this hid: with output discarded, a watcher that failed to start,
+  # died on its first poll, or was refused a report by herdr left NO trace at
+  # all, and the symptom the user sees is a frozen state with no way to tell a
+  # dead watcher from an idle pane. One file per pane, capped, named after the
+  # pane, is a diagnosable amount of state.
+  #
+  # `disown` detaches it from this shell's job table so the caller's own exit
+  # does not signal it. Harmless if it fails: nohup already ignores SIGHUP.
+  MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
+    nohup "$watcher" "$pane" >>"$log" 2>&1 &
+  local watcher_pid=$!
+  disown 2>/dev/null || true
+
+  # The lock now carries the WATCHER's pid rather than this shell's, so the next
+  # trigger asks the right question - is the watcher still running - instead of
+  # asking about a handler that exited microseconds ago and would read as dead.
+  printf '%s\n' "$watcher_pid" >"$lockfile" 2>/dev/null || true
+
+  if [ -n "$launch_line" ]; then
+    log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. Its log is ${log}. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
+  fi
+  return 0
+}
+
+# WHY THE WATCHER IS STARTED AT ALL NOW RATHER THAN ONLY SUGGESTED (issue #75).
 #
 # It was opt-in for a long time, and the opt-in nobody takes is the same as no
 # state tracking at all. Measured on this machine, 2026-10-04: `ps` found ZERO
 # mcode-watch.sh processes, so every state herdr displayed came from a one-time
-# adopt-time measurement and never moved again. That is the owner's report, and it
-# is the reason `working` stuck after a turn finished - the orange dot.
+# adopt-time measurement and never moved again. That is the owner's report, and
+# it is the reason `working` stuck after a turn finished - the orange dot.
 #
 # The original blocker is GONE. #47 refused to auto-start the watcher because it
 # called `pane release-agent` on every exit path, and that call DELETES the agent
@@ -184,6 +437,9 @@ resolve_source_pane() {
 #     sweep, to answer a question the watcher can answer for free: it already
 #     polls `pane get`, and when the pane is gone it exits 0 without reporting a
 #     state and without releasing anything. Verified in bin/mcode-watch.sh.
+#   * and after #84 there is a THIRD option that is better than both: herdr
+#     itself tells us when a pane has a minimax-code agent (see the
+#     [[events]] block in herdr-plugin.toml), so no polling loop has to guess.
 #
 # So lifetime is tied to the thing being watched rather than to a supervisor that
 # could itself outlive it or die silently.
@@ -191,87 +447,35 @@ resolve_source_pane() {
 # FAILURE POLICY, same asymmetry as every other step after the split: the launch
 # already worked and the user can see mcode running. Failing now would report a
 # success as a failure and could make a caller retry, spawning a second pane. So
-# every failure below is a warning and exit 0 - and the warning says what is lost,
-# because "state is not tracked" with no remedy is how this gets misdiagnosed.
+# every failure below is a warning and exit 0 - and the warning says what is
+# lost, because "state is not tracked" with no remedy is how this gets
+# misdiagnosed.
 watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
   local pane="$1" agent_name="$2"
-  local dir watcher
-
-  # Resolved from this script's own directory, NOT $HERDR_PLUGIN_ROOT: the env
-  # var is only injected when Herdr runs the action, so a hand-run of the
-  # entrypoint would resolve an empty string.
-  #
-  # `..` because this file IS the plugin's bin/mcode-plugin.sh, so its own
-  # directory is `bin/` and the watcher sits one level up. Getting this wrong
-  # yields <root>/bin/bin/mcode-watch.sh - short enough to look right, and
-  # `-x`-false. `pwd -P` collapses the `..` and resolves symlinks.
-  #
-  # `|| true` matters under `set -e`: a failing `cd` in this substitution would
-  # abort the launch *after* it succeeded, turning a cosmetic failure into a
-  # failed action.
-  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
-  watcher="${dir}/bin/mcode-watch.sh"
 
   # Opt-out, checked BEFORE anything else so it costs nothing and starts nothing.
   # Compared as the exact string "0" rather than "any non-empty value", so
   # MCODE_WATCH_AUTOSTART= (set but empty) keeps the default on - an empty value
   # reads as "not configured", and treating it as "off" would silently disable a
   # default the user never turned off.
+  #
+  # The event hook honours the same variable, with the honest caveat that the
+  # hook runs inside the herdr SERVER, so the value has to have been exported
+  # into the environment herdr was started from to reach it. A per-launch
+  # export will not. That is a property of the mechanism, not a bug to work
+  # around, and it is why this is an opt-out and not the default.
   if [ "${MCODE_WATCH_AUTOSTART:-1}" = "0" ]; then
+    local dir watcher
+    dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
+    watcher="${dir}/bin/mcode-watch.sh"
     log "minimax-code: state for pane ${pane} will NOT be tracked, because MCODE_WATCH_AUTOSTART=0. Until you start a watcher, \`herdr agent list\` will keep showing whatever state it last saw - which goes stale in BOTH directions when a turn starts or finishes. To start it by hand: ${watcher} ${pane}"
     return 0
   fi
 
-  if [ -z "$dir" ]; then
-    log "minimax-code: could not resolve this plugin's own directory, so the state watcher was not started and pane ${pane} will stay 'unknown' in \`herdr agent list\` - and 'unknown' is the only state this plugin can keep true without a watcher. The launch itself succeeded."
-    return 0
-  fi
-  if [ ! -x "$watcher" ]; then
-    log "minimax-code: could not start the state watcher - ${watcher} is missing or not executable - so pane ${pane} will stay 'unknown' in \`herdr agent list\`, and that state will NOT follow the pane as it works and idles. The launch itself succeeded."
-    return 0
-  fi
-  # Checked rather than assumed: this is a POSIX tool, but the plugin supports
-  # platforms where a stripped-down install may not carry it, and a missing
-  # nohup would otherwise produce a watcher that dies the moment this script
-  # exits - the worst failure mode, because it looks started.
-  if ! command -v nohup >/dev/null 2>&1; then
-    log "minimax-code: \`nohup\` is not on PATH, so the state watcher was not started and pane ${pane} will stay 'unknown'. Start it in another terminal to get real states: ${watcher} ${pane}. The launch itself succeeded."
-    return 0
-  fi
-
-  # WHY OUTPUT GOES TO /dev/null. The watcher's stdout and stderr are its own
-  # per-transition commentary, and herdr already records every state transition
-  # it reports - \`herdr agent list\` and the pane's own state history are the
-  # durable record. A detached process with no reader is writing to a void, and
-  # a log file would be state this plugin does not otherwise keep and would have
-  # to explain, rotate and clean up. If a transition is ever refused, the
-  # watcher says so on ITS stderr and continues, which is worth knowing about
-  # but not at the cost of an unowned file.
-  #
-  # `disown` detaches it from this shell's job table so the launch's own exit
-  # does not signal it. Harmless if it fails: nohup already ignores SIGHUP, so
-  # disown is belt-and-braces, and a non-interactive shell may legitimately have
-  # nothing to disown.
-  #
-  # BOTH NAMES, AND WHY. `MCODE_AGENT_LABEL` is this plugin's established label
-  # knob - it is what `mcode-session.sh` documents and reads - so it is the one
-  # that matters: a watcher (or anything replacing it) that knows only the
-  # documented var must still receive the name the launch chose. `MCODE_WATCH_AGENT`
-  # is passed alongside it as the watcher-specific override, and
-  # `mcode-watch.sh` prefers it, so the two can only disagree if someone
-  # deliberately points the watcher's label away from the session's.
-  #
-  # Either alone is a real defect, and the first pane hides it. Passing only
-  # `MCODE_WATCH_AGENT` looks correct on the very first launch, where the chosen
-  # name is the literal `mcode` and both spellings produce the same string; it
-  # only diverges on the second pane, when the name is `mcode-2` and anything
-  # reading the documented var gets an empty string and reports every state
-  # under an agent name that does not exist.
-  MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
-    nohup "$watcher" "$pane" >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-
-  log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
+  # The third argument is the only difference between the launch path and the
+  # event path, and it is a message rather than behaviour. See ensure_watcher.
+  ensure_watcher "$pane" "$agent_name" \
+    "launch"
 }
 
 # Register the pane's session identity and resume command (issue #79).
@@ -616,13 +820,124 @@ cmd_start() {
   watcher_autostart "$new_pane" "$agent_name"
 }
 
+# ---------------------------------------------------------------------------
+# THE EVENT PATH (issue #84): `pane.agent_status_changed` -> ensure a watcher.
+#
+# This is what fixes the defect. Before it, the only way a pane got a watcher was
+# step 10 of a launch THIS plugin performed, so a pane started by flock's
+# `adopt --agent minimax-code`, or by a human typing `mcode` into a pane, or
+# left over from before 0.4.1, kept whatever state herdr last saw - frozen, and
+# frozen in both directions, which is worse than no state at all because it looks
+# live.
+#
+# WHY THE EVENT REACHES THOSE PANES AT ALL. herdr fires this event whenever
+# `pane report-agent` is called by anyone, and it was MEASURED that it fires for
+# a registration this plugin did not make - including flock's, which is the
+# exact case #84 is about. See the [[events]] block in herdr-plugin.toml for the
+# captured payloads. The block comment that used to sit there argued this event
+# could only ever echo the plugin's own reporting back to it; that was true when
+# it was written and #84 is what made it false.
+
+# Is this event about a pane of ours?
+#
+# The event payload carries `agent` but NOT `--source`, so a handler cannot ask
+# "did I report this?". It can ask "is the label mine?", and for a LIFECYCLE
+# decision that is enough: the only thing done with the answer is "start a
+# watcher for this pane", and a pane labelled `claude` is not a pane this plugin
+# should be polling.
+#
+# Both spellings are accepted because both exist in the wild, and neither is a
+# typo: the launcher registers `--agent mcode`, and flock adopts with
+# `--agent minimax-code`. Matching only one of them would leave exactly the
+# panes #84 is filed about unwatched.
+#
+# A NAME the user typed is also accepted, because `agent rename` is what makes a
+# pane name-addressable and the name is a third string. It is matched as a
+# prefix on the mcode/mcode-N sequence, so `mcode-2` is ours and `mcodeish` is
+# not - the `-` is in the pattern rather than a loose `mcode*`.
+is_our_agent_label() { # is_our_agent_label <label>
+  case "${1:-}" in
+    minimax-code)   return 0 ;;
+    mcode)          return 0 ;;
+    mcode-[0-9]*)   return 0 ;;
+    *)              return 1 ;;
+  esac
+}
+
+# The agent's NAME - what `herdr agent get <name>` resolves - read back from
+# herdr rather than guessed.
+#
+# WHY IT HAS TO BE READ AND NOT ASSUMED. The launcher knows the name because it
+# chose it. This path does not: the event payload carries the agent LABEL and no
+# name, and on an adopted pane the name is whatever flock or the user decided.
+# Guessing `mcode` here would report every state under a name that pane may not
+# have, which is the exact defect CLAUDE.md records about the watcher being
+# hard-coded to `mcode`.
+#
+# Falls back to the event's own label when the read yields nothing - a pane that
+# is registered but unnamed is still worth watching, and reporting under the
+# label is the honest description of what we know.
+resolve_agent_name() { # resolve_agent_name <pane-id> <fallback-label>
+  local pane="$1" fallback="$2" name=""
+  name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"
+  if [ -n "$name" ]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  printf '%s\n' "$fallback"
+}
+
+cmd_ensure_watcher() {
+  local event_json="${HERDR_PLUGIN_EVENT_JSON:-}"
+  local pane agent
+
+  if [ -z "$event_json" ]; then
+    # Reachable by hand, and the diagnostic has to name the cause: this command
+    # is meaningless outside an event, and an empty pane id would otherwise
+    # silently do nothing at all.
+    die "\`ensure-watcher\` is the manifest's \`pane.agent_status_changed\` handler and needs HERDR_PLUGIN_EVENT_JSON. Run it through \`${HERDR} plugin action invoke\` or by hand with that variable set; there is nothing to do otherwise."
+  fi
+
+  pane="$(printf '%s' "$event_json" | json_field '.data.pane_id')"
+  if ! valid_pane_id "$pane"; then
+    # A pane id from a JSON payload is data, and this value is about to be used
+    # to build a path and to name a process. Refuse rather than coerce.
+    die "\`ensure-watcher\` got no usable pane id from the event payload: $(printf '%q' "$pane"). Refusing to start a watcher for an unidentified pane. No watcher was started."
+  fi
+
+  # The scoping gate. Not an optimisation - see is_our_agent_label.
+  agent="$(printf '%s' "$event_json" | json_field '.data.agent')"
+  if ! is_our_agent_label "$agent"; then
+    # Silent by design. This event fires for every agent in the session,
+    # including agents this plugin has never heard of, and an event handler that
+    # announced itself on every one of them would be a second source of noise in
+    # a system that already has one. There is nothing to report here: not acting
+    # on someone else's pane is the correct outcome, not a problem.
+    return 0
+  fi
+
+  # Same opt-out as the launch path. See watcher_autostart for the caveat that
+  # this only sees the value if it was exported into the environment herdr
+  # itself was started from.
+  if [ "${MCODE_WATCH_AUTOSTART:-1}" = "0" ]; then
+    return 0
+  fi
+
+  # No third argument: this runs detached inside the herdr server, so a line on
+  # stderr has no reader. The watcher's own log is the place for this story.
+  ensure_watcher "$pane" "$(resolve_agent_name "$pane" "$agent")"
+}
+
 main() {
   case "${1:-}" in
     start)
       cmd_start
       ;;
+    ensure-watcher)
+      cmd_ensure_watcher
+      ;;
     *)
-      log "usage: mcode-plugin.sh start"
+      log "usage: mcode-plugin.sh start | ensure-watcher"
       exit 2
       ;;
   esac
