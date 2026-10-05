@@ -66,7 +66,20 @@ if [ "\${3:-}" = "inner" ]; then
   /bin/sh "$WORK/pane-shell.sh" "\$4" "\$2" hook &
   wait
 else
-  HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+  # mcode writes a JSON payload on the hook's stdin. The suite feeds a real one,
+  # because the hook's cheap path reads cwd out of it and a test that never
+  # supplied a payload would be testing a fallback the real thing rarely takes.
+  # (No backticks anywhere in this heredoc: it is unquoted, so a backticked word in
+  # a comment is a command substitution and bash will try to run it.)
+  # M4_PAYLOAD_CWD unset means "payload carries no cwd", which is itself a case
+  # worth having: the hook must then fall back to its own working directory.
+  if [ -n "\${M4_PAYLOAD_CWD:-}" ]; then
+    printf '{"session_id":"m4-test","cwd":"%s"}' "\$M4_PAYLOAD_CWD" \
+      | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+  else
+    printf '{"session_id":"m4-test"}' \
+      | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+  fi
 fi
 EOF
 chmod +x "$WORK/pane-shell.sh"
@@ -102,9 +115,14 @@ spawn_pane() {
   if [ -n "$inner" ]; then
     /bin/rm -f "$WORK/$inner.pid" "$WORK/$inner.go" 2>/dev/null
   fi
-  "$WORK/pane-shell.sh" "$tag" "$cwd" "$mode" "$inner" >/dev/null 2>&1 &
+  # stderr is kept, not discarded: the hook says on stderr what it could not prove,
+  # and a suite that throws that away cannot assert on the difference between "the
+  # prefilter matched" and "the prefilter missed and we paid for the full scan".
+  "$WORK/pane-shell.sh" "$tag" "$cwd" "$mode" "$inner" >"$WORK/$tag.stderr" 2>&1 &
   PANE_SHELL_PID=$!
 }
+
+stderr_of() { cat "$WORK/$1.stderr" 2>/dev/null; }
 
 pane_pid() { # pane_pid <tag> -> the pid, or 0
   local i=0
@@ -588,8 +606,21 @@ case_budget_trip_still_registers_what_it_found() {
   reset_log
   /bin/rm -f "$WORK/slow.pid" "$WORK/slow.go" "$WORK/slow2.pid" "$WORK/slow2.go" 2>/dev/null
 
-  MCODE_HOOK_BUDGET_SECONDS=1 \
-    "$WORK/pane-shell.sh" slow "$WORK" inner slow2 >"$WORK/stderr2" 2>&1 &
+  # The cost of the scan is made DELIBERATE rather than incidental. An earlier
+  # revision of this case threw 1500 panes at a one-second budget and hoped the
+  # machine would be slow enough; on a loaded runner the INDEX phase alone crossed
+  # the second boundary and the scan was cut short before a single pane was
+  # examined, which is a different failure than the one this case is about. The
+  # budget here is 1s, the probe delay below is a floor the machine cannot beat,
+  # and the fixture is small enough that indexing is instant — so the first batch
+  # always completes, always finds the pane, and the trip always happens later.
+  #
+  # Everything is exported BEFORE spawn_pane: the stand-in shell is the hook's
+  # parent, so it inherits the environment it was started with, not the one it is
+  # released with. Setting these afterwards is a silent no-op.
+  export MCODE_HOOK_BUDGET_SECONDS=2
+  export FAKE_HOOK_PROBE_DELAY=0.3
+  "$WORK/pane-shell.sh" slow "$WORK" inner slow2 >"$WORK/stderr2" 2>&1 &
   PANE_SHELL_PID=$!
   local i=0
   # The outer shell only SPAWNS the inner one after its own .go file appears, so
@@ -607,24 +638,32 @@ case_budget_trip_still_registers_what_it_found() {
     return
   fi
 
-  # 3 sessions x 500 panes, and the matching pane is FIRST: found at rank 2, then
-  # the scan has 1499 more panes to get through and a one-second budget to do it in.
+  # 3 sessions x 20 panes, and the matching pane is FIRST: found at rank 2 in the
+  # very first batch, then 60 more probes at 0.3s each — about 3s of work against a
+  # 2s budget. The overrun has to be DECISIVE, not marginal: `budget_left` compares
+  # whole seconds, so a scan that finishes 0.1s past its budget trips on a fast
+  # machine and not on a slow one, and the case then passes or fails depending on
+  # which side of a second boundary it started. Three seconds of sleeps against a
+  # two-second budget trips whatever the machine does, while indexing 60 panes and
+  # the first batch stay far inside it.
   write_fixture "$(jq -nc --argjson pid "$outer" '
     def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000, fg_pgid:0, fg_pids:[]}];
     {sessions:[
        {name:"s1",socket:"/tmp/hpmc-slow/s1.sock",running:true,
-        panes:([{pane_id:"w1:outer",shell_pid:$pid,fg_pgid:0,fg_pids:[]}] + filler(500;"w1f"))},
-       {name:"s2",socket:"/tmp/hpmc-slow/s2.sock",running:true,panes:filler(500;"w2")},
-       {name:"s3",socket:"/tmp/hpmc-slow/s3.sock",running:true,panes:filler(500;"w3")}
+        panes:([{pane_id:"w1:outer",shell_pid:$pid,fg_pgid:0,fg_pids:[]}] + filler(20;"w1f"))},
+       {name:"s2",socket:"/tmp/hpmc-slow/s2.sock",running:true,panes:filler(20;"w2")},
+       {name:"s3",socket:"/tmp/hpmc-slow/s3.sock",running:true,panes:filler(20;"w3")}
      ]}')"
 
   : >"$WORK/slow2.go"
   wait "$PANE_SHELL_PID" 2>/dev/null
   PANE_SHELL_PID=""
+  unset MCODE_HOOK_BUDGET_SECONDS FAKE_HOOK_PROBE_DELAY
 
   if ! grep -q 'budget expired' "$WORK/stderr2" 2>/dev/null; then
     note "expected the scan to be cut short by the 1s budget, but it finished;"
     note "this case cannot prove what it exists to prove unless it truncates"
+    note "stderr: $(head -6 "$WORK/stderr2" 2>/dev/null | tr '\n' '|')"
   fi
   if ! grep -q 'report-agent w1:outer' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the budget expired and the pane it had ALREADY proved was discarded;"
@@ -636,50 +675,147 @@ case_budget_trip_still_registers_what_it_found() {
   fi
 }
 
-# 15. The answer does not depend on WHERE the matching pane sits.
+# 15. The prefilter finds a pane in the LAST of three sessions, cheaply.
 #
-#     This is the case that exists because the scan is order-independent BY
-#     DESIGN and that has to be kept true by a test rather than by intent. The
-#     fixture is 3 sessions x 100 panes with the matching pane LAST — the most
-#     expensive position for any strategy that stops early, and the position that
-#     used to lose: a sequential scan needs 300 herdr calls at a measured ~10 ms
-#     each, which is past the 3 s budget, so the hook gave up and the pane was
-#     never registered.
-#
-#     Both halves are asserted. The pane must be reported — that is the
-#     order-independence claim. And the scan must have examined every pane, which
-#     is the reason it can be reported at all: a hook that quietly settled for the
-#     first plausible pane would pass the first assertion while being exactly the
-#     defect this case exists to kill.
+#     300 panes exist and exactly ONE is worth a `process-info` call: the only one
+#     whose cwd is the hook's. That is the whole point of the prefilter, so this
+#     case asserts the COST as well as the answer — the pane is reported, and the
+#     call count proves the other 299 were never probed. A hook that ignored the
+#     prefilter would report the same pane and pass a correctness-only assertion
+#     while giving back the entire saving.
 case_match_in_the_last_of_three_sessions() {
   local pid calls_made
+  export M4_PAYLOAD_CWD="/m4/project"
   spawn_pane late
   pid="$(pane_pid late)"
   if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
 
-  # 3 sessions x 100 panes; the match is the LAST pane of the LAST session.
+  # 3 sessions x 100 panes, all in some OTHER directory, and the matching pane —
+  # last of the last session, in the hook's directory — is the only candidate.
   write_fixture "$(jq -nc --argjson pid "$pid" '
-    def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000, fg_pgid:0, fg_pids:[]}];
+    def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000,
+                                           fg_pgid:0, fg_pids:[], cwd:"/elsewhere"}];
     {sessions:[
        {name:"s1",socket:"/tmp/hpmc-last/s1.sock",running:true,panes:filler(100;"w1")},
        {name:"s2",socket:"/tmp/hpmc-last/s2.sock",running:true,panes:filler(100;"w2")},
        {name:"s3",socket:"/tmp/hpmc-last/s3.sock",running:true,
-        panes:(filler(99;"w3") + [{pane_id:"w3:real",shell_pid:$pid,fg_pgid:0,fg_pids:[]}])}
+        panes:(filler(99;"w3") + [{pane_id:"w3:real",shell_pid:$pid,fg_pgid:0,
+                                   fg_pids:[], cwd:"/m4/project"}])}
      ]}')"
   reset_log
   release_pane late
+  unset M4_PAYLOAD_CWD
 
   if ! grep -q 'report-agent w3:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the matching pane in the LAST session was not reported; log: $(calls_digest)"
   fi
-
   calls_made="$(wc -l <"$FAKE_HOOK_LOG" | tr -d ' ')"
-  # 1 session list + 3 pane list + 300 process-info = 304 when the scan is
-  # exhaustive. Anything materially below that means panes went unexamined, and an
-  # unexamined pane is a pane that might have been the nearer one.
+  # 1 session list + 3 pane list + 1 process-info = 5. The prefilter's entire claim
+  # is that the other 299 panes cost nothing, so the ceiling is tight on purpose.
+  if [ "$calls_made" -gt 12 ]; then
+    note "$calls_made herdr calls for 300 panes; the cwd prefilter did no work,"
+    note "so the prefilter is not actually narrowing the search"
+  fi
+  if ! grep -q 'prefilter cwd (from the SessionStart payload)' "$WORK/late.stderr" 2>/dev/null; then
+    note "the hook did not report reading cwd from the payload; stderr: $(stderr_of late | head -3 | tr '\n' '|')"
+  fi
+}
+
+# 16. A cwd match is a CANDIDATE, never the proof.
+#
+#     This is the case that keeps the prefilter honest. Two panes share the hook's
+#     directory — the collision this repo documents — and the decoy is listed FIRST,
+#     so any implementation that treats cwd as identity registers the wrong pane.
+#     The decoy's shell_pid is a pid that appears in no ancestry, so the ancestry
+#     match rejects it and the real pane wins even though it was found second.
+case_cwd_match_is_never_the_proof() {
+  local pid
+  export M4_PAYLOAD_CWD="/m4/project"
+  spawn_pane decoy
+  pid="$(pane_pid decoy)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+
+  write_fixture "$(jq -nc --argjson pid "$pid" '
+    {sessions:[
+       {name:"s1",socket:"/tmp/hpmc-decoy/s1.sock",running:true,
+        panes:[{pane_id:"w1:decoy",shell_pid:999999,fg_pgid:0,fg_pids:[],cwd:"/m4/project"},
+               {pane_id:"w1:real",shell_pid:$pid,fg_pgid:0,fg_pids:[],cwd:"/m4/project"}]}
+     ]}')"
+  reset_log
+  release_pane decoy
+  unset M4_PAYLOAD_CWD
+
+  if ! grep -q 'report-agent w1:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the proven pane was not reported; a cwd match must not settle the question"
+    note "log: $(calls_digest)"
+  fi
+  if grep -q 'report-agent w1:decoy' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "registered the DECOY: cwd was treated as identity rather than as a filter"
+  fi
+}
+
+# 17. When cwd matches nothing, the full scan runs — and says so.
+#
+#     A pane's directory can differ from the project directory, and a `cd` between
+#     launch and SessionStart moves it, so the prefilter missing is an ordinary
+#     outcome and not an error. The thorough path still has to run, because the
+#     ancestry match remains the only thing that may register a pane. What must not
+#     happen quietly is the extra cost: a user whose pane is slow to appear should
+#     be able to tell this apart from "nothing matched", so the fallback announces
+#     itself, and this asserts on the announcement as well as the outcome.
+#
+#     The concurrency assertion belongs here rather than in the prefilter case
+#     because this is the pass that actually has hundreds of panes to get through.
+case_cwd_matching_nothing_falls_back_loudly() {
+  local pid calls_made conc_max
+  # A generous budget, for the same reason the prefilter case has one: this case
+  # is about WHICH pass runs and whether it says so, not about how many seconds a
+  # throttled CI runner takes to get through 300 stubs. The real-budget behaviour
+  # is pinned by `budget-trip-still-registers-what-it-found`, which forces the
+  # overrun deliberately and asserts what happens next.
+  export MCODE_HOOK_BUDGET_SECONDS=30
+  export M4_PAYLOAD_CWD="/m4/project"
+  export FAKE_HOOK_CONC="$WORK/conc"
+  : >"$FAKE_HOOK_CONC.cur" 2>/dev/null
+  : >"$FAKE_HOOK_CONC.max" 2>/dev/null
+
+  spawn_pane nomatch
+  pid="$(pane_pid nomatch)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+
+  # Nothing anywhere is in /m4/project, including the pane that owns this process.
+  write_fixture "$(jq -nc --argjson pid "$pid" '
+    def filler($n; $pre): [range(0; $n) | {pane_id:($pre + ":p" + tostring), shell_pid:900000,
+                                           fg_pgid:0, fg_pids:[], cwd:"/elsewhere"}];
+    {sessions:[
+       {name:"s1",socket:"/tmp/hpmc-fb/s1.sock",running:true,panes:filler(100;"w1")},
+       {name:"s2",socket:"/tmp/hpmc-fb/s2.sock",running:true,panes:filler(100;"w2")},
+       {name:"s3",socket:"/tmp/hpmc-fb/s3.sock",running:true,
+        panes:(filler(99;"w3") + [{pane_id:"w3:real",shell_pid:$pid,fg_pgid:0,
+                                   fg_pids:[], cwd:"/elsewhere"}])}
+     ]}')"
+  reset_log
+  release_pane nomatch
+  unset M4_PAYLOAD_CWD FAKE_HOOK_CONC MCODE_HOOK_BUDGET_SECONDS
+
+  if ! grep -q 'running the full scan' "$WORK/nomatch.stderr" 2>/dev/null; then
+    note "the prefilter missed and the hook did not say it was falling back;"
+    note "a silent extra full scan is the same quiet failure as a silent skip"
+    note "stderr: $(head -6 "$WORK/nomatch.stderr" 2>/dev/null | tr '\n' '|')"
+  fi
+  if ! grep -q 'report-agent w3:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the fallback scan did not find the pane either; log: $(calls_digest)"
+  fi
+  calls_made="$(wc -l <"$FAKE_HOOK_LOG" | tr -d ' ')"
   if [ "$calls_made" -lt 290 ]; then
-    note "only $calls_made herdr calls for 300 panes; the scan stopped early,"
-    note "so the match it reported is not proven to be the nearest pane"
+    note "only $calls_made calls for 300 panes; the fallback did not scan every pane,"
+    note "so the answer still depends on where the pane happened to sit"
+  fi
+  conc_max="$(cat "$WORK/conc.max" 2>/dev/null || echo 0)"
+  case "$conc_max" in '' | *[!0-9]*) conc_max=0 ;; esac
+  if [ "$conc_max" -lt 2 ]; then
+    note "peak concurrent herdr calls was $conc_max; the fallback ran sequentially,"
+    note "and 300 panes will not fit the budget on a slow machine"
   fi
 }
 
@@ -697,6 +833,8 @@ CASES=(
   foreground-process-is-an-anchor:case_foreground_process_is_an_anchor
   scan-stops-at-a-definitive-match:case_scan_stops_at_a_definitive_match
   match-in-the-last-of-three-sessions:case_match_in_the_last_of_three_sessions
+  cwd-match-is-never-the-proof:case_cwd_match_is_never_the_proof
+  cwd-matching-nothing-falls-back-loudly:case_cwd_matching_nothing_falls_back_loudly
   budget-expiry-is-announced:case_budget_expiry_is_announced
   budget-trip-still-registers-what-it-found:case_budget_trip_still_registers_what_it_found
   install-never-uses-a-bare-rm:case_install_never_uses_a_bare_rm

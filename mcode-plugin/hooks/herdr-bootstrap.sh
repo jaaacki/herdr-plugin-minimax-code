@@ -271,94 +271,47 @@ probe_pane_to() {
   return 0
 }
 
-discover_pane() { # discover_pane <chain>
-  local chain="$1" start_ms best_sock="" best_pane="" best_rank=999999
-  local sock running pane_id panes_json
-  # `definitive` = a match nothing can beat, so the scan may stop. `truncated` =
-  # the budget cut the scan short, which must never look like a clean sweep.
-  local definitive=0 truncated=0
+# probe_pass <candidates_only: 1|0>
+#
+# Walks the indexed panes and leaves the nearest match in the CALLER's best_pane /
+# best_rank / best_sock. bash scoping is dynamic, so assigning them here without
+# declaring them local writes the caller's variables rather than a copy — that is
+# deliberate, and it is why this takes no output argument and returns no verdict.
+#
+# Batching: probes run a batch at a time and the batch is evaluated before the next
+# one starts. The first batch is ONE pane and the width then doubles to
+# PROBE_LANES. A fixed width would make the common case pay for parallelism it does
+# not need — with the matching pane first, eight probes would be launched before any
+# of them was read, and every session start would cost eight herdr round trips
+# where one would do. The ramp changes only HOW MANY probes are in flight, never
+# which panes are eligible, so it cannot change the answer, only how long it takes.
+probe_pass() {
+  local only_candidates="$1"
+  local n=0 launched lanes=1 i rank pane cand_sock total=${#A_SOCK[@]}
 
-  start_ms="$(now_ms)"
-
-  local sessions_json
-  if ! sessions_json="$("$HERDR" session list --json 2>/dev/null)"; then
-    log "herdr 'session list --json' failed; refusing to register."
-    return 1
-  fi
-  if ! printf '%s' "$sessions_json" | jq -e '.sessions' >/dev/null 2>&1; then
-    log "herdr 'session list --json' returned no .sessions array; refusing to register."
-    return 1
-  fi
-
-  # Index every pane of every RUNNING session. That is one `pane list` per session
-  # and no per-pane work, so the index stays cheap however many sessions exist.
-  #
-  # Only RUNNING sessions are probed, and each is addressed by the socket_path the
-  # enumeration itself returned — so the socket and the panes come from the same
-  # answer, and a session can never be selected by a name this script guessed.
-  #
-  # The gate is `running`, not "is this path a socket". `running` is herdr's own
-  # answer about a live server; a `-S` test would only re-ask the filesystem a
-  # question herdr has already answered, would reject a perfectly good socket on
-  # any platform that models one differently, and buys nothing: a socket with no
-  # server behind it answers `server_not_running` in about a millisecond, and the
-  # deadline below bounds the loop either way.
-  local -a P_SOCK=() P_PANE=()
-  while IFS=$'\t' read -r sock running; do
-    [ -n "$sock" ] || continue
-    case "$sock" in
-      /*) : ;;
-      *) continue ;;
-    esac
-    [ "$running" = "true" ] || continue
-    budget_left "$start_ms" || { truncated=1; break; }
-
-    panes_json="$(h_ "$sock" pane list)" || continue
-    printf '%s' "$panes_json" | jq -e '.result.panes' >/dev/null 2>&1 || continue
-
-    while IFS= read -r pane_id; do
-      [ -n "$pane_id" ] || continue
-      P_SOCK+=("$sock")
-      P_PANE+=("$pane_id")
-    done < <(printf '%s' "$panes_json" | jq -r '.result.panes[].pane_id' 2>/dev/null)
-  done < <(printf '%s' "$sessions_json" \
-    | jq -r '.sessions[] | select(.running == true) | [.socket_path, "true"] | @tsv' 2>/dev/null)
-
-  local total=${#P_SOCK[@]}
-
-  # Probe every indexed pane, in batches, and keep the NEAREST rank seen. Every
-  # pane is a candidate, so the answer cannot depend on the order sessions or panes
-  # came back in.
-  #
-  # The first batch is ONE pane and the batch size then doubles up to PROBE_LANES.
-  # A fixed width would make the common case pay for parallelism it does not need:
-  # with the matching pane first, eight probes are launched before any is read, and
-  # every session start would cost eight herdr round trips where one would do.
-  # Ramping means an ordinary start stops after a single probe while a 300-pane
-  # machine still reaches full width in three batches. The ramp only changes HOW MANY
-  # probes are in flight, never which panes are eligible, so it cannot affect the
-  # answer — only how long the answer takes.
-  local n=0 launched lanes=1 i rank pane cand_sock
-  while [ "$n" -lt "$total" ] && [ "$definitive" -eq 0 ]; do
+  while [ "$n" -lt "$total" ]; do
+    [ "$definitive" -eq 1 ] && break
     budget_left "$start_ms" || { truncated=1; break; }
 
     launched=0
-    while [ "$launched" -lt "$lanes" ] && [ $((n + launched)) -lt "$total" ]; do
-      # stdin comes from /dev/null: these run while the parent is mid-loop, and an
-      # inherited stdin would let a probe swallow the parent's input.
-      probe_pane_to "${P_SOCK[$((n + launched))]}" "${P_PANE[$((n + launched))]}" \
-        "$PROBE_DIR/result.$((n + launched))" </dev/null &
-      launched=$((launched + 1))
+    while [ "$n" -lt "$total" ] && [ "$launched" -lt "$lanes" ]; do
+      if [ "$only_candidates" != "1" ] || [ "${A_CAND[$n]:-0}" = "1" ]; then
+        # stdin comes from /dev/null: these run while the parent is mid-loop, and
+        # an inherited stdin would let a probe swallow the parent's input.
+        probe_pane_to "${A_SOCK[$n]}" "${A_PANE[$n]}" "$PROBE_DIR/result.$n" </dev/null &
+        launched=$((launched + 1))
+      fi
+      n=$((n + 1))
     done
     wait 2>/dev/null
 
-    i=0
-    while [ "$i" -lt "$launched" ]; do
+    i=$((n - launched))
+    while [ "$i" -lt "$n" ]; do
       rank=""
       pane=""
       cand_sock=""
-      if [ -f "$PROBE_DIR/result.$((n + i))" ]; then
-        IFS=$'\t' read -r rank pane cand_sock <"$PROBE_DIR/result.$((n + i))" || true
+      if [ -f "$PROBE_DIR/result.$i" ]; then
+        IFS=$'\t' read -r rank pane cand_sock <"$PROBE_DIR/result.$i" || true
       fi
       case "$rank" in
         '' | *[!0-9]*) : ;;
@@ -375,13 +328,10 @@ discover_pane() { # discover_pane <chain>
           # the index grows, so no unexamined pane can beat it.
           #
           # Note what this does NOT do: it is not what makes the answer
-          # order-independent. The scan finishes in full unless it finds a match
-          # that cannot be beaten, so the answer is the same whatever order the
-          # sessions and panes came back in. This only avoids paying for panes that
-          # cannot change the result. Measured by m3 with a 3-session x 100-pane
-          # fixture and the match at session 2: the pane was proved on about call 2
-          # and the hook still spent 305, because the old loop kept asking after it
-          # already had the answer.
+          # order-independent. The pass finishes in full unless it finds a match
+          # that cannot be beaten, and when the prefilter misses the full scan runs
+          # anyway, so the answer is the same whatever order sessions and panes came
+          # back in. This only avoids paying for panes that cannot change it.
           if [ "$best_rank" -le 1 ]; then
             definitive=1
             break
@@ -391,10 +341,97 @@ discover_pane() { # discover_pane <chain>
       i=$((i + 1))
     done
 
-    n=$((n + launched))
     [ "$lanes" -lt "$PROBE_LANES" ] && lanes=$((lanes * 2))
     [ "$lanes" -gt "$PROBE_LANES" ] && lanes="$PROBE_LANES"
   done
+}
+
+discover_pane() { # discover_pane <chain> <hook_cwd>
+  local chain="$1" hook_cwd="$2"
+  local start_ms best_sock="" best_pane="" best_rank=999999
+  local sock running pane_id panes_json is_cand
+  # `definitive` = a match nothing can beat, so the scan may stop. `truncated` =
+  # the budget cut the search short, which must never look like a clean sweep.
+  local definitive=0 truncated=0 fell_back=0
+
+  start_ms="$(now_ms)"
+
+  local sessions_json
+  if ! sessions_json="$("$HERDR" session list --json 2>/dev/null)"; then
+    log "herdr 'session list --json' failed; refusing to register."
+    return 1
+  fi
+  if ! printf '%s' "$sessions_json" | jq -e '.sessions' >/dev/null 2>&1; then
+    log "herdr 'session list --json' returned no .sessions array; refusing to register."
+    return 1
+  fi
+
+  # ---- pass one: one `pane list` per session, and mark the candidates -----------
+  #
+  # Every running session is asked for its panes exactly once. From that single
+  # answer each pane is recorded twice over: it is always a candidate for the
+  # fallback, and it is a CANDIDATE for the cheap pass when its `cwd` or
+  # `foreground_cwd` equals the hook's cwd.
+  #
+  # cwd is a PREFILTER AND NOTHING MORE. Two panes in one directory is a documented
+  # collision in this repo, which is exactly why cwd is never allowed to identify a
+  # pane — so a cwd match here buys one `process-info` call and decides nothing. The
+  # shell_pid / foreground-pid ancestry match is still the only thing that can
+  # register a pane, and if the ancestry match fails the pane is discarded exactly
+  # as if its cwd had never been looked at. The win is arithmetic: the expensive
+  # per-pane call is spent on a handful of candidates instead of on all of them.
+  local -a A_SOCK=() A_PANE=() A_CAND=()
+  while IFS=$'\t' read -r sock running; do
+    [ -n "$sock" ] || continue
+    case "$sock" in
+      /*) : ;;
+      *) continue ;;
+    esac
+    [ "$running" = "true" ] || continue
+    budget_left "$start_ms" || { truncated=1; break; }
+
+    panes_json="$(h_ "$sock" pane list)" || continue
+    printf '%s' "$panes_json" | jq -e '.result.panes' >/dev/null 2>&1 || continue
+
+    while IFS=$'\t' read -r pane_id is_cand; do
+      [ -n "$pane_id" ] || continue
+      A_SOCK+=("$sock")
+      A_PANE+=("$pane_id")
+      A_CAND+=("${is_cand:-0}")
+    done < <(printf '%s' "$panes_json" | jq -r --arg c "$hook_cwd" '
+      .result.panes[]
+      | [ .pane_id,
+          (if (.cwd == $c or .foreground_cwd == $c) then "1" else "0" end) ]
+      | @tsv' 2>/dev/null)
+  done < <(printf '%s' "$sessions_json" \
+    | jq -r '.sessions[] | select(.running == true) | [.socket_path, "true"] | @tsv' 2>/dev/null)
+
+  # Only RUNNING sessions are indexed, and each is addressed by the socket_path the
+  # enumeration itself returned — so the socket and the panes come from the same
+  # answer, and a session can never be selected by a name this script guessed.
+  #
+  # The gate is `running`, not "is this path a socket". `running` is herdr's own
+  # answer about a live server; a `-S` test would only re-ask the filesystem a
+  # question herdr has already answered, would reject a perfectly good socket on
+  # any platform that models one differently, and buys nothing: a socket with no
+  # server behind it answers `server_not_running` in about a millisecond, and the
+  # deadline bounds the loop either way.
+
+  probe_pass 1
+
+  if [ -z "$best_pane" ] && [ "$definitive" -eq 0 ] && [ "$truncated" -eq 0 ]; then
+    # ---- pass two: the fallback, and it is never silent ------------------------
+    # The prefilter found nothing that the ancestry would accept. That is an
+    # ordinary outcome — a pane's `cwd` can differ from the project directory, and
+    # a `cd` between launch and SessionStart moves it — so the full budgeted scan
+    # runs and the answer is still the ancestry's to give. What is NOT ordinary is
+    # doing that quietly: a user whose pane never registers needs to be able to
+    # tell "no pane matched" from "the cheap path missed and we paid for the
+    # thorough one", so it is said out loud, with the cost it just incurred.
+    fell_back=1
+    log "no pane whose cwd matched was PROVEN by ancestry; running the full scan over every pane."
+    probe_pass 0
+  fi
 
   # A TRUNCATED SCAN MUST SAY SO. If the budget cut the search short, the match we
   # hold may not be the nearest one, and a caller reading only "proved pane X" would
@@ -408,10 +445,13 @@ discover_pane() { # discover_pane <chain>
   # ~85 panes "exhausted the budget and the hook refused", leaving the pane never
   # registered. That was m3's reading of an earlier revision; it was retracted, and
   # this hook has never done it.
-  #
-  # This block is reached even when the scan examined nothing at all, which is what
-  # a zero budget produces — announcing that is the entire point of the warning, so
-  # it must not sit behind an early return that a truncated scan would take.
+  if [ "$fell_back" -eq 1 ]; then
+    if [ -n "$best_pane" ]; then
+      log "the full scan proved pane $best_pane at rank $best_rank."
+    else
+      log "the full scan proved no pane either."
+    fi
+  fi
   if [ "$truncated" -eq 1 ]; then
     log "WARNING: the ${DEADLINE_SECONDS}s search budget expired mid-scan."
     if [ -n "$best_pane" ]; then
@@ -419,8 +459,8 @@ discover_pane() { # discover_pane <chain>
     else
       log "WARNING: no pane was examined before the budget expired."
     fi
-  elif [ "$total" -eq 0 ]; then
-    log "no running session offered a pane to examine; refusing to register."
+  elif [ "$fell_back" -eq 0 ] && [ -n "$best_pane" ]; then
+    log "prefilter matched; cost was ${#A_SOCK[@]} pane(s) listed and fewer probed than a full scan would need."
   fi
 
   [ -n "$best_pane" ] || return 1
@@ -440,9 +480,39 @@ main() {
     return 0
   fi
 
-  local chain found sock pane_id rank
+  local chain found sock pane_id rank hook_cwd
   chain="$(chain_walk)"
   log "ancestry chain: $chain"
+
+  # The SessionStart payload, read ONCE and BOUNDED.
+  #
+  # mcode writes a JSON object on the hook's stdin carrying session_id, prompt_id,
+  # transcript_path, cwd and model (measured on mcode 0.6.2), one line.
+  #
+  # BOUNDED, because the obvious `payload="$(cat)"` is a hang: any caller that
+  # invokes the hook with an open pipe and no payload — which is exactly what the
+  # e2e harness does — leaves `cat` waiting for an EOF that never comes, and the
+  # hook then fails to register anything at all. That regression was real and it
+  # was caught by the e2e suite, not by the unit suite, because the unit suite
+  # always supplies a payload and so never exercised the other path.
+  # `read -t` is a bash builtin, so this costs no fork, gives up after two seconds,
+  # and leaves the variable set even on a short read. A terminal is skipped
+  # outright: there is no payload on a tty and waiting there would only cost time.
+  #
+  # If the payload is absent, unreadable, or is not a single line of JSON, the
+  # fallback below applies. That fallback is the reason this can be allowed to fail
+  # quietly at all.
+  local payload=""
+  if [ ! -t 0 ]; then
+    IFS= read -r -t 2 payload 2>/dev/null || true
+  fi
+  hook_cwd="$(printf '%s' "$payload" | jq -r 'if type == "object" then (.cwd // empty) else empty end' 2>/dev/null || true)"
+  if [ -n "$hook_cwd" ]; then
+    log "prefilter cwd (from the SessionStart payload): $hook_cwd"
+  else
+    hook_cwd="$(pwd 2>/dev/null || true)"
+    log "prefilter cwd (payload had none; using the hook's own cwd): $hook_cwd"
+  fi
 
   # Created HERE, in the parent, and not inside discover_pane: discover_pane runs in
   # a command substitution, so a directory it made would belong to a subshell that
@@ -455,7 +525,7 @@ main() {
     return 0
   fi
 
-  if ! found="$(discover_pane "$chain")"; then
+  if ! found="$(discover_pane "$chain" "$hook_cwd")"; then
     log "no herdr pane is proven by this process ancestry; refusing to register."
     log "NOT falling back to any session: an unproven pane must never be reported."
     return 0

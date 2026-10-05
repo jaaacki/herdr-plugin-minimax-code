@@ -59,6 +59,28 @@ CACHE=""
 if [ -n "${HERDR_SOCKET_PATH:-}" ]; then _log_sock="$HERDR_SOCKET_PATH"; else _log_sock="(unset)"; fi
 printf '%s\t%s\n' "$_log_sock" "$*" >>"$LOG" 2>/dev/null
 
+# ---- concurrency observation -------------------------------------------------
+# Opt-in, via FAKE_HOOK_CONC. The hook probes panes in parallel batches, and
+# "there is a loop that backgrounds jobs" is not the same claim as "the probes
+# actually overlap". Recording the high-water mark of simultaneously-live stub
+# processes turns the second claim into something a suite can assert, with no
+# reference to how fast the machine is.
+#
+# The counts are read-modify-written without locking, so a value can be
+# UNDERSTATED when two probes land in the same instant. That is fine for the only
+# question asked of it — is the mark greater than one — because a sequential scan
+# can never produce 2 no matter how it races, while a parallel one produces 2 on
+# every run.
+if [ -n "${FAKE_HOOK_CONC:-}" ]; then
+  _c=0; [ -f "$FAKE_HOOK_CONC.cur" ] && _c="$(cat "$FAKE_HOOK_CONC.cur" 2>/dev/null || echo 0)"
+  case "$_c" in '' | *[!0-9]*) _c=0 ;; esac
+  _c=$((_c + 1)); echo "$_c" >"$FAKE_HOOK_CONC.cur" 2>/dev/null
+  _m=0; [ -f "$FAKE_HOOK_CONC.max" ] && _m="$(cat "$FAKE_HOOK_CONC.max" 2>/dev/null || echo 0)"
+  case "$_m" in '' | *[!0-9]*) _m=0 ;; esac
+  if [ "$_c" -gt "$_m" ]; then echo "$_c" >"$FAKE_HOOK_CONC.max" 2>/dev/null; fi
+  trap 'x=$(( $(cat "$FAKE_HOOK_CONC.cur" 2>/dev/null || echo 1) - 1 )); [ "$x" -ge 0 ] && echo "$x" >"$FAKE_HOOK_CONC.cur" 2>/dev/null' EXIT
+fi
+
 if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
   printf '{"error":{"code":"no_fixture","message":"FAKE_HOOK_FIXTURE unset or missing"}}\n'
   exit 1
@@ -117,7 +139,9 @@ case "${2:-}" in
       | if $sess == null
         then {error:{code:"server_not_running",message:("no herdr server is running at " + $s)}}
         else {id:"cli:pane:list",
-              result:{type:"pane_list",panes:[$sess.panes[]|{pane_id,cwd}]}}
+              result:{type:"pane_list",
+                      panes:[$sess.panes[]|{pane_id,cwd,
+                                            foreground_cwd:(.fg_cwd // .cwd)}]}}
         end' "$FIXTURE")"
     case "$out" in
       *'"error"'*) emit "$out"; exit 1 ;;
@@ -139,6 +163,12 @@ case "${2:-}" in
       exit 1
     fi
     build_cache
+    # Opt-in, fixed cost per probe. Lets a suite make a scan take a known amount of
+    # TIME instead of an amount that depends on the machine, which is the only way
+    # to test budget behaviour without a timing assertion that is really an
+    # assertion about how fast the runner is. A sleep is a floor, not a ceiling, so
+    # the total only ever grows — the case cannot pass by being fast.
+    [ -n "${FAKE_HOOK_PROBE_DELAY:-}" ] && sleep "$FAKE_HOOK_PROBE_DELAY"
     hit=""
     while IFS=$'\t' read -r c_sock c_pane c_json; do
       if [ "$c_sock" = "$sock" ]; then

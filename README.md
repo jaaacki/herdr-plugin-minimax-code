@@ -163,6 +163,19 @@ never used to guess. If no pane can be proven, the hook reports nothing and says
 never falls back to the default session, because a registration on the wrong pane is
 worse than no registration.
 
+**It pays for the expensive check only where it has to.** Ancestry is the only thing
+that may register a pane, and answering it costs one `process-info` call per pane — so
+on a machine with many panes that is too much to spend on all of them. The hook first
+asks each session for its panes (one call each) and keeps only those whose `cwd` or
+`foreground_cwd` matches the session's own directory, which it reads from the
+`SessionStart` payload. That is a **filter, never a proof**: two panes in one directory
+is a documented collision, so a directory match buys a single `process-info` call and
+settles nothing, and a pane whose ancestry does not match is discarded exactly as if
+its directory had never been read. If the filter finds nothing that ancestry will
+accept, the hook runs the full search anyway and **says on stderr that it did** — a
+pane's directory can legitimately differ from the project's, and that fallback is an
+ordinary outcome rather than an error, but it should never be a silent one.
+
 **On a machine with a great many panes**, the search is time-bounded, because `mcode`
 kills a hook that overruns its budget and a killed hook is indistinguishable from one
 that never ran. If the bound is reached, the hook **still registers the pane it had
