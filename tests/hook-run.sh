@@ -452,20 +452,46 @@ case_foreground_process_is_an_anchor() {
   fi
 }
 
-# 11. The install action is the only way the hook becomes active, and it never
-#     types a bare `rm` (issue #109).
+# 11. Neither the install nor the uninstall path types a bare `rm` (issue #109).
+#
+#     BOTH functions that delete things, not just one. This case used to scope
+#     itself to cmd_install_hook alone, which was the entire surface when it was
+#     written. #118 added cmd_uninstall_hook — a second function that removes a
+#     directory — and a one-function scan would have stayed green on a bare
+#     `rm -rf` written into the uninstall path, which is precisely the regression
+#     issue #109 exists to stop. Widening the scan is the price of adding a second
+#     remover, and it is cheaper than finding out later that the test was half the
+#     rule.
 case_install_never_uses_a_bare_rm() {
-  local install_fn
-  install_fn="$(sed -n '/^cmd_install_hook()/,/^}/p' "$repo/bin/mcode-plugin.sh")"
-  if [ -z "$install_fn" ]; then
-    note "cmd_install_hook not found in bin/mcode-plugin.sh"
+  local deleting
+  deleting="$(sed -n '/^cmd_install_hook()/,/^}/p; /^cmd_uninstall_hook()/,/^}/p' \
+    "$repo/bin/mcode-plugin.sh")"
+  if [ -z "$deleting" ]; then
+    note "neither cmd_install_hook nor cmd_uninstall_hook found in bin/mcode-plugin.sh"
     return
   fi
-  if printf '%s' "$install_fn" | grep -qE '(^|[^/[:alnum:]_])rm[[:space:]]'; then
-    note "cmd_install_hook contains a bare rm; issue #109 requires /bin/rm"
+  if ! printf '%s' "$deleting" | grep -q 'cmd_uninstall_hook'; then
+    note "cmd_uninstall_hook is gone; if it was deleted on purpose, drop it from this case"
   fi
-  if ! printf '%s' "$install_fn" | grep -q '/bin/rm'; then
-    note "cmd_install_hook does not use /bin/rm for the replacement"
+  # The scan must cover BOTH removers, and this is what makes that self-verifying:
+  # each of the two functions has exactly one absolute-path removal, so a scan
+  # narrowed back to a single function finds one and fails here. Without it, the
+  # gap m3 pointed at could be reintroduced silently and this case would still
+  # pass - a test that cannot tell whether it is looking at the whole rule.
+  local covered
+  covered="$(printf '%s' "$deleting" | grep -c '/bin/rm' 2>/dev/null || echo 0)"
+  case "$covered" in '' | *[!0-9]*) covered=0 ;; esac
+  if [ "$covered" -lt 2 ]; then
+    note "the scan found $covered absolute-path removals; it is no longer covering"
+    note "both cmd_install_hook and cmd_uninstall_hook, so a bare rm in one of them"
+    note "would pass this case. Re-widen the sed range."
+  fi
+  if printf '%s' "$deleting" | grep -qE '(^|[^/[:alnum:]_])rm[[:space:]]'; then
+    note "an install/uninstall function contains a bare rm; issue #109 requires /bin/rm"
+    note "offending: $(printf '%s' "$deleting" | grep -nE '(^|[^/[:alnum:]_])rm[[:space:]]' | head -2 | tr '\n' '|')"
+  fi
+  if ! printf '%s' "$deleting" | grep -q '/bin/rm'; then
+    note "no /bin/rm found in the install/uninstall functions"
   fi
 }
 

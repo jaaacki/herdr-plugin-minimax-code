@@ -484,34 +484,46 @@ main() {
   chain="$(chain_walk)"
   log "ancestry chain: $chain"
 
-  # The SessionStart payload, read ONCE and BOUNDED.
+  # The SessionStart payload, read once and BOUNDED — but only briefly.
   #
   # mcode writes a JSON object on the hook's stdin carrying session_id, prompt_id,
-  # transcript_path, cwd and model (measured on mcode 0.6.2), one line.
+  # transcript_path, cwd and model (measured on mcode 0.6.2), one line, and it does
+  # so BEFORE spawning the hook, so the bytes are already in the pipe when this
+  # process starts. Half a second is therefore not a race: it is slack.
   #
-  # BOUNDED, because the obvious `payload="$(cat)"` is a hang: any caller that
-  # invokes the hook with an open pipe and no payload — which is exactly what the
-  # e2e harness does — leaves `cat` waiting for an EOF that never comes, and the
-  # hook then fails to register anything at all. That regression was real and it
-  # was caught by the e2e suite, not by the unit suite, because the unit suite
-  # always supplies a payload and so never exercised the other path.
-  # `read -t` is a bash builtin, so this costs no fork, gives up after two seconds,
-  # and leaves the variable set even on a short read. A terminal is skipped
-  # outright: there is no payload on a tty and waiting there would only cost time.
+  # The obvious `payload="$(cat)"` is a hang — any caller that invokes the hook
+  # with an open pipe and no payload leaves `cat` waiting for an EOF that never
+  # comes. The e2e harness does exactly that, and the hang was real. `read -t` is a
+  # builtin, so it costs no fork, and it gives up.
   #
-  # If the payload is absent, unreadable, or is not a single line of JSON, the
-  # fallback below applies. That fallback is the reason this can be allowed to fail
-  # quietly at all.
+  # WHY THE WINDOW IS 0.5s AND NOT 2s. The first version used 2s and it was my own
+  # regression: the e2e stand-in runs the hook with no payload, so every such run
+  # paid a flat 2 seconds before doing any work, against a 10s window, and the
+  # hook case went flaky on a loaded machine. A missed payload costs NOTHING here,
+  # because the two fallbacks below resolve to the same directory that mcode
+  # reports — so paying real time for a nicety is the wrong trade.
+  # WHY THE WINDOW IS AN INTEGER. A fractional `read -t 0.5` is rejected outright by
+  # bash 3.2 — "invalid timeout specification", non-zero, variable left empty — and
+  # bash 3.2 is /bin/bash on macOS, which is the platform this plugin targets. The
+  # failure is silent by construction: the payload simply comes back empty and the
+  # hook falls back to its own directory, so the prefilter quietly stops working on
+  # exactly the platform where the rest of it was measured. Integer timeouts work on
+  # both 3.2 and 5.x.
   local payload=""
   if [ ! -t 0 ]; then
-    IFS= read -r -t 2 payload 2>/dev/null || true
+    IFS= read -r -t 1 payload 2>/dev/null || true
   fi
   hook_cwd="$(printf '%s' "$payload" | jq -r 'if type == "object" then (.cwd // empty) else empty end' 2>/dev/null || true)"
   if [ -n "$hook_cwd" ]; then
     log "prefilter cwd (from the SessionStart payload): $hook_cwd"
+  elif [ -n "${MINIMAX_PROJECT_DIR:-}" ]; then
+    # mcode's own project-directory variable, measured present in a live hook's
+    # environment. Free, and identical to what the payload would have said.
+    hook_cwd="$MINIMAX_PROJECT_DIR"
+    log "prefilter cwd (from MINIMAX_PROJECT_DIR, the payload was unavailable): $hook_cwd"
   else
     hook_cwd="$(pwd 2>/dev/null || true)"
-    log "prefilter cwd (payload had none; using the hook's own cwd): $hook_cwd"
+    log "prefilter cwd (no payload and no MINIMAX_PROJECT_DIR; using the hook's own cwd): $hook_cwd"
   fi
 
   # Created HERE, in the parent, and not inside discover_pane: discover_pane runs in
