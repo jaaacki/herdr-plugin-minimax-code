@@ -404,6 +404,15 @@ STUB
   MCODE_STUB_MARKER="$WORKDIR/stub-running"
   export MCODE_STUB_MARKER
 
+  # Make the session reporter print which socket and which herdr binary it is
+  # about to use, into the plugin log this suite already captures. Diagnostic
+  # only, and the reporter is silent unless this is set — see log_report_env in
+  # bin/mcode-session.sh. Exported for the same reason as the stub above: the
+  # action is spawned by the server, so it must be in the server's environment
+  # before it starts.
+  MCODE_LOG_REPORT_ENV=1
+  export MCODE_LOG_REPORT_ENV
+
   # The resume command the plugin will record, overridden for the same PATH
   # reason and at the same moment as the stub: the action is spawned by the
   # server, so anything the action must see has to be in the server's environment
@@ -948,6 +957,46 @@ resume_failure_mode() {
 
 run_case_resume_restored() {
   local name="resume: a restart re-runs the recorded resume command in the recreated pane"
+
+  # PREFLIGHT: no other e2e server may be alive. Every run mints the same pane id
+  # w1:p2, so a leaked server from an earlier run owns a pane with that exact
+  # name — and a report naming w1:p2 then SUCCEEDS against the wrong server
+  # instead of failing, which is the least detectable way to be wrong. That is not
+  # a hypothesis about the flake: it is why a stale server has to be impossible
+  # before any result below this line means anything.
+  #
+  # Scoped to this suite's own session-name prefix on purpose. A blanket kill on
+  # "herdr" would take the developer's own session down, and this suite has
+  # already damaged this machine once by being careless about that boundary.
+  local swept=0 stray
+  for stray in $(pgrep -f "herdr --session e2e-" 2>/dev/null); do
+    # Skip our own server: the current run is legitimately alive right now.
+    grep -q -- "--session $SESSION " <<<"$(ps -o args= -p "$stray" 2>/dev/null)" && continue
+    kill "$stray" 2>/dev/null && swept=$((swept + 1))
+  done
+  if [ "$swept" -gt 0 ]; then
+    printf 'e2e: swept %s leaked e2e server(s) from an earlier run before the resume case\n' \
+      "$swept" >&2
+  fi
+  # A swept process may still be visible for a moment, and the assertion below is
+  # about what is alive NOW, so give the signal the same bounded wait the watcher
+  # teardown in cleanup uses. Bounded, because a server ignoring SIGTERM must not
+  # hang the suite.
+  local swept_wait=0
+  while [ "$swept_wait" -lt 2000 ] && pgrep -f "herdr --session e2e-" >/dev/null 2>&1 \
+        && ! pgrep -f "herdr --session $SESSION " >/dev/null 2>&1; do
+    sleep 0.1 2>/dev/null || sleep 1
+    swept_wait=$((swept_wait + 100))
+  done
+  if pgrep -f "herdr --session e2e-" >/dev/null 2>&1 \
+     && ! pgrep -f "herdr --session $SESSION " >/dev/null 2>&1; then
+    fail "$name" "another e2e server from an earlier run is still alive" \
+      "live: $(pgrep -fl 'herdr --session e2e-' 2>/dev/null | cut -c1-160 | tr '\n' ' ')" \
+      "every run mints the same pane id w1:p2, so a report naming w1:p2 would" \
+      "SUCCEED against that stale server and this case would measure the wrong" \
+      "machine. Stopping here rather than reporting a result I cannot trust."
+    return
+  fi
 
   if [ -z "${NEW_PANE:-}" ]; then
     fail "$name" "no new pane recorded by the launch case"

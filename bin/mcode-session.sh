@@ -510,8 +510,27 @@ cmd_report() {
   verify_session_readback "$pane" "$sid"
 }
 
+# Where this process believes it is talking, and to what. OFF by default; the e2e
+# turns it on with MCODE_LOG_REPORT_ENV=1.
+#
+# WHY IT EXISTS: an intermittent e2e failure showed the resume report being
+# accepted (exit 0) while the session's own server logged no report request at
+# all. A call that returns 0 without reaching the intended server is either going
+# somewhere else or not happening, and the environment is the only place the
+# difference shows. One line, gated, because this is a diagnostic and not
+# something an operator should read on every launch.
+#
+# The socket is the load-bearing half: herdr rewrites HERDR_SOCKET_PATH and
+# HERDR_BIN_PATH in every plugin process it spawns (src/app/api/plugins/runtime.rs:39-55),
+# so a value that is not the expected session's socket names the wrong server.
+log_report_env() { # log_report_env <pane>
+  [ "${MCODE_LOG_REPORT_ENV:-0}" = "1" ] || return 0
+  log "mcode-session: env pane=$1 socket=${HERDR_SOCKET_PATH:-<unset>} herdr=$HERDR ppid=${PPID:-?} ppid_exe=$(readlink /proc/${PPID:-0}/exe 2>/dev/null || echo n/a)"
+}
+
 issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if herdr accepted
   local pane="$1" sid="$2"
+  log_report_env "$pane"
   # shellcheck disable=SC2206  # deliberate word-splitting: a command line
   local -a resume_argv=(${MCODE_RESUME_CMD})
   local -a session_argv=(pane report-agent-session --source "$AGENT_SOURCE" --agent "$AGENT_LABEL")
