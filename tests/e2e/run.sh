@@ -352,15 +352,27 @@ prepare_stub_mcode() {
   mkdir -p "$WORKDIR/bin"
   cat > "$WORKDIR/bin/$AGENT_LABEL" <<STUB
 #!/bin/sh
-# Stand-in for the real launcher. Kept alive so the pane does not exit: herdr
-# drops a pane's agent registration when the pane's process ends, and a pane
-# whose shell exits would take the registration with it.
+# Stand-in for the real launcher, and it must be a LONG-LIVED process for the whole
+# time the test needs it.
+#
+# Not a nicety. A self-report on a pane whose foreground process is transient is
+# volatile: reported_resume follows the registration, and a registration that
+# wobbles takes the resume with it. m2 and m1 both measured that on a shell-only
+# pane. This case failed once in a full-suite run with the resume accepted by
+# herdr and then absent from the snapshot, which is the shape that produces.
+#
+# The pane gets the stub's path typed in, so for a moment its foreground process is
+# still the shell. The marker file is how the test knows the long-lived process is
+# actually in place, so the wait can be placed where it matters rather than assumed.
 printf 'mcode (e2e stub) %s\n' "\$*"
-exec sleep 300
+: > "\$MCODE_STUB_MARKER"
+exec sleep 600
 STUB
   chmod +x "$WORKDIR/bin/$AGENT_LABEL"
   PATH="$WORKDIR/bin:$PATH"
   export PATH
+  MCODE_STUB_MARKER="$WORKDIR/stub-running"
+  export MCODE_STUB_MARKER
 
   # The resume command the plugin will record, overridden for the same PATH
   # reason and at the same moment as the stub: the action is spawned by the
@@ -851,6 +863,30 @@ run_case_resume_restored() {
   await_action_log 25
   ACTION_LOG="$(action_log_tail)"
 
+  # The stub must be the pane's foreground process before the resume is read back
+  # from the snapshot. The action types the stub's path and then reports the agent,
+  # so for a moment the pane is still running its shell, and a registration that
+  # wobbles takes reported_resume with it. Waiting for the stub's marker is what
+  # makes "a long-lived process is in place" a checked fact instead of an
+  # assumption — the alternative is a test that is green or red depending on how
+  # fast the machine was.
+  #
+  # Bounded, and its own failure: if the marker never appears the stub never ran,
+  # and every assertion below would be about a pane that was never really launched.
+  local marker_waited=0
+  while [ ! -f "$MCODE_STUB_MARKER" ] && [ "$marker_waited" -lt 10000 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    marker_waited=$((marker_waited + 100))
+  done
+  if [ ! -f "$MCODE_STUB_MARKER" ]; then
+    fail "$name" "the stub launcher never started in pane $NEW_PANE, so there is no long-lived process behind the registration" \
+      "expected marker: $MCODE_STUB_MARKER" \
+      "action log: ${ACTION_LOG}" \
+      "everything below this point would be measuring a pane that was never really" \
+      "launched, so this case stops here rather than reporting a false result."
+    return
+  fi
+
   # 1. STORED. The plugin reported the resume, and herdr kept it — in
   #    `agent_resume` in the session snapshot, which is the field the old
   #    read-back never looked at.
@@ -913,14 +949,10 @@ run_case_resume_restored() {
             "$(session_snapshot)" 2>/dev/null)" = "0" ]; then
     fail "$name" "the resume was reported and herdr ACCEPTED it, but the snapshot never gained it" \
       "action log: ${ACTION_LOG}" \
-      "herdr's exit status said the report landed, so this is not a refused report." \
-      "It is the record that went missing, and this case has reproduced it ONCE," \
-      "under full-suite load, after passing four times standalone or back to back." \
-      "NOT ROOT-CAUSED. herdr clears a pane's reported_resume in three places" \
-      "(terminal/state.rs:1920, :2025 and :2047) and any of them firing between the" \
-      "report and the 5s save debounce would produce exactly this. Which one fires" \
-      "is not established. Do not add a retry that hides it: a real regression would" \
-      "hide behind one too."
+      "the stub was confirmed running before this poll, so a long-lived process was" \
+      "in place and this is not the known shell-only-pane case. The herdr server log" \
+      "around this pane is the next thing to read; do NOT add a retry, because a" \
+      "retry would hide a real regression as thoroughly as it would hide a flake."
   elif ! grep -q "client connected" "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" 2>/dev/null; then
     fail "$name" "no client ever connected, so herdr's pending resume had a 0x0 terminal area" \
       "herdr skips deferred agent resumes when no client is attached" \
