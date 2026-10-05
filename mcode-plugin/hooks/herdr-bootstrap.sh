@@ -75,6 +75,12 @@
 
 set -uo pipefail
 
+# TEST-ONLY KNOBS. All three are unreachable from a real hook: mcode strips every
+# variable the user exported, so in production these are ALWAYS the defaults. They
+# exist so the suite can drive this script directly, and they are named as test
+# affordances on purpose. `MCODE_AGENT_SOURCE` is the dangerous one — a test could
+# set a wrong `--source` and the suite would pass on a string the shipped hook can
+# never produce. Do not add a knob here that reads as a production setting.
 AGENT_LABEL="${MCODE_AGENT_LABEL:-mcode}"
 AGENT_SOURCE="${MCODE_AGENT_SOURCE:-herdr:minimax-code}"
 
@@ -116,10 +122,21 @@ chain_walk() {
 
 # Call herdr against ONE specific session, by socket, never by name and never
 # without qualification. `h_ <socket> <args...>`.
+#
+# herdr's stderr is folded into our log rather than discarded. This is the one place
+# the hook used to be un-diagnosable exactly when it mattered: when herdr REFUSES a
+# report-agent it says why on stderr, and throwing that away left a log line reading
+# "herdr REFUSED the registration" with no reason attached. The whole `--source`
+# story in this repo lives in errors herdr declines to print. A caller that sets
+# `H_ERR` gets the text instead, so the discovery loop stays quiet.
 h_() {
   local sock="$1"
   shift
-  HERDR_SOCKET_PATH="$sock" "$HERDR" "$@" 2>/dev/null
+  if [ -n "${H_ERR:-}" ]; then
+    HERDR_SOCKET_PATH="$sock" "$HERDR" "$@" 2>>"$H_ERR"
+  else
+    HERDR_SOCKET_PATH="$sock" "$HERDR" "$@" 2>/dev/null
+  fi
 }
 
 # ---- pane discovery -----------------------------------------------------------
@@ -147,7 +164,10 @@ budget_left() { # budget_left <start_ms>
 
 discover_pane() { # discover_pane <chain>
   local chain="$1" start_ms best_sock="" best_pane="" best_rank=999999
-  local sock running pane_id procs shell_pid fg_pgid rank pid idx
+  local sock running pane_id procs anchors rank pid idx
+  # `definitive` = a match nothing can beat, so the scan may stop. `truncated` =
+  # the budget cut the scan short, which must never look like a clean sweep.
+  local definitive=0 truncated=0
 
   start_ms="$(now_ms)"
 
@@ -178,7 +198,7 @@ discover_pane() { # discover_pane <chain>
       *) continue ;;
     esac
     [ "$running" = "true" ] || continue
-    budget_left "$start_ms" || { log "budget exhausted; stopping the search."; break; }
+    budget_left "$start_ms" || { truncated=1; break; }
 
     local panes_json
     panes_json="$(h_ "$sock" pane list)" || continue
@@ -186,20 +206,27 @@ discover_pane() { # discover_pane <chain>
 
     while IFS= read -r pane_id; do
       [ -n "$pane_id" ] || continue
-      budget_left "$start_ms" || break
+      budget_left "$start_ms" || { truncated=1; break; }
       # `pane process-info` takes --pane on 0.9.3, not a positional argument.
       procs="$(h_ "$sock" pane process-info --pane "$pane_id")" || continue
 
-      shell_pid="$(printf '%s' "$procs" | jq -r '.result.process_info.shell_pid // empty' 2>/dev/null)"
-      fg_pgid="$(printf '%s' "$procs" | jq -r '.result.process_info.foreground_process_group_id // empty' 2>/dev/null)"
-      [ -n "$shell_pid" ] || continue
+      # ONE jq, not three. The three values used to be extracted by three separate
+      # forks of jq, and forks — not herdr — dominated the per-pane cost. They now
+      # arrive as one TSV line. Measured on a 32-pane machine: 2 herdr + 3 jq per
+      # pane was ~24 ms, and the whole scan had to fit a 3 s budget.
+      anchors="$(printf '%s' "$procs" | jq -r '
+        [ (.result.process_info.shell_pid // empty),
+          (.result.process_info.foreground_process_group_id // empty),
+          ((.result.process_info.foreground_processes // [])[].pid) ]
+        | map(select(. != null and . != ""))
+        | join(" ")' 2>/dev/null)" || continue
+      [ -n "$anchors" ] || continue
 
       # Anchors, shell_pid first: the foreground group moves per job, so the shell
       # is the stable one, and the foreground pids are what let a pane running
       # mcode match on the mcode process itself.
       rank=999999
-      for pid in "$shell_pid" "$fg_pgid" \
-        $(printf '%s' "$procs" | jq -r '(.result.process_info.foreground_processes // [])[].pid' 2>/dev/null); do
+      for pid in $anchors; do
         case "$pid" in
           '' | *[!0-9]*) continue ;;
         esac
@@ -215,9 +242,45 @@ discover_pane() { # discover_pane <chain>
         best_sock="$sock"
         best_pane="$pane_id"
       fi
+
+      # EARLY EXIT, and this is the fix that makes the scan affordable.
+      #
+      # A match at rank 0 is this very process and rank 1 is its `mcode` parent.
+      # Either one is definitive: no other pane can be nearer, because the chain
+      # only gets further away as the index grows. So once one is found, the
+      # remaining panes of this session and every later session cannot improve on
+      # it, and continuing to ask herdr about them is pure cost.
+      #
+      # Without this the loop kept going after it had already proved its pane, and
+      # the cost was O(all panes x all sessions) on EVERY session start. Measured
+      # by m3 with a 3-session x 100-pane fixture and the match at session 2: the
+      # pane was proved on about call 2 and the hook still spent 305. Against real
+      # herdr that is ~24 ms per pane, so a machine with ~85 panes exhausted the
+      # 3 s budget and the hook refused — the worst kind of failure, because the
+      # pane silently never registers, and it fails on exactly the busy machines
+      # where registration matters most.
+      if [ "$best_rank" -le 1 ]; then
+        definitive=1
+        break
+      fi
     done < <(printf '%s' "$panes_json" | jq -r '.result.panes[].pane_id' 2>/dev/null)
+    [ "$definitive" -eq 1 ] && break
   done < <(printf '%s' "$sessions_json" \
     | jq -r '.sessions[] | select(.running == true) | [.socket_path, "true"] | @tsv' 2>/dev/null)
+
+  # A TRUNCATED SCAN MUST SAY SO. If the budget cut the search short, the match we
+  # hold may not be the nearest one, and a caller reading only "proved pane X" would
+  # take that as a complete search. This is the same failure class as the one this
+  # issue already fought — a silent "enabled, nothing happened" — re-entering
+  # through a performance ceiling, so it is stated in the log rather than inferred.
+  if [ "$truncated" -eq 1 ]; then
+    log "WARNING: the ${DEADLINE_SECONDS}s search budget expired mid-scan."
+    if [ -n "$best_pane" ]; then
+      log "WARNING: using pane $best_pane at rank $best_rank anyway, but it may NOT be the nearest pane; some were never examined."
+    else
+      log "WARNING: no pane was examined before the budget expired."
+    fi
+  fi
 
   [ -n "$best_pane" ] || return 1
   printf '%s\t%s\t%s\n' "$best_sock" "$best_pane" "$best_rank"

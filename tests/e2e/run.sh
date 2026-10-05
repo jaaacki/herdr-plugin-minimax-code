@@ -1446,8 +1446,143 @@ prepare_stub_mcode
 self_test_isolation
 self_test_triage
 
+# ── case: the mcode SessionStart hook, against THIS real herdr ───────────────
+# Issue #118. Every other case here drives the plugin's launcher or the watcher
+# directly. This one drives what #118 actually added: the mcode-side hook, which
+# finds its own pane by walking its process ancestry and reports that pane once.
+#
+# WHY THE HOOK RUNS AS A CHILD OF THE PANE'S SHELL, RATHER THAN A REAL `mcode`.
+# mcode's entire contribution to the ancestry is "be a descendant of the pane's
+# shell", and the hook reads nothing else about it — no mcode on PATH, no
+# credentials, no API call, nothing from the session store. Running the hook as a
+# child of the pane's own shell therefore exercises the real mechanism against a
+# real herdr, on a CI runner with no mcode installed and no account to sign in
+# with. A real `mcode` session is verified by hand in an isolated session instead;
+# that evidence is on the #118 PR, and it is not reproducible in CI, so it is not
+# pretended at here.
+#
+# What this proves, and only this: real herdr, a real pane, a real process tree, a
+# real `pane report-agent` on the pane the ancestry proved, and the real
+# `ensure-watcher` picking that registration up and starting exactly one watcher.
+run_case_hook_bootstrap() {
+  local name="hook: a SessionStart run registers its own pane and starts a watcher"
+
+  if ! command -v pgrep >/dev/null 2>&1; then
+    fail "$name" "pgrep is required to assert a watcher process exists"
+    return
+  fi
+
+  # A fresh pane, so the assertion is about this hook and not about a registration
+  # the launch case already made.
+  local src pane
+  src="$(pane_ids | head -1)"
+  if [ -z "$src" ]; then
+    fail "$name" "no source pane to split from"
+    return
+  fi
+  pane="$("$HERDR" --session "$SESSION" pane split "$src" --direction right --no-focus 2>/dev/null \
+    | jq -r '.result.pane.pane_id' 2>/dev/null)"
+  if [ -z "$pane" ]; then
+    fail "$name" "could not split a pane for the hook to claim"
+    return
+  fi
+  THROWAWAY_PANE="$pane"
+  note_created_pane "$pane"
+
+  # The topology here is the production one, and BOTH halves of it are
+  # load-bearing. Measured while writing this case:
+  #
+  #   * If the hook is the only process in the pane's foreground, the registration
+  #     lasts about 300 ms and then herdr's detection pass drops it again. That
+  #     looks exactly like a hook that never reported, and it is a test artefact
+  #     rather than the production shape.
+  #   * With a LONG-LIVED foreground process holding the pane and the hook running
+  #     as its short-lived child -- which is what `mcode` does -- the registration
+  #     persists: measured steady across a 10s poll, state_change_seq holding at 1.
+  #   * And it must NOT be `exec sleep 300`: `exec` REPLACES the pane's shell, and a
+  #     command typed into `sleep` goes to its stdin and is discarded, so the hook
+  #     would never run at all.
+  local stand_in="$WORKDIR/fake-mcode-foreground.sh"
+  cat >"$stand_in" <<STANDIN
+#!/bin/sh
+# Stands in for mcode in a pane: holds the foreground for its lifetime and runs
+# the hook as its own child, so the ancestry the hook walks is the real one.
+sleep 300 &
+HOLDER=\$!
+env -u HERDR_SOCKET_PATH -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID \\
+  "$repo/mcode-plugin/hooks/herdr-bootstrap.sh" SessionStart >"$WORKDIR/hook.out" 2>&1
+wait \$HOLDER
+STANDIN
+  # Asserted BEFORE the stand-in starts, because the stand-in runs the hook
+  # immediately: checked afterwards, this would always find the pane already
+  # registered and the case would report its own setup as a failure.
+  if [ -n "$(agent_row "$pane")" ]; then
+    fail "$name" "pane $pane was already registered before the hook ran"
+    return
+  fi
+
+  chmod +x "$stand_in"
+  "$HERDR" --session "$SESSION" pane run "$pane" "$stand_in" >/dev/null 2>&1
+  sleep 1
+
+  # `pane run` types the command into the pane; the shell there runs it, so give
+  # the ancestry walk and the report a bounded window rather than reading once.
+  local i registered=0
+  for i in $(seq 1 40); do
+    if [ -n "$(agent_row "$pane")" ]; then registered=1; break; fi
+    sleep 0.25
+  done
+  if [ "$registered" -ne 1 ]; then
+    fail "$name" "the hook did not register pane $pane within 10s" \
+      "the hook resolves its pane by process ancestry; if the pane's shell is not" \
+      "an ancestor of the hook process it must refuse rather than guess" \
+      "hook output: $(tail -4 "$WORKDIR/hook.out" 2>/dev/null | tr '\n' '|')" \
+      "pane state: $("$HERDR" --session "$SESSION" agent get "$pane" 2>/dev/null | jq -c '.result.agent // .error' 2>/dev/null)"
+    return
+  fi
+
+  # THE STATE IS DELIBERATELY NOT ASSERTED, and reading that as an omission would be
+  # a mistake. The hook's one report is `--state idle`, but by the time this case
+  # reads the pane the watcher — started BY that report — has already classified the
+  # pane from its screen and owns the value. Measured here: `unknown`, because the
+  # stand-in is not a real mcode screen. That is the design working, not a
+  # regression, and asserting `idle` would be asserting that the watcher had not yet
+  # run — i.e. asserting a race. What must hold is that the pane is registered under
+  # the shared label and that exactly one watcher now owns it.
+  local row
+  row="$(agent_row "$pane")"
+  if [ "$(printf '%s' "$row" | jq -r '.agent // empty')" != "$AGENT_LABEL" ]; then
+    fail "$name" "pane $pane reports agent '$(printf '%s' "$row" | jq -r '.agent // empty')', expected $AGENT_LABEL" \
+      "hook output: $(tail -3 "$WORKDIR/hook.out" 2>/dev/null | tr '\n' '|')"
+    return
+  fi
+
+  # And the registration must have started exactly one watcher — the mechanism the
+  # whole bootstrap-only design rests on: the hook reports once, herdr fires
+  # pane.agent_status_changed, and ensure-watcher takes over.
+  local found=0
+  for i in $(seq 1 40); do
+    if pgrep -f "mcode-watch.sh $pane" >/dev/null 2>&1; then found=1; break; fi
+    sleep 0.25
+  done
+  if [ "$found" -ne 1 ]; then
+    fail "$name" "no watcher was started for $pane within 10s of the hook registering it" \
+      "the hook reports once and never again; the watcher it triggers is what owns" \
+      "state, so a registration with no watcher leaves the pane frozen at idle"
+    return
+  fi
+  local n
+  n="$(pgrep -f "mcode-watch.sh $pane" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -ne 1 ]; then
+    fail "$name" "$n watchers for one pane; it must be exactly 1"
+    return
+  fi
+  pass "$name"
+}
+
 run_case_bootstrap
 run_case_launch
+run_case_hook_bootstrap
 run_case_registered
 run_case_readable
 run_case_name_addressable

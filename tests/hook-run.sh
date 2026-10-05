@@ -485,6 +485,77 @@ case_manifest_command_actually_executes() {
   fi
 }
 
+# 13. THE EARLY EXIT IS LOAD-BEARING, and this is the case that fails without it.
+#
+#     The hook has a 3 s internal budget because mcode kills an overrun by process
+#     group. So the number of herdr calls it is allowed to make is not a style
+#     question — it is the difference between registering and refusing, on exactly
+#     the busy machines where registration matters most.
+#
+#     The fixture is three sessions of 50 panes each, with the matching pane FIRST
+#     in the first session. A correct hook proves its pane almost immediately and
+#     stops, because a match at chain rank 0 or 1 is definitive: nothing further
+#     along the chain can be nearer. Without the early exit this spends ~300 calls
+#     to reach a conclusion it already had.
+case_scan_stops_at_a_definitive_match() {
+  local pid calls_made
+  spawn_pane alpha
+  pid="$(pane_pid alpha)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+
+  # 3 sessions x 50 panes; the match is pane 0 of session 1.
+  write_fixture "$(jq -nc --argjson pid "$pid" '
+    def filler($n): [range(0; $n) | {pane_id:("wF:p" + tostring), shell_pid:900000, fg_pgid:0, fg_pids:[]}];
+    {sessions:[
+       {name:"s1",socket:"/tmp/hpmc-scale/s1.sock",running:true,
+        panes:([{pane_id:"w1:real",shell_pid:$pid,fg_pgid:0,fg_pids:[]}] + filler(50))},
+       {name:"s2",socket:"/tmp/hpmc-scale/s2.sock",running:true,panes:filler(50)},
+       {name:"s3",socket:"/tmp/hpmc-scale/s3.sock",running:true,panes:filler(50)}
+     ]}')"
+  reset_log
+  release_pane alpha
+
+  if ! grep -q 'report-agent w1:real' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the matching pane was not reported; log: $(calls | tr '\n' '|')"
+  fi
+  calls_made="$(wc -l <"$FAKE_HOOK_LOG" | tr -d ' ')"
+  # One session list + one pane list + process-info for the panes scanned up to and
+  # including the match. The match is pane 0, so ~3 calls. A generous ceiling still
+  # fails loudly for a full scan: 150 panes would need ~300.
+  if [ "$calls_made" -gt 20 ]; then
+    note "spent $calls_made herdr calls with the match at pane 0 of session 1"
+    note "a definitive match must end the scan; without that this is O(all panes x all sessions)"
+  fi
+}
+
+# 14. A budget that expires mid-scan is announced, never silent.
+#
+#     The failure this replaces is the worst shape of quiet: the hook gives up, the
+#     pane never registers, and the only trace is one line in mcode's hook
+#     diagnostics. A truncated search must say it was truncated.
+case_budget_expiry_is_announced() {
+  # One pane shell, launched directly so its stderr — and therefore the hook's
+  # stderr — lands in $WORK/stderr where it can be asserted on.
+  reset_log
+  /bin/rm -f "$WORK/budget.pid" "$WORK/budget.go" 2>/dev/null
+  MCODE_HOOK_BUDGET_SECONDS=0 \
+    "$WORK/pane-shell.sh" budget "$WORK" hook >"$WORK/stderr" 2>&1 &
+  PANE_SHELL_PID=$!
+  local i=0
+  while [ ! -s "$WORK/budget.pid" ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+  : >"$WORK/budget.go"
+  wait "$PANE_SHELL_PID" 2>/dev/null
+  PANE_SHELL_PID=""
+
+  if ! grep -q 'budget expired' "$WORK/stderr" 2>/dev/null; then
+    note "the budget expired but nothing announced it; a truncated scan must say so"
+    note "stderr: $(head -5 "$WORK/stderr" 2>/dev/null | tr '\n' '|')"
+  fi
+  if grep -q 'report-agent' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "reported a pane with no budget to examine one; that is guessing, not proving"
+  fi
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
@@ -497,6 +568,8 @@ CASES=(
   reports-once-with-the-shared-source:case_reports_once_with_the_shared_source
   survives-a-missing-herdr-and-bad-json:case_survives_a_missing_herdr_and_bad_json
   foreground-process-is-an-anchor:case_foreground_process_is_an_anchor
+  scan-stops-at-a-definitive-match:case_scan_stops_at_a_definitive_match
+  budget-expiry-is-announced:case_budget_expiry_is_announced
   install-never-uses-a-bare-rm:case_install_never_uses_a_bare_rm
 )
 
