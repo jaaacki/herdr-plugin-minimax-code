@@ -135,11 +135,60 @@ esac
 #           nothing. Banked captures and provenance:
 #           tests/fixtures/detection/README.md.
 #
+# ALSO REJECTED, and it is the obvious thing to reach for: the composer's `›`
+# prompt line. It is on every mcode screen, idle AND working, and `›` is a
+# generic glyph - it appears in half the tools on a machine. It happens to be
+# absent from the one captured non-mcode pane, but one sample is not evidence
+# that no other pane carries it, and misreporting a foreign pane as an idle
+# mcode session is worse than reporting it `unknown`.
+#
+# THE COMPOSER HINT HAS THREE TEXTS, AND ONLY ITS SUFFIX IS STABLE.
+#
+# What mcode prints above the input box depends on what is in the composer, and
+# all of these were captured (tests/fixtures/detection/README.md):
+#
+#   empty, fresh session   Start · @ file or Plugin · / autocomplete
+#   empty, after a turn    Message · Enter send · Shift+Enter newline
+#   ONE line of text       Prompt · Enter send · Shift+Enter newline
+#   TWO lines or more      Long draft · Ctrl+G edit · Enter send
+#
+# So a typed-but-unsubmitted composer REMOVES the only idle marker the tail had
+# and substitutes one of its own. The LEADING NOUN changes with the composer's
+# shape and the trailing affordance does not, so `Enter send` is the one string
+# that survives all three hints. That is what a marker is for - it has to
+# survive, not name a shape - and three specific rules would need a fourth the
+# next time the noun changes.
+#
+# `Enter send` CANNOT MATCH A WORKING SCREEN, and that was measured, not assumed.
+# The obvious way to break this is that mcode lets you type into the composer
+# while a turn is running - the working status line advertises "Enter steer" - so
+# it is the one way a composer marker could be read mid-turn. Captured, it is
+# not a risk: while a turn is in flight the status line occupies the hint's row
+# and the composer renders as bare prompt lines, with AND without a multi-line
+# draft in it. See working-with-composer-text.txt (one line typed) and
+# working-with-multiline-composer.txt (three lines typed), both banked for
+# exactly this. Across every captured screen `Enter send` appears in the idle
+# tails and `Enter steer` in the working ones, never both, and never in a
+# non-mcode pane.
+#
+# The suffix is still a phrase and not a bare word, which matters here: a bare
+# `Enter` would match "Option+Enter queue" on every working screen. Same mistake
+# as bare `Esc`, which matched mcode's own changelog prose on a captured IDLE
+# screen. Markers must be phrases.
+#
+# KNOWN LIMIT, measured, not guessed: the hint renders ABOVE the composer, so a
+# draft long enough to push its own hint out of the 8-line tail matches nothing
+# and reports `unknown`. Captured at 4 draft lines the hint is still in the tail;
+# at 5 it is gone, and the tail holds only prompt lines, box rules and the status
+# strip. Fixing that would need a marker on one of those, and the only candidate
+# is the rejected prompt line above. The window is documented rather than
+# papered over.
+#
 # Order matters: working is tested before idle. mcode has more than two resting
 # shapes - a fresh session ("Start - @"), a finished turn ("Completed in"), an
-# idle session still showing a task list, a drafted message, and mid-flight. A
-# finished turn is idle and is the common case; a watcher keyed only on the
-# fresh-session shape reports unknown for nearly every session.
+# idle session still showing a task list, a composer holding a draft, and
+# mid-flight. A finished turn is idle and is the common case; a watcher keyed
+# only on the fresh-session shape reports unknown for nearly every session.
 #
 # "More than two" is a floor, not a count. Each capture batch so far has added a
 # resting shape the one before it did not have, so the table below should be read
@@ -155,7 +204,7 @@ working|⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠭⠫
 idle|Start · @
 idle|● Ready
 idle|Completed in
-idle|Message · Enter send'
+idle|Enter send'
 
 has_marker() { # has_marker <text> <marker>
   printf '%s\n' "$1" | grep -qF -- "$2"

@@ -1,0 +1,10 @@
+   › steering line one
+     steering line two
+     steering line threewrite exactly 50 numbered lines, one short sentence each, about testing best practices
+    ⠼ Loading 1s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  typed during a running turn
+     second line of steering text
+     third line of steering text
+    ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  /private/tmp │ ◇ Count from one to eighty │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 96% left
