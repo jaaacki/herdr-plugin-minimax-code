@@ -97,10 +97,12 @@ export FAKE_HOOK_FIXTURE="$WORK/fixture.json"
 # Isolate the hook's DURABLE LOG, and do it once, for the whole suite.
 #
 # The hook writes to "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap".
-# Six places here run the hook; the two durable-log cases pass their own
-# MINIMAX_DATA_DIR through `env -i`, and the other three inherited the developer's
-# real $HOME. That was measured, not assumed: on a machine where this suite had
-# been run three times, 48 of the 54 fires in that developer's REAL
+# Six places here run the hook. Two are the durable-log cases, which pass their own
+# MINIMAX_DATA_DIR through `env -i`. The other FOUR inherited the developer's real
+# $HOME: the stand-in pane shell's heredoc below — which is how most cases reach the
+# hook, so it is the largest contributor — and the direct call sites at 352, 428 and
+# 432. That was measured, not assumed: on a machine where this suite had been run
+# three times, 48 of the 54 fires in that developer's REAL
 # ~/.minimax/state/herdr-bootstrap/hook.log were this suite — fake panes w1:p1,
 # w1:real, w3:real — and all 21 refusals in the file belonged to it too.
 #
