@@ -2,11 +2,16 @@
 # mcode-session.sh — register this pane's mcode session with herdr, and record
 # the command herdr would use to resume it after a restart.
 #
-# STATUS: wired but UNVERIFIED. This records a resume command; nobody has yet
-# watched herdr restore a pane from one. The restart needed to prove it cannot
-# be run safely anywhere yet — every candidate environment is a live machine
-# whose other work a restart would destroy. So: the registration is tested, the
-# resume is reasoned, not demonstrated. Do not describe it as working.
+# STATUS: wired, and the resume is now PROVEN (issue #85). A named herdr session
+# was launched, reported, stopped, restarted and re-attached, and `mcode --continue`
+# was observed running in the recreated pane. Before that, restart-restore was
+# wired but unverified, and the read-back reported the wrong field — it checked
+# `agent_session`, which herdr only populates for agent kinds it enumerates, and so
+# called a write that WAS stored "nothing was stored". The resume half is now
+# verified by the report's own exit status; the id half, which herdr discards
+# silently, is still read back. Read the measurement block below before changing
+# any of it: three sharp edges in the restore path are recorded there, and each one
+# has already cost a debugging round trip.
 #
 # ---- TWO RESUME MECHANISMS. Do not conflate them. ---------------------------
 # Every "is resume broken?" question about this file has this answer, and the two
@@ -19,61 +24,90 @@
 #      it keeps working whether or not herdr stored anything.
 #
 #   2. herdr RESTART-RESTORE — the `resume_argv` recorded on the pane, which
-#      herdr would re-run in a pane it recreated after a restart.
-#      ASSUME UNAVAILABLE, and do not claim otherwise. Two separate reasons, and
-#      they must not be merged:
-#        * it is UNVERIFIABLE — `herdr agent get` exposes no resume field at all,
-#          so no call available to this script can report whether herdr kept it;
-#        * and on 0.9.3 the write is DISCARDED anyway (measured below), which is
-#          good reason to assume it went with everything else.
-#      Unverifiable plus discarded is not the same claim as verified-absent, and
-#      this script only ever says the second about the session id, which the
-#      read-back can actually see.
+#      herdr re-runs in a pane it recreated after a restart.
+#      WORKS, and is now PROVEN end to end. See the measurement block below.
 #
-# ---- MEASURED: herdr 0.9.3 discards the session report (issue #71) -----------
-# Re-measured first-hand on 2026-10-04 against herdr 0.9.3, and the same result is
-# reported independently in sparkfn/pc-client#2251 (six exit-0 reports, zero
-# persisted fleet-wide). Do not re-derive this; it is the reason the read-back
-# below exists.
+# ---- MEASURED: the resume IS persisted, and a restart DOES run it ------------
+# Supersedes the "herdr 0.9.3 discards the session report" conclusion this file
+# carried until issue #85. That conclusion was half right, and the half that was
+# wrong is the half that mattered.
 #
-#   $ herdr pane report-agent <pane> --source herdr:minimax-code \
-#         --agent minimax-code --state idle -- mcode --continue
-#   $ herdr pane report-agent-session <pane> --source herdr:minimax-code \
-#         --agent minimax-code --agent-session-id mvs_testdeadbeef -- mcode --continue
-#   $ echo $?          # 0
+# What herdr actually does, verified in herdr source at tag v0.9.3 and then
+# measured live on 0.9.3 on 2026-10-05 (see the blocks below for both):
+#
+#   * `pane report-agent-session --resume-argv` is recorded as a
+#     `ReportedAgentResume` for ANY reporter. It is NOT gated on the closed
+#     `--kind` enum (`src/agent_resume.rs:30`). Only the session *id* is.
+#   * It is captured into the session snapshot as `agent_resume`
+#     (`src/persist/snapshot.rs:375`, `PaneAgentResumeSnapshot`).
+#   * On restore it is turned back into a plan and PREFERRED over a native agent
+#     session (`src/persist/restore.rs:815` `pane_restore_startup`), gated by
+#     `session.resume_agents_on_restore`, which defaults to true
+#     (`src/config/model.rs:278`).
+#
+# MEASURED LIVE, in a named session so the owner's herdr was untouched. Launch,
+# report, `server stop`, start again, attach a client:
+#
+#   $ cat ~/.config/herdr/sessions/<name>/session.json | jq -c \
+#       '[.workspaces[].tabs[].panes[] | select(.agent_resume) | .agent_resume]'
+#   [{"source":"herdr:minimax-code","agent":"mcode","argv":["mcode","--continue"]}]
+#   $ herdr --session <name> server stop && herdr --session <name> server &
+#   $ herdr session attach <name>          # a client must attach; see below
+#   $ herdr --session <name> pane read <pane>
+#     ... "No saved Session exists in the current workspace." ... Ask Mcode to do anything
+#
+# That last line is the REAL `mcode --continue` running in the recreated pane.
+#
+# THREE THINGS THAT WILL BITE, all measured, none of them guessable:
+#
+#   * A client must ATTACH before the resume runs. `pending_agent_resume_candidates`
+#     returns nothing while the terminal area is 0x0, which is the state of a
+#     headless server with no client (src/app/agent_resume.rs:99). Panes spawn as
+#     plain shells and the resume is silently skipped. This is why the e2e case
+#     has to attach a pty, and why "I restarted and nothing happened" is the most
+#     common false alarm about this feature.
+#   * `mcode --continue` resolves by CWD, not by session id. Restored in a
+#     directory with no mcode session, it prints "No saved Session exists in the
+#     current workspace" — which is mcode answering correctly, not a failed
+#     restore. The restore ran; the session was simply not there.
+#   * herdr dedupes by (source, agent, cwd, argv) — `ReportedAgentResume::plan`
+#     builds exactly that key (src/agent_resume.rs:41). Two mcode panes in ONE cwd
+#     therefore restore only ONE. Measured: with w1:p1 and w1:p2 both reporting
+#     `mcode --continue` in the same directory, w1:p1 came back running mcode and
+#     w1:p2 came back a plain shell. The winner is the lowest raw pane id, because
+#     the snapshot's `panes` map is walked in key order and the first insert into
+#     `resumed_sessions` wins. So the second pane silently loses its resume.
+#
+# ---- WHAT IS STILL NOT STORED: the session ID -------------------------------
+# The id half of the old conclusion was right, and stays. `session_ref_from_report`
+# returns None unless the reporter is one of the agent kinds herdr enumerates
+# (`src/agent_resume.rs:116`), and mcode is not one, so:
+#
 #   $ herdr agent get <pane> | jq -r '.result.agent.agent_session'
 #   null
 #
-# Facts that matter, all on 0.9.3:
+# An absent id is expected and not a plugin fault. It is also harmless: manual
+# resume re-resolves by workspace and never needed one. The two halves are now
+# verified in two different ways — the resume by the report's exit status, which
+# herdr makes meaningful by refusing rather than dropping, and the id by reading
+# `agent get` back, because herdr accepts and discards an id with no error at all.
+# The bug this file used to have was checking only the id and generalising its
+# verdict to the resume.
 #
-#   * `pane report-agent-session` exits 0 and the write does not happen. No error,
-#     no warning, nothing persisted. This is the silent no-op shape that the
-#     ${HERDR_PLUGIN_ROOT} bug used to have, and that we have now been caught by
-#     three times.
-#   * The id's shape, `--session-start-source`, and an enormous `--seq` make no
-#     difference; the discard is unconditional. The --seq case rules out a stale
-#     watermark, which was the most plausible benign explanation left.
-#   * Root cause is upstream: herdr persists session identity only for the closed
-#     set of agent kinds it enumerates in `agent start`, and mcode is not one of
-#     them. We cannot patch that from this repo. It is a separate epic.
-#   * Fleet-wide, only `herdr:claude` and `herdr:codex` panes carry a session.
+# One API detail that is easy to get wrong and is load-bearing below: `agent_session`
+# is an OBJECT, not a string. A pane that does have a session returns
+# {"agent":..,"kind":"id","source":"herdr:claude","value":"94929c8f-…"}, so the id
+# is at `.result.agent.agent_session.value`. Reading `.result.agent.agent_session`
+# directly yields the whole object as text.
 #
-# Two API details that are easy to get wrong and are load-bearing below:
+# `herdr agent get` exposes no resume field at all, and nothing needs it to: herdr
+# refuses the resume report outright rather than dropping it, so the report's exit
+# status is the verification. See the read-back comment above for why the resume
+# half is not read back from a file.
 #
-#   * `agent_session` is an OBJECT, not a string. A pane that does have a session
-#     returns {"agent":..,"kind":"id","source":"herdr:claude","value":"94929c8f-…"},
-#     so the id is at `.result.agent.agent_session.value` and `kind` discriminates
-#     it. Reading `.result.agent.agent_session` directly yields the whole object as
-#     text and can never equal a bare `mvs_…` id. On an mcode pane the key is
-#     ABSENT, not present-and-null.
-#   * `herdr agent get` exposes NO resume field at all — there is no resume_argv
-#     anywhere in the response. So resume persistence is structurally
-#     unverifiable through this API, which is why the no-session-id path below
-#     says exactly that instead of implying it checked.
-#
-# Consequence for this script: reporting is not proof. After the report it now
-# reads the pane back and says what herdr actually kept. That is a warning, never
-# an error — see verify_session_readback for why.
+# Consequence for this script: the ID half of a report is not proof — herdr accepts
+# and discards an id for a non-enumerated kind without any error — so that one IS
+# read back. It is a warning, never an error.
 #
 # Two ways this gets used:
 #
@@ -92,7 +126,9 @@
 #
 #   resolve   print the resolution outcome; never mutates anything
 #   report    resolve, re-assert the pane's agent state, attach identity, then
-#             read the report back and warn if herdr discarded it (issue #71)
+#             read the report back and say what herdr actually kept (issue #71,
+#             corrected by #85: the id and the resume command are two fields in
+#             two different files, and only one of them is ever missing)
 #
 # Environment (all optional):
 #   HERDR_BIN_PATH         path to the herdr binary
@@ -132,11 +168,18 @@ AGENT_SOURCE="${MCODE_AGENT_SOURCE:-herdr:minimax-code}"
 # The resume command herdr will re-run in the restored pane.
 #
 # Default is the bare name `mcode --continue`, because `report-agent --help`
-# documents RESUME_ARG as "starts with a plain command name". An absolute path
-# would be more robust against a different PATH in the restored pane, but I have
-# not established that herdr accepts a path there, and the only way to settle it
-# is to actually restore a pane — which is issue #36's outstanding criterion.
-# Override with MCODE_RESUME_CMD if the bare name proves unreliable.
+# documents RESUME_ARG as "starts with a plain command name" and herdr enforces
+# it: `validate_resume_argv` rejects any argv whose first element is not a plain
+# command name, so an absolute path here is not merely discouraged, it is refused
+# (src/agent_resume.rs:58). This is not a style preference to be "improved" later.
+#
+# MEASURED, since the restore is now proven: a pane restored with this argv runs
+# the real mcode from a login shell's PATH. It did NOT run a stub placed earlier
+# on the SERVER's PATH — the recreated pane's shell resolves commands from its own
+# login environment, not from the environment the server was started with. So
+# "mcode is on my PATH because I launched herdr with it on PATH" is false, and
+# "mcode is on my PATH because I installed it" is what has to be true.
+# Override with MCODE_RESUME_CMD if that ever stops holding.
 MCODE_RESUME_CMD="${MCODE_RESUME_CMD:-mcode --continue}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -228,19 +271,34 @@ current_agent_state() {
     2>/dev/null || true
 }
 
-# --- read-back: did the report actually land? ---------------------------------
-# herdr accepts `pane report-agent-session` and discards it (see the measurement
-# block at the top of this file). Exit 0 from a CLI call is a claim about the
-# process, not about the state, and the state is the only thing anyone downstream
-# needs. So the report is read back and the difference is stated.
+# --- read-back: did herdr keep the session ID? --------------------------------
+# The report writes two things, and they are NOT verified the same way.
+#
+#   * the resume command — verified by the REPORT'S OWN EXIT STATUS. herdr refuses
+#     outright rather than silently dropping it: `report-agent-session` answers
+#     `resume_not_accepted` when the reporter does not hold the pane
+#     (src/app/api/plugins/panes.rs:1683). So 0 means recorded, non-zero means
+#     refused, and issue_session_report says which. Reading herdr's session file to
+#     double-check was tried and removed: herdr debounces session saves by five
+#     seconds, so a read taken while a launch is still running reports the resume
+#     "absent" on essentially every launch. A check that is wrong almost every time
+#     is worse than none, and it was costing a file read and four functions.
+#   * the session ID — verified by reading `agent get`, because herdr accepts and
+#     discards an ID for a non-enumerated agent kind without any error at all. That
+#     is the case a read-back exists for, and the only one left.
 #
 # WHY A WARNING AND NOT A FAILURE. The launch and the registration both already
-# succeeded; what is missing is a capability herdr declined to provide. Exiting
-# non-zero would report a success as a failure and invite a caller to retry,
-# which would spawn duplicate work to fix something that is not ours to fix. The
-# one thing that is not negotiable is silence: exiting 0 while claiming a session
-# was stored is the exact defect #71 exists to close. So every path here returns
-# 0, and every path that did not confirm says so in words.
+# succeeded. Exiting non-zero would report a success as a failure and invite a
+# caller to retry, which would spawn duplicate work. The one thing that is not
+# negotiable is silence: exiting 0 while claiming a session was stored — or while
+# claiming one was NOT stored when it was — is the exact defect #71 exists to
+# close, and #85 is the same defect wearing the opposite sign. So every path here
+# returns 0, and every path that did not confirm says so in words.
+#
+# LINES ARE SHORT ON PURPOSE. This runs on every launch and every attach. A
+# paragraph per outcome is noise in a scrollback, and a reader who scrolls past
+# three screens of prose has not been told anything they could not have had in one
+# line.
 
 # Print the session id herdr actually holds for a pane, or nothing.
 #
@@ -262,35 +320,36 @@ readback_session_id() { # readback_session_id  — reads an `agent get` response
     ' 2>/dev/null || true
 }
 
-# Verify what herdr actually kept after a session report, and describe it.
+# Verify the session ID herdr actually holds, and describe it in one line.
 #
-# Outcomes, and the wording is load-bearing — each says a different fact, and
-# collapsing any two of them would be a smaller version of the lie #71 is about:
+# The outcomes, and the wording is load-bearing — each states a different fact:
 #
-#   * id sent, reads back          → say nothing. A confirmed write needs no
-#                                    commentary, and this is the anti-cheat case:
-#                                    a read-back that always warns is as wrong as
-#                                    one that never warns.
-#   * id sent, absent or different → name the id, the pane, the cause, and what
-#                                    is verified lost. Session identity is
-#                                    VERIFIED absent by the read-back; whether
-#                                    herdr kept the resume command is a
-#                                    SEPARATE question this API cannot answer —
-#                                    see the header block.
+#   * id sent, reads back          → SAY NOTHING. A confirmed write needs no
+#                                    commentary, and this is the anti-cheat case: a
+#                                    read-back that always warns is as wrong as one
+#                                    that never warns.
+#   * id sent, absent or different → VERIFIED absent, and EXPECTED. herdr keeps a
+#                                    session id only for the agent kinds it
+#                                    enumerates (session_ref_from_report,
+#                                    src/agent_resume.rs:116) and mcode is not one.
+#                                    Reporting this as a failure was the bug #85
+#                                    exists to fix: it is correct behaviour, and the
+#                                    old wording dressed it as a fault.
 #   * id sent, `agent get` failed  → could not confirm. NOT a claim of loss.
-#   * no id sent                    → identity is a different question (nothing
-#                                    was sent), and resume persistence is
-#                                    structurally unverifiable either way.
+#   * no id sent                    → nothing to compare against, but the read-back
+#                                    is still made: a session already on the pane is
+#                                    one THIS RUN did not put there, and a stale
+#                                    registration is worth naming.
 verify_session_readback() { # verify_session_readback <pane> [session-id]
-  local pane="$1" sid="${2:-}" out found reported
+  local pane="$1" sid="${2:-}" out found
 
   # `if ! out=$(...)` and not a bare capture: under `set -e` a failing assignment
   # aborts before any diagnostic can print, which is the failure mode #71 is about.
   if ! out=$("$HERDR" agent get "$pane" 2>/dev/null); then
     if [ -n "$sid" ]; then
-      log "mcode-session: reported session ${sid} for pane ${pane}, but could not verify it: \`${HERDR} agent get ${pane}\` failed. Session identity and the resume command are UNVERIFIED — neither confirmed stored nor confirmed lost. Not a registration failure: the pane is registered. Exiting 0."
+      log "mcode-session: reported session ${sid} for pane ${pane}, but \`agent get\` failed, so the id is UNVERIFIED — neither stored nor lost. The pane IS registered; exiting 0."
     else
-      log "mcode-session: no session id was reported, and \`${HERDR} agent get ${pane}\` failed, so the read-back could not verify what this pane holds. Identity is unconfirmed; whether the resume command was persisted is unverifiable regardless, because \`agent get\` exposes no resume field. Not a registration failure: the pane is registered. Exiting 0."
+      log "mcode-session: no session id was reported, and \`agent get\` failed, so what this pane holds is unconfirmed. The pane IS registered; exiting 0."
     fi
     return 0
   fi
@@ -301,47 +360,28 @@ verify_session_readback() { # verify_session_readback <pane> [session-id]
 
   if [ -n "$sid" ]; then
     if [ "$found" = "$sid" ]; then
-      # Confirmed. Silence is the correct output here; a "yay it worked" line would
-      # be noise on a path that is supposed to be the uneventful one.
+      # Confirmed. Silence is the correct output; "yay it worked" would be noise on
+      # the path that is supposed to be the uneventful one.
       return 0
     fi
+    local reported
     if [ -n "$found" ]; then
       reported="a different session ('${found}')"
     else
-      reported="no session at all (agent_session is absent)"
+      reported="no session at all"
     fi
-    # Two different resume mechanisms, and only one of them is settled here.
-    # Conflating them is the mistake this wording used to make.
-    #
-    #   * Session identity — VERIFIED absent. The read-back just looked, and it
-    #     is not there. This is a fact.
-    #   * resume_argv / herdr restart-restore — UNVERIFIABLE. `agent get` has no
-    #     resume field, so no API call can tell us whether herdr kept the resume
-    #     command. herdr discarded this whole call, which is good reason to
-    #     *assume* it went too, but assume is not verify, and saying otherwise
-    #     would be asserting a measurement nobody took.
-    #   * Manual `mcode --continue` — UNAFFECTED. It re-resolves by workspace and
-    #     needs no session id at all, so it works whether or not herdr kept
-    #     anything. That is the mechanism people actually use today.
-    log "mcode-session: reported session ${sid} for pane ${pane}, but herdr 0.9.3 did not persist it — \`agent get\` reports ${reported}. Session identity is NOT stored: that is verified by the read-back, not inferred. Whether herdr kept the resume command is a separate question this API cannot answer — \`agent get\` exposes no resume field — so ASSUME herdr restart-restore is unavailable rather than rely on it. Manual resume is unaffected: '${MCODE_RESUME_CMD}' re-resolves by workspace and needs no session id. This is a herdr limitation for agent kinds it does not enumerate (mcode is not one), not a plugin error, and it is upstream. The pane IS registered; exiting 0 so no caller retries work that cannot succeed."
+    log "mcode-session: reported session ${sid} for pane ${pane}, but herdr holds ${reported}. The id is NOT stored, verified by the read-back — expected, not a fault: herdr keeps a session id only for the agent kinds it enumerates."
     return 0
   fi
 
-  # No id was sent, so there is nothing to compare against — but the read-back is
-  # still worth making, because what it finds is attributable: any session on this
-  # pane is one this run did NOT put there. That is a stale registration from an
-  # earlier run or another reporter, and a stale registration is worse than none.
-  # Reading it and saying nothing would be the silent no-op this whole change
-  # exists to remove, so the read-back is made unconditionally.
+  # No id was sent, so there is nothing to compare against — but the read-back still
+  # reports something attributable: a session already on the pane is one this run
+  # did not put there.
   if [ -n "$found" ]; then
-    log "mcode-session: no session id was reported, and the read-back shows pane ${pane} already carries session '${found}', which this run did NOT report — a registration left by an earlier run or by another reporter. Expect resume to be unavailable until that is resolved."
+    log "mcode-session: no session id was reported, and pane ${pane} already carries session '${found}', which this run did NOT report — a registration left by an earlier run or another reporter."
   else
-    log "mcode-session: no session id was reported, and the read-back confirms pane ${pane} holds no session — nothing was stored, and nothing was sent to be stored."
+    log "mcode-session: no session id was reported, and the read-back confirms pane ${pane} holds none — nothing was sent to be stored, so nothing is missing."
   fi
-  # True regardless of what the read-back found, and true for a structural reason
-  # rather than an unlucky one: `herdr agent get` has no resume field at all, so
-  # there is no API through which to check whether herdr kept the resume command.
-  log "mcode-session: herdr restart-restore is unverifiable from here. Whether herdr kept the resume command ('${MCODE_RESUME_CMD}') cannot be checked: \`herdr agent get\` exposes no resume field, and on herdr 0.9.3 the session report is discarded outright, so assume restart-restore is unavailable. Manual resume is a different mechanism and is unaffected — it re-resolves by workspace and needs no session id. The pane IS registered; exiting 0."
   return 0
 }
 
@@ -428,21 +468,27 @@ cmd_report() {
     # Deliberate, not accidental: the lookup above cannot succeed against today's
     # manifest schema, and reporting a wrong id is worse than reporting none.
     #
-    # This line went through two corrections, both because it made claims the
-    # evidence does not support.
+    # This line went through three corrections, each because it made a claim the
+    # evidence did not support. The first two are kept because the shape of the
+    # mistake is the thing worth remembering.
     #
     # It used to end "Resume is unaffected: '…' re-resolves by workspace". "Resume
     # is unaffected" reads as a claim about whether herdr KEPT the resume command,
-    # and herdr discarded the whole report-agent-session call on 0.9.3 —
-    # resume_argv included — so we cannot say it was kept.
+    # which this line had no way to support at the time.
     #
-    # The second correction is the one that mattered: even "the command does not
-    # depend on an id" was still merging two mechanisms. `mcode --continue` run by
-    # a person genuinely is unaffected, and needs no id. herdr restart-restore is
-    # a different mechanism fed by a different write, and nothing here can report
-    # on it. So the claim is now scoped to MANUAL resume by name, and points at
-    # the header block, which is the single authoritative statement of the split.
-    log "mcode-session: no session id could be resolved for this pane (no manifest records a cwd), so none is reported. MANUAL resume is unaffected: '${MCODE_RESUME_CMD}' re-resolves by workspace and needs no session id. That is separate from herdr restart-restore, whose resume command this API cannot report on at all."
+    # The second correction: even "the command does not depend on an id" was still
+    # merging two mechanisms. `mcode --continue` run by a person genuinely is
+    # unaffected and needs no id. herdr restart-restore is a different mechanism
+    # fed by a different write.
+    #
+    # The third, and the one issue #85 forced: this line used to end "…whose
+    # resume command this API cannot report on at all". That was true, and it was
+    # also the thing that made the file overclaim — from "no API can tell me" it
+    # went on to advise assuming restart-restore was unavailable, and herdr keeps
+    # the resume command and does restore it. So the claim is now scoped to MANUAL
+    # resume by name, and the restart-restore half is verified where it is
+    # actually decided: the report's own exit status, a few lines below.
+    log "mcode-session: no session id could be resolved for this pane (no manifest records a cwd), so none is reported. MANUAL resume is unaffected: '${MCODE_RESUME_CMD}' re-resolves by workspace."
   fi
 
   # The session report itself is shared with `attach` (issue #79) so the argv, the
@@ -451,20 +497,40 @@ cmd_report() {
     die "\`${HERDR} pane report-agent-session ${pane}\` failed. The state report above succeeded, so the pane is registered; the session identity was not attached."
   fi
 
-  # Exit 0 from the call above is not evidence the write happened — herdr 0.9.3
-  # discards this report and still exits 0 (measurement block at the top). So the
-  # pane is read back afterwards, unconditionally.
+  # The ID is read back after the report, unconditionally. The RESUME is not, and
+  # does not need to be: issue_session_report already took its exit status, and
+  # that is the only signal herdr gives for it.
   #
   # Unconditional, including when no id was sent. There is nothing to *compare*
   # against in that case, but the read-back still reports something attributable:
   # any session already on the pane is one this run did not put there, which is a
   # stale registration worth naming. Skipping the call would make the no-id path
-  # the one path that reports success without looking.
+  # the one path that reports success without looking. The resume half needs no id
+  # at all, so it is checked in every case.
   verify_session_readback "$pane" "$sid"
+}
+
+# Where this process believes it is talking, and to what. OFF by default; the e2e
+# turns it on with MCODE_LOG_REPORT_ENV=1.
+#
+# WHY IT EXISTS: an intermittent e2e failure showed the resume report being
+# accepted (exit 0) while the session's own server logged no report request at
+# all. A call that returns 0 without reaching the intended server is either going
+# somewhere else or not happening, and the environment is the only place the
+# difference shows. One line, gated, because this is a diagnostic and not
+# something an operator should read on every launch.
+#
+# The socket is the load-bearing half: herdr rewrites HERDR_SOCKET_PATH and
+# HERDR_BIN_PATH in every plugin process it spawns (src/app/api/plugins/runtime.rs:39-55),
+# so a value that is not the expected session's socket names the wrong server.
+log_report_env() { # log_report_env <pane>
+  [ "${MCODE_LOG_REPORT_ENV:-0}" = "1" ] || return 0
+  log "mcode-session: env pane=$1 socket=${HERDR_SOCKET_PATH:-<unset>} herdr=$HERDR ppid=${PPID:-?} ppid_exe=$(readlink /proc/${PPID:-0}/exe 2>/dev/null || echo n/a)"
 }
 
 issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if herdr accepted
   local pane="$1" sid="$2"
+  log_report_env "$pane"
   # shellcheck disable=SC2206  # deliberate word-splitting: a command line
   local -a resume_argv=(${MCODE_RESUME_CMD})
   local -a session_argv=(pane report-agent-session --source "$AGENT_SOURCE" --agent "$AGENT_LABEL")
@@ -474,7 +540,46 @@ issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if h
   session_argv+=("$pane")
   session_argv+=(--)
   session_argv+=("${resume_argv[@]}")
-  "$HERDR" "${session_argv[@]}"
+
+  # The exit status says herdr ACCEPTED the report, and that is the ONLY thing it
+  # says. herdr refuses this call outright when it will not record the resume,
+  # answering `resume_not_accepted` when the reporter does not hold the pane
+  # (src/app/api/plugins/panes.rs:1683), so 0 means accepted and non-zero means
+  # refused, and the status is passed through rather than swallowed.
+  #
+  # ACCEPTED IS NOT STORED. The comment here used to say "0 means recorded, and
+  # neither needs a second source to confirm it", and #99 falsifies that: the
+  # report goes to the CORRECT session socket with the real herdr binary, herdr
+  # returns 0, and that session's own log records no `pane.report_agent*` at all
+  # while its snapshot has no `agent_resume`. About one run in three.
+  #
+  # So a 0 here is herdr's word and nothing more, and the line below is worded to
+  # keep "accepted" and "kept" apart rather than to assert the second. Persistence
+  # is a capture-time question this call does not answer, which is also why the
+  # e2e case that would answer it is gated behind MCODE_E2E_RESUME=1.
+  #
+  # A SECOND, INDEPENDENT reason a 0 does not prove storage: herdr re-checks the
+  # argv when it captures the snapshot and drops the resume if `validate_resume_argv`
+  # rejects it — an absolute path, or an argv containing an apostrophe or a control
+  # character. That check runs at CAPTURE time, not report time. The default
+  # (`mcode --continue`) is well inside what validates.
+  #
+  # The status is PASSED THROUGH, not swallowed. Both callers do `if ! issue_
+  # session_report; then die ...`, and that contract is what makes a refusal
+  # visible: the launcher treats `attach` as best-effort, so a refusal surfaces as
+  # a named failure in the launch log rather than as silence. Returning 0 from both
+  # branches because `log` succeeded would quietly disarm that.
+  local out rc=0
+  if out=$("$HERDR" "${session_argv[@]}" 2>&1); then
+    log "mcode-session: resume command accepted by herdr (exit 0); after a restart herdr re-runs '${MCODE_RESUME_CMD}' in this pane if it kept it (not verified here, see #99)."
+  else
+    rc=$?
+    # Whitespace collapsed rather than newlines deleted: two stderr lines arrive
+    # with no separator otherwise, and the text is what makes this worth printing.
+    # Capped so the whole line stays near 200 characters.
+    log "mcode-session: resume REFUSED by herdr: $(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | cut -c1-110). Manual resume is unaffected."
+  fi
+  return "$rc"
 }
 
 # Attach identity to a pane some OTHER step has already registered. This is the
@@ -499,8 +604,9 @@ issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if h
 # step of. `attach` runs inside every launch, where the launch path has already said
 # what it is doing; the discovery chatter ("using session store", "resolved
 # session") is narration for an operator who asked a question, and repeating it
-# unasked is noise. The ONE line that must survive is the read-back's, because on
-# herdr 0.9.3 it is the only thing telling the user their session was discarded.
+# unasked is noise. The ONE line that must survive is the read-back's: it is the
+# only thing telling the user what herdr actually kept, and on a launch that
+# silently failed to store anything it is the only line there is.
 cmd_attach() {
   local pane="${HERDR_PANE_ID:-}"
   if [ -z "$pane" ]; then
