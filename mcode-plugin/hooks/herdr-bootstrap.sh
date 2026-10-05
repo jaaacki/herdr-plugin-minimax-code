@@ -100,6 +100,62 @@ fi
 # always written, because that is what mcode keeps in its hook diagnostics.
 log() {
   printf 'herdr-bootstrap: %s\n' "$*" >&2
+  # Every line that reaches stderr is also made durable. Routing it here rather than
+  # adding a dlog call at each step means a new log line cannot be added later that
+  # quietly skips the durable record — the two can no longer drift apart.
+  dlog "$*"
+}
+
+# ---- DURABLE LOG -------------------------------------------------------------
+# WHY THIS EXISTS. The one real-machine run of this hook, on 2026-10-05, registered
+# nothing and left no evidence at all: the command was malformed, mcode's TUI
+# consumed the hook's stderr, and every observable — pane status, watcher processes,
+# herdr's own request log — was equally consistent with "the hook never ran" and
+# "the hook ran and failed". stderr is not a diagnostic, it is a stream something
+# else decides whether to show you. This file is the diagnostic.
+#
+# WHERE. Under the plugin's own state directory, never beside the script: mcode runs
+# hooks from a content-addressed, read-only snapshot, so a write next to this file
+# either fails or lands in a throwaway copy that is deleted with the snapshot.
+# HOME is one of the few variables m3 measured as reaching a live hook, so this path
+# resolves from inside the stripped environment.
+#
+# BOUNDED. One line per step, and the file is trimmed to its tail once it passes
+# DLOG_MAX_BYTES. A diagnostic that can grow without limit on someone's machine is
+# not a diagnostic, it is a leak. Trimming keeps the last 200 lines, which spans
+# several sessions and still shows whether the current one started at all.
+#
+# NEVER FAILS THE HOOK. Every write is `|| true` and the mkdir is guarded. A
+# registration must never be lost because a log line could not be written; if this
+# file cannot be written, the hook's actual job still runs and still decides for
+# itself. The log is an observer here, not a participant.
+DLOG_DIR="${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap"
+DLOG_FILE="$DLOG_DIR/hook.log"
+DLOG_MAX_BYTES=65536
+DLOG_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+
+dlog() {
+  local sz
+  mkdir -p "$DLOG_DIR" 2>/dev/null || return 0
+  if [ -f "$DLOG_FILE" ]; then
+    sz="$(wc -c < "$DLOG_FILE" 2>/dev/null || echo 0)"
+    case "$sz" in '' | *[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "$DLOG_MAX_BYTES" ]; then
+      tail -n 200 "$DLOG_FILE" > "$DLOG_FILE.tmp" 2>/dev/null &&
+        mv "$DLOG_FILE.tmp" "$DLOG_FILE" 2>/dev/null
+    fi
+  fi
+  printf 'herdr-bootstrap %s pid=%s %s\n' "$DLOG_TS" "$$" "$*" >> "$DLOG_FILE" 2>/dev/null || true
+  return 0
+}
+
+# Chained onto the existing cleanup trap, not replacing it: the probe directory must
+# still be removed on the way out, and the exit code is the single most useful line
+# in the file when a run registers nothing.
+dlog_exit() {
+  dlog "exit=$?"
+  cleanup_probe_dir
+  return 0
 }
 
 # ---- the ancestry chain -------------------------------------------------------
@@ -232,7 +288,7 @@ cleanup_probe_dir() {
   PROBE_DIR=""
   return 0
 }
-trap cleanup_probe_dir EXIT
+trap dlog_exit EXIT
 
 # rank_for_pane <socket> <pane_id> <chain>
 #
@@ -528,8 +584,7 @@ main() {
 
   # Created HERE, in the parent, and not inside discover_pane: discover_pane runs in
   # a command substitution, so a directory it made would belong to a subshell that
-  # is gone before this line returns, and the EXIT trap would have nothing to clean.
-  # Fail closed if it cannot be made — a scan with nowhere to put its verdicts has
+  # is gone before this line returns, and the EXIT trap would have nothing to clean.  # Fail closed if it cannot be made — a scan with nowhere to put its verdicts has
   # proved nothing, and an unproved pane must never be reported.
   if ! PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mcode-herdr-probe.XXXXXX" 2>/dev/null)"; then
     log "cannot create a scratch directory for the pane scan; refusing to register."
