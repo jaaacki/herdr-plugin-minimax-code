@@ -8,7 +8,7 @@ that produced a file, it does not belong in this directory.
 
 A herdr `0.9.3` session snapshot, copied byte-for-byte out of
 `~/.config/herdr/sessions/flock85cap3/session.json` on 2026-10-05 (macOS 27.0.0
-arm64, `/Users/noonoon/.local/bin/herdr`).
+arm64, `~/.local/bin/herdr`).
 
 Produced in a **named** session, so the machine's real herdr was never started,
 stopped or reconfigured:
