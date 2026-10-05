@@ -168,6 +168,18 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
   registration is pane-scoped and herdr drops it with the pane. If you ever add the call
   back, it must use the same `--source` the pane was registered with — see the silent-mismatch
   measurement above.
+- **A self-reported state is only as fresh as the last tick, and a dead watcher never resets
+  it.** `mcode-watch.sh:256` reports on *transitions* only and the pane-gone path at `:243-248`
+  reports nothing, so Herdr keeps the last value indefinitely — a pane can read `working` long
+  after the turn ended. The watcher is `nohup`'d detached with no supervisor, so nothing notices.
+  Check with `pgrep -f "mcode-watch.sh <PANE_ID>"`, re-sync with `bin/mcode-watch.sh <PANE_ID>`
+  (it classifies once and reports, so the fix is immediate).
+- **An `agent_session` on one of our panes may not be ours.** Where `codex` ran in a pane
+  earlier, Herdr keeps the *codex* session, inherited from whatever ran there rather than stored
+  by this plugin — a plugin-launched pane is a fresh split and carries none, so **read
+  `agent_session.source` before concluding the plugin stored anything.** Such a pane has no
+  `agent_resume`, so on restore Herdr falls back to `agent_session` (`restore.rs:824`, v0.9.3)
+  and would type `codex resume <id>` into a pane now running `mcode`. Tracked in #87.
 - **Herdr's own Claude integration self-reports session *identity*, never *state*.** Its state
   is screen-detected — `herdr agent explain` names the rule (`osc_title_working`, region
   `osc_title`) — and `explain` refuses outright for a self-reported agent. So there is nothing
@@ -186,7 +198,8 @@ Follow the repo's issue → worktree → PR → `dev` → `main` flow (see globa
 tracks the v0.2.0 work; `dev` is the integration branch and `main` is released from it. PRs must
 be green on both CI legs before merge.
 
-Worktrees are created **only** via `flock worktree add --repo <path> --issue <n>` — never by hand,
-because cleanup trusts the recorded ownership. **It branches from `main`, not `dev`** — members
-have hit this and reviewed a stale tree before noticing. Always
-`git fetch origin && git reset --hard origin/dev` before reviewing or testing anything.
+Worktrees are plain `git worktree add <path> -b <branch> origin/dev` — always off
+`origin/dev`, never `main`. (Flock v2 has no worktree verb; the old
+`flock worktree add --repo <path> --issue <n>` is gone, and it branched from `main`.) Run
+`git fetch origin` before creating one, and `git reset --hard origin/dev` before reviewing
+or testing anything.

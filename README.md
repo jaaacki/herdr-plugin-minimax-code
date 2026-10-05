@@ -96,6 +96,13 @@ bin/mcode-watch.sh <PANE_ID>
 
 Things worth knowing:
 
+- **A state is only as fresh as its watcher.** A watcher that dies — or that was never
+  started for the pane — leaves Herdr holding the last value it was told, so a pane can
+  read `working` long after the turn ended, with nothing reporting an error. The watcher
+  is detached and unsupervised, so nothing notices when it stops. Check with
+  `pgrep -f "mcode-watch.sh <PANE_ID>"`, and re-sync by running
+  `bin/mcode-watch.sh <PANE_ID>` — it classifies once and reports before waiting for a
+  change, so the state is right immediately.
 - **It runs detached, and is tied to the pane rather than to a supervisor.** It is
   deliberately *not* a foreground job in the pane you launched from — that pane is
   running `mcode`. It exits when the pane it watches disappears, and that is the
@@ -164,10 +171,17 @@ Herdr accepts `pane report-agent-session`, exits 0, and persists nothing — it 
 keeps session identity for the agent kinds it enumerates in `herdr agent start`, and
 `minimax-code` is not one. The launch therefore prints an honest "not persisted"
 line, and resume is unavailable. This is Herdr's ceiling, not a plugin bug, and it is
-confirmed independently in `sparkfn/pc-client#2251`. To check for yourself:
+confirmed independently in `sparkfn/pc-client#2251`.
+
+**A session on one of our panes is not automatically ours.** Where `codex` ran in a
+pane earlier and `mcode` was started in it afterwards, Herdr keeps the *codex* session —
+inherited from whatever ran there rather than stored by this plugin, so read
+`agent_session.source` before concluding anything was saved. Those panes have no
+`agent_resume`, so on restore Herdr falls back to `agent_session` and would type
+`codex resume <id>` into a pane now running `mcode`; tracked in #87.
 
 ```bash
-herdr agent list | grep -o '"agent_session":{[^}]*}'   # present for herdr:claude / herdr:codex, absent for ours
+herdr agent list | jq -r '.result.agents[] | select(.agent_session) | [.agent, .pane_id, .agent_session.source] | @tsv'
 ```
 
 When Herdr gains `--kind minimax-code`, the launch path already reports identity and
