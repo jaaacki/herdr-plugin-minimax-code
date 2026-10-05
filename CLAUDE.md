@@ -75,15 +75,19 @@ never had. It is what established that a launched pane appears in `herdr agent l
 that it is addressable both by pane id (`herdr agent get <pane-id>`) and by name
 (`herdr agent get mcode`, installed by `agent rename`).
 
-Resume works, and the docs must not claim more than that. Herdr keeps no session id for us (no
-`agent_session`), but it **accepts a resume command**, and a restarted herdr **re-runs** it *if
-it kept it*. **Do not upgrade that to "works", and do not drop the "if it kept it".** Herdr can
-accept the report and still not store it — that is the #99 failure mode, and the launch line is
-`resume command accepted by herdr (exit 0); after a restart herdr re-runs … in this pane if it
-kept it (not verified here, see #99)`. Match that line's strength. Proof is by hand in an
-isolated named session (#85/#94); the e2e case is **opt-in** (`MCODE_E2E_RESUME=1`) because it
-is intermittent, about one run in three, cause unknown. Never read a green suite as evidence
-for this feature.
+Herdr accepts a resume command for us, and a restarted herdr re-runs it *if it kept it*. **Do not
+upgrade that to "works", and do not drop the "if it kept it".** Herdr keeps no session id for us
+(no `agent_session`), and it can accept a resume report and still not store it — that is the #99
+failure mode, and the launch line says so itself: `resume command accepted by herdr (exit 0);
+after a restart herdr re-runs … in this pane if it kept it (not verified here, see #99)`. Match
+that line's strength, and do not quote an older one. Proof is by hand in an isolated named
+session (#85/#94); the e2e case is **opt-in** (`MCODE_E2E_RESUME=1`) because it is intermittent,
+about one run in three, cause unknown. Never read a green suite as evidence for this feature.
+
+To check the current state, read the session's **live** `session.json` — never the
+`session-snapshots/*.json` history, which can still show a resume the live state no longer has.
+The path comes from `herdr session list`, so it is right for a named session too; `agent get` and
+`pane get` carry no `agent_resume` at all on 0.9.3.
 
 Three caveats, all measured: **a client must attach**, or while the terminal area is `0x0`
 herdr has no pane to resume into and panes come back as plain shells with nothing logged; two

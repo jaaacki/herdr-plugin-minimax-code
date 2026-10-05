@@ -150,7 +150,7 @@ What a launched pane gets, and what it does not:
 | A name, so `get` / `read` / `wait` resolve by name | ✅ renamed at launch |
 | `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
 | Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
-| Resume after a Herdr restart | ✅ herdr accepts the resume command, and re-runs it after a restart if it kept it — see how well that is pinned |
+| Resume after a Herdr restart | ⚠️ herdr accepts the resume command, and re-runs it after a restart if it kept it — proven by hand, CI case gated (#99) |
 | `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
 
 ### The session id is discarded; the resume command is accepted
@@ -236,19 +236,21 @@ Three things to know before relying on it:
   candidates on (source, agent, cwd, argv) and keeps the first, so the second pane
   comes back a plain shell and says nothing. Documented, not worked around.
 
-To check the current state yourself. No `herdr` command exposes the resume command —
-neither `agent get` nor `pane get` carries it — so read the session snapshot. Herdr
-debounces those writes, so wait a few seconds after a launch before reading one:
+To check the current state yourself. No `herdr` command exposes the resume command — neither
+`agent get` nor `pane get` carries it — so read the session's **live** state file. Take the
+directory from `herdr session list` so this is right for a named session too:
 
 ```bash
-SNAP="$(ls -t "${XDG_CONFIG_HOME:-$HOME/.config}/herdr/session-snapshots/"*.json | head -1)"
-jq -r '[.. | objects | select(has("agent_resume")) | .agent_resume
-        | "\(.source)\t\(.agent)\t\(.argv | join(" "))"] | .[]' "$SNAP"
+DIR="$(herdr session list | awk '$1=="default" {print $3}')"   # or your session's name
+jq -r '[.workspaces[].tabs[].panes[] | select(has("agent_resume")) | .agent_resume
+        | "\(.source)\t\(.agent)\t\(.argv | join(" "))"] | .[]' "$DIR/session.json"
 ```
 
-Each line is one pane whose snapshot carries a resume command. Absence means that
-pane's snapshot has none — and remember it is a snapshot, so an empty result may be a
-save that has not landed yet, or a report herdr did not keep (#99).
+Each line is one pane whose live state carries a resume command. **Do not read
+`session-snapshots/*.json` for this** — that is periodic history, and it can still show a
+resume the live state has since dropped, which is the opposite of what you asked. Empty output
+means no pane currently holds one; on a busy machine that is also what a report herdr accepted
+and did not keep looks like (#99).
 
 ## Driving a launched pane
 
