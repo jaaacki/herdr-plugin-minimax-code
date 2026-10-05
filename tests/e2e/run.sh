@@ -555,13 +555,16 @@ run_case_event_watcher() {
 run_case_foreign_pane_untouched() {
   local name="scoping: a pane registered as another agent gets no watcher"
 
-  if [ -z "${THROWAWAY_PANE:-}" ]; then
-    fail "$name" "the event-hook case did not record its throwaway pane"
-    return
-  fi
-
+  # SELF-CONTAINED, deliberately. This case used to depend on THROWAWAY_PANE
+  # from the case above it, so when that case failed early this one failed too
+  # and a scoping regression looked like two separate failures. It splits its
+  # own pane now, and the two cases can be read and run independently.
   local src pane
   src="$(pane_ids | head -1)"
+  if [ -z "$src" ]; then
+    fail "$name" "no source pane to split from"
+    return
+  fi
   pane="$("$HERDR" --session "$SESSION" pane split "$src" --direction right --no-focus 2>/dev/null \
     | jq -r '.result.pane.pane_id' 2>/dev/null)"
   if [ -z "$pane" ]; then

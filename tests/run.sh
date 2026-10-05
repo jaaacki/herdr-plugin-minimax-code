@@ -54,6 +54,17 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-plugin-tests.XXXXXX")"
 # KEEP_TMP=1 leaves the sandbox in place for inspection after a failure.
 cleanup() {
   PATH="$BASE_PATH"
+  # Kill anything still running out of this sandbox BEFORE the directory goes,
+  # and wait for the process table to clear. A stub left behind holds a pane id
+  # the next run also uses, and #84 decides "already watched" by reading the
+  # process table — so a survivor is not litter, it is a false result waiting to
+  # happen. Scoped to $WORK's unique name, so it can only ever match this run's
+  # own stubs.
+  local wb
+  wb="$(work_basename 2>/dev/null || true)"
+  if [ -n "$wb" ]; then
+    kill_watchers_matching "${wb}/.*plugin/bin/mcode-watch\.sh"
+  fi
   if [ "${KEEP_TMP:-0}" = "1" ]; then
     printf 'tests/run.sh: KEEP_TMP=1, sandbox left at %s\n' "$WORK" >&2
     return
@@ -570,6 +581,18 @@ STUB
 #!/bin/sh
 printf '%s\t%s\n' "$*" "${MCODE_AGENT_LABEL:-}" >>"$(dirname -- "$0")/../watcher-ran"
 sleep 5
+STUB
+      chmod +x "$root/bin/mcode-watch.sh"
+      ;;
+    brief)
+      # Records its start and exits at once. The shape of a watcher that has
+      # DIED, which is what a pane looks like when its watcher crashed, when the
+      # pane closed mid-poll, or when someone killed it. Used where the question
+      # is whether a dead watcher still counts as a watcher.
+      cat >"$root/bin/mcode-watch.sh" <<'STUB'
+#!/bin/sh
+echo "ran $1" >>"$(dirname -- "$0")/../watcher-ran"
+exit 0
 STUB
       chmod +x "$root/bin/mcode-watch.sh"
       ;;
@@ -1500,11 +1523,116 @@ case_29() { # #75: the watcher inherits the label the launch chose, not a litera
   fi
 }
 
+# Kill any watcher a case started, matched on THAT CASE'S OWN staged copy.
+#
+# This exists because #84 made watcher existence a process-table question, and
+# that couples every watcher case to every other one. The hook stub sleeps 30s;
+# without this, a case left a watcher running for its pane, and the next case
+# that used the same pane id found it and declined to start its own — so the
+# suite's result depended on execution order and on how busy the machine had
+# been. That is not hypothetical: one run left three stubs alive and a later run
+# failed three cases for reasons that had nothing to do with those cases.
+#
+# SCOPED TO THE STAGED PATH, and that is the whole safety argument. Cases run
+# their stubs from $CASE_DIR/plugin/bin/, a temp directory unique per case, so
+# this can only ever match a stub this suite started. It must never be a blanket
+# `pkill -f mcode-watch.sh`: the developer's own minimax-code panes have REAL
+# watchers running, their command line is a bare relative
+# `bin/mcode-watch.sh <pane>`, and a blanket pattern kills those. This suite got
+# that wrong once already, in a verification script, and had to report it.
+kill_staged_watchers() { # kill_staged_watchers
+  [ -n "${WORK:-}" ] || return 0
+  [ -n "${CURRENT_CASE:-}" ] || return 0
+  [ -d "$CASE_DIR/plugin" ] || return 0
+  # Match a PATH SUFFIX, never an absolute path, and the reason is that two
+  # different absolute paths can both be the stub this case started:
+  #
+  #   * the entrypoint resolves the watcher with `cd .. && pwd -P` before it
+  #     execs, so a stub IT started runs out of the canonical
+  #     /private/var/folders/... path;
+  #   * a stub a case starts by hand, like case-39's, runs out of whatever
+  #     $CASE_DIR literally is, which on macOS is the unresolved
+  #     /var/folders/... (and with mktemp's doubled slash).
+  #
+  # An absolute pattern matches one of those and misses the other, silently.
+  # $WORK's basename is unique per run and appears verbatim in both forms, so
+  # matching on it covers every stub this run owns and nothing else.
+  kill_watchers_matching "$(work_basename)/${CURRENT_CASE}/plugin/bin/mcode-watch\.sh"
+}
+
+# work_basename - the unique per-run directory name, safe to use as a pgrep
+# pattern component. The `.` is escaped so it cannot act as "any character".
+work_basename() {
+  local b
+  b="${WORK:-}"
+  b="${b##*/}"
+  case "$b" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  printf '%s\n' "${b//./\\.}"
+}
+
+# kill_watchers_matching PATTERN - kill everything matching, and WAIT for the
+# process table to clear.
+#
+# SIGKILL, not SIGTERM, and the reason is measured rather than assumed. A stub is
+# `#!/bin/sh` running a foreground `sleep`, and bash DEFERS a SIGTERM while a
+# foreground child is running: the signal is handled after the child finishes, so
+# `kill` alone leaves the stub alive for the full 30 seconds of its sleep. That
+# is not a corner case, it is what happened — six stubs from one full run were
+# still alive half a minute later, holding `wZ:p8` and `wZ:p42`, and the run after
+# it failed a dozen cases for that reason.
+#
+# SIGKILL is appropriate precisely because these are processes this suite created
+# in its own temp sandbox and knows it owns. It is never aimed at anything else:
+# every pattern here is scoped to a sandbox name this run generated, and a watcher
+# on a real pane is not this suite's to kill.
+#
+# The wait is there for the same reason the signal alone was not enough:
+# `pane_is_watched` reads the process table, so a process still dying in the
+# background is indistinguishable from a live one, and the next case — same pane
+# id, because ADOPTED_PANE and the fixture's new-pane id are constants — would
+# find its predecessor still listed and decline to start a watcher.
+kill_watchers_matching() { # kill_watchers_matching <pgrep-pattern>
+  local pattern="$1" tries p
+  [ -n "$pattern" ] || return 0
+  for p in $(pgrep -f "$pattern" 2>/dev/null); do
+    kill -9 "$p" 2>/dev/null
+  done
+  for tries in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+    pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+    sleep 0.05
+  done
+  return 0
+}
+
+# Sweep watchers left behind by an EARLIER run of this suite that was killed
+# before its own cleanup could run.
+#
+# #84 made "is this pane watched" a process-table question, so a stray `sleep 30`
+# stub from a previous run holds a pane id and makes the next run believe panes
+# are already watched. That is not a hypothetical: a run interrupted partway
+# left stubs alive, and the following run failed a dozen cases, every one of
+# them reporting "no watcher started" when in fact a predecessor had suppressed
+# them.
+#
+# SCOPED TO THIS SUITE'S OWN SANDBOX NAMING, which is what makes it safe. Every
+# stub this suite runs lives under a mcode-plugin-tests.XXXXXX directory, and
+# the pattern requires that name plus /plugin/bin/. The developer's real
+# minimax-code panes run a watcher whose command line is a bare relative
+# `bin/mcode-watch.sh <pane>` with no sandbox anywhere in it, so this cannot
+# reach them. A blanket `pkill -f mcode-watch.sh` would, and this suite has
+# already killed the owner's watchers that way once and had to report it.
+sweep_orphan_watchers() { # sweep_orphan_watchers
+  kill_watchers_matching 'mcode-plugin-tests\..*/plugin/bin/mcode-watch\.sh'
+}
+
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
   CASES_RUN=$((CASES_RUN + 1))
   broke=0
   "$2"
+  kill_staged_watchers
   if [ "$broke" -eq 0 ]; then
     printf 'ok    %s\n' "$CURRENT_CASE"
   else
@@ -1527,7 +1655,32 @@ run_case() { # run_case <name> <function>
 # The pane these cases pretend flock adopted. Deliberately NOT the pane id the
 # launch path produces: if the event handler only worked on panes cmd_start had
 # just created, these cases would pass without testing the fix at all.
-ADOPTED_PANE="wZ:p42"
+# UNIQUE PER RUN, and this is the fix for a whole class of flakiness rather than
+# cosmetic tidiness.
+#
+# #84 decides "is this pane watched" by reading the PROCESS TABLE, and the event
+# cases take their pane id from the payload — which means a test may choose it,
+# and until now they all chose the same one. So a stub left alive by any earlier
+# run (an interrupted run, a `kill -9`, a machine that was busy) would hold that
+# pane, the next run would decide the pane was already watched, and every watcher
+# case would fail for a reason that had nothing to do with the code. Observed
+# repeatedly here: a run failing 13 cases, and leaving 2 stubs that made the run
+# after it fail 13 more.
+#
+# Deriving the id from $$ makes that impossible — a stub from another run cannot
+# be watching a pane id that did not exist then. The fixture-derived `wZ:p8` is
+# NOT renamed: CLAUDE.md is explicit that the split's pane id must never be
+# faked, so those cases keep the real id and rely on the startup sweep and the
+# foreign-watcher preflight instead.
+#
+# The tag is $$ mod 100000, so the ids stay short and pane-shaped while being
+# unique across the handful of runs a machine will do in a session. Two runs
+# colliding here would need the same pid modulo 100000, which is why the preflight
+# below still exists rather than being considered redundant.
+RUN_TAG=$(( $$ % 100000 ))
+ADOPTED_PANE="wZ:p${RUN_TAG}"
+SECOND_PANE="wZ:p$(( RUN_TAG + 1 ))"
+FOREIGN_PANE="wZ:p$(( RUN_TAG + 2 ))"
 
 case_30() { # #84: an adopted pane gets a watcher even though we never launched it
   setup_case
@@ -1558,14 +1711,13 @@ case_30() { # #84: an adopted pane gets a watcher even though we never launched 
   assert_one_watcher "$root/watcher-ran" "one event for one pane"
 }
 
-case_31() { # #84: a second trigger for a pane with a LIVE watcher starts nothing
+case_31() { # #84: a second trigger for a pane that IS watched starts nothing
   setup_case
   local copy root
   copy="$(stage_plugin hook)"
   root="$CASE_DIR/plugin"
-  # setup_case defaults this to 0 so no case spawns a detached process by
-  # accident, and the event path honours that opt-out exactly as the launch path
-  # does. These cases are about the opt-out being ON.
+  # See case_30: setup_case defaults the opt-out ON and the event path honours
+  # it, so a case about a watcher existing has to ask for one.
   export MCODE_WATCH_AUTOSTART=1
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
@@ -1577,20 +1729,21 @@ case_31() { # #84: a second trigger for a pane with a LIVE watcher starts nothin
   # The first watcher sleeps 30s in the hook stub, so it is provably still
   # alive here. Assert that, because the whole case rests on it: if it were
   # dead, "a second trigger started nothing" would be true for the wrong reason.
-  local first_pid
-  first_pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
-  if [ -z "$first_pid" ] || ! kill -0 "$first_pid" 2>/dev/null; then
-    note "the first watcher is not recorded as running (pid='${first_pid}')," \
-         "so the idempotency assertion below would be vacuous"
+  #
+  # Checked with pgrep but NOT with the same pattern the entrypoint uses. A
+  # test that reused the implementation's expression would agree with it even
+  # when both were wrong, which is how a wrong anchor ships. This one is
+  # deliberately looser: it looks for the stub path and the pane on the same
+  # line and nothing else.
+  if ! pgrep -f "bin/mcode-watch.sh $ADOPTED_PANE" >/dev/null 2>&1; then
+    note "the first watcher is not running, so the idempotency assertion below" \
+         "would be vacuous: a dead watcher and a suppressed second watcher look" \
+         "identical from the marker file alone"
     return
   fi
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  # A second event while the watcher lives. This is not hypothetical: the hook
-  # fires on the watcher's OWN first report, so in production this happens on
-  # every single transition.
-  #
   # CONTROL, and it has to be a control rather than a wait: "still one line" is
   # what a correctly-idempotent implementation produces AND what a stub that
   # records nothing at all would produce. Those are opposite findings wearing the
@@ -1604,13 +1757,6 @@ case_31() { # #84: a second trigger for a pane with a LIVE watcher starts nothin
   fi
   assert_one_watcher "$root/watcher-ran" \
     "two events for one pane whose watcher is still alive"
-  # The original watcher must be the one still running, not a replacement.
-  local now_pid
-  now_pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
-  if [ "$now_pid" != "$first_pid" ]; then
-    note "the recorded watcher pid changed from '${first_pid}' to '${now_pid}';" \
-         "a second trigger must not replace a live watcher"
-  fi
 }
 
 case_32() { # #84: an event about someone else's agent starts nothing at all
@@ -1631,7 +1777,7 @@ case_32() { # #84: an event about someone else's agent starts nothing at all
   # every agent in the session. Asking for a watcher is what makes the gate the
   # only thing that can stop one.
   export MCODE_WATCH_AUTOSTART=1
-  run_event_handler_at "$copy" "wZ:p99" "claude"
+  run_event_handler_at "$copy" "$FOREIGN_PANE" "claude"
   assert_rc_zero "$RC"
 
   if [ -e "$root/watcher-ran" ]; then
@@ -1696,42 +1842,49 @@ case_33() { # #84: the watcher's output goes to a per-pane log, not /dev/null
   fi
 }
 
-case_34() { # #84: a DEAD watcher's lock is reclaimed, not a permanent block
+case_34() { # #84: a watcher that has EXITED does not block a new one
   setup_case
-  local copy root pid
-  copy="$(stage_plugin hook)"
+  local copy root
+  copy="$(stage_plugin brief)"
   root="$CASE_DIR/plugin"
-  # See case_30: the opt-out defaults ON in the sandbox and the event path
-  # honours it, so this case has to ask for a watcher explicitly.
   export MCODE_WATCH_AUTOSTART=1
 
-  # A lock left behind by a watcher that is gone: the pane closed, the machine
-  # rebooted, the process was killed. This is the ordinary way locks go stale,
-  # and the failure it causes is the worst one in this file - a pane that can
-  # NEVER get a watcher again, with no error anywhere, because the handler
-  # reports it already has one.
-  mkdir -p "$MCODE_WATCH_LOG_DIR/lock"
-  # 4194304 is above the default pid_max on both platforms in scope, so this
-  # cannot accidentally be a live process.
-  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid"
-  if kill -0 4194304 2>/dev/null; then
-    note "control: pid 4194304 is unexpectedly alive on this machine, so the" \
-         "stale-lock setup does not model a dead watcher"
+  # The same worry the removed lock file used to answer, asked of the mechanism
+  # that replaced it. A pane whose watcher died - the pane closed mid-poll, the
+  # machine rebooted, someone killed it - must get a NEW watcher, because a
+  # frozen pane is the defect #84 is filed about and "there is already a
+  # watcher" is the one reason it would not be fixed.
+  #
+  # The `brief` stub records its start and exits at once, so the first watcher
+  # is genuinely gone by the time the event arrives. This is the case the old
+  # lock could only answer by keeping a pid file, and the reason a stale pid
+  # file used to be able to freeze a pane forever.
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the first event started no watcher, so this case would pass vacuously"
+    return
+  fi
+
+  # Wait for it to be gone, or the second event's decline is meaningless.
+  local i gone=0
+  for i in $(seq 1 40); do
+    if ! pgrep -f "bin/mcode-watch.sh $ADOPTED_PANE" >/dev/null 2>&1; then
+      gone=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$gone" -ne 1 ]; then
+    note "control: the brief stub is still running after 10s, so this is not" \
+         "actually testing what happens after a watcher exits"
     return
   fi
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
-    note "a stale lock from a dead watcher permanently blocked a new watcher for" \
-         "${ADOPTED_PANE}; the pane's state is frozen forever with no error"
-    return
-  fi
-  # The new watcher, not the stale pid.
-  pid="$(cat "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" 2>/dev/null || true)"
-  if [ "$pid" = "4194304" ]; then
-    note "the lock still records the dead pid, so the next trigger will also" \
-         "decline and this pane can never be watched again"
+  if ! wait_for_count "$root/watcher-ran" 2 1500; then
+    note "an exited watcher still blocked a new one for ${ADOPTED_PANE};" \
+         "a pane whose watcher died stays frozen forever with no error anywhere"
   fi
 }
 
@@ -1821,104 +1974,230 @@ case_37() { # #84: the manifest really declares the hook, in the dotted vocabula
   fi
 }
 
-case_38() { # #84: the lock is PER PANE, not per session
+case_38() { # #84: a watcher on ONE pane does not suppress another pane
   setup_case
   local copy root
   copy="$(stage_plugin hook)"
   root="$CASE_DIR/plugin"
   export MCODE_WATCH_AUTOSTART=1
 
-  # The property case_23 could not test, asserted where it CAN be tested: the
+  # The property case-23 could not test, asserted where it can be tested: the
   # event path takes its pane id from the payload, so a test may legitimately
   # choose it, and two distinct ids are two distinct panes as far as the handler
   # is concerned.
   #
-  # This is the half of "exactly one watcher per pane" that a session-wide lock
-  # would silently break. With one lock for the whole session, the first pane's
-  # watcher would suppress every other pane's forever - which looks like the
-  # idempotency working, and leaves panes 2..N frozen exactly as #84 describes.
+  # This is the whole risk of deciding "already watched" by looking at the
+  # process table. A bare `pgrep -f mcode-watch.sh` asks whether ANY watcher is
+  # running and answers yes for every pane in the session, which looks exactly
+  # like idempotency working and leaves panes 2..N frozen - the #84 symptom
+  # rebuilt inside the fix for it. So: one pane watched, a DIFFERENT pane
+  # triggered, and the second must still get its own watcher.
   run_event_handler_at "$copy" "wZ:p42" "minimax-code"
-  run_event_handler_at "$copy" "wZ:p43" "mcode"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the first pane got no watcher, so the per-pane assertion below would" \
+         "pass vacuously"
+    return
+  fi
+  if ! pgrep -f "bin/mcode-watch.sh wZ:p42" >/dev/null 2>&1; then
+    note "control: no watcher is running for wZ:p42, so the second event has" \
+         "nothing to be wrongly suppressed by"
+    return
+  fi
 
+  run_event_handler_at "$copy" "$SECOND_PANE" "mcode"
   if ! wait_for_count "$root/watcher-ran" 2 1500; then
-    note "two distinct panes produced $(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)" \
-         "watcher(s); each pane needs its own, or every pane after the first is" \
-         "frozen with no error anywhere"
+    note "${ADOPTED_PANE} has a watcher and ${SECOND_PANE} got none; the check is session-wide," \
+         "so every pane after the first stays frozen with no error anywhere"
     sed 's/^/          /' "$root/watcher-ran"
     return
   fi
-  # Each pane watched by its own watcher, not one of them watched twice.
-  if ! grep -qF "wZ:p42" "$root/watcher-ran"; then
-    note "no watcher was started for wZ:p42"
+  if ! grep -qF "$SECOND_PANE" "$root/watcher-ran"; then
+    note "no watcher was started for ${SECOND_PANE}"
   fi
-  if ! grep -qF "wZ:p43" "$root/watcher-ran"; then
-    note "no watcher was started for wZ:p43"
-  fi
-  local total
-  total="$(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)"
-  if [ "${total:-0}" -ne 2 ]; then
-    note "two panes started ${total:-0} watchers; it must be exactly 2"
-  fi
-  # Two locks, not one: this is the mechanical check behind the assertion above.
-  local locks
-  locks="$(find "$MCODE_WATCH_LOG_DIR/lock" -name '*.pid' 2>/dev/null | wc -l | tr -d ' ')"
-  if [ "${locks:-0}" -ne 2 ]; then
-    note "expected one lock per pane (2), found ${locks:-0}; a shared lock would" \
-         "make this 1 and would suppress the second pane's watcher permanently"
+  # And both alive at once, which is the point: one per pane, not one overall.
+  local both=0
+  pgrep -f "bin/mcode-watch.sh wZ:p42" >/dev/null 2>&1 && both=$((both + 1))
+  pgrep -f "bin/mcode-watch.sh $SECOND_PANE" >/dev/null 2>&1 && both=$((both + 1))
+  if [ "$both" -ne 2 ]; then
+    note "expected a live watcher per pane (2), found $both"
   fi
 }
 
-case_39() { # #84: dead lock files are pruned, so the state dir does not grow forever
+case_39() { # #84: a watcher started OUTSIDE ensure_watcher is respected
   setup_case
   local copy root
   copy="$(stage_plugin hook)"
   root="$CASE_DIR/plugin"
   export MCODE_WATCH_AUTOSTART=1
 
-  # Reclaiming the lock on the pane you are watching is not the same thing as
-  # clearing the locks of panes you are not. Every closed pane otherwise leaves
-  # a file behind, and the state dir grows by one entry per pane the user has
-  # ever watched, forever.
+  # The defect this case exists for. The first version of #84 decided "already
+  # watched" from a pid lock file this code wrote, which records only OUR spawns
+  # and is therefore blind to:
   #
-  # This case exists because that pruning was silently broken and NO other case
-  # noticed: a stale, directory-based copy of the prune function was left behind
-  # when the lock moved from a directory to a file, and in bash the LAST
-  # definition wins, so the dead one was the live one. It iterated directories
-  # (`[ -d "$d" ] || continue`) when the lock is a file, so it skipped
-  # everything and removed nothing — while calling a function that no longer
-  # existed. Every other case stayed green.
-  mkdir -p "$MCODE_WATCH_LOG_DIR/lock"
-  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/wZ:p1.pid"   # dead, other pane
-  printf '4194304\n' >"$MCODE_WATCH_LOG_DIR/lock/wZ:p2.pid"   # dead, other pane
-  mkdir -p "$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid"               # a live lock
-  printf '%s\n' "$$" >"$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid"
+  #   * every watcher a 0.4.1 launcher started - all of them, at the moment
+  #     someone upgrades, and
+  #   * the hand-run `bin/mcode-watch.sh <PANE_ID>` the README tells people to
+  #     run as the fix for a frozen state.
+  #
+  # Both are live processes holding a pane. So the watcher below is started the
+  # way a person or an older launcher starts one - by hand, from the test, with
+  # no involvement from the entrypoint - and the event must then start NOTHING.
+  # Against the lock-file version this case fails, because the lock has no
+  # record of it and the handler concludes the pane is unwatched.
+  #
+  # Started with a flag, deliberately: `mcode-watch.sh <pane> --interval 1` is
+  # what the README tells a user to type, and an end-anchored pattern on the
+  # pane id does not match it. That is measured, not assumed - see
+  # pane_is_watched in bin/mcode-plugin.sh.
+  "$root/bin/mcode-watch.sh" "$ADOPTED_PANE" --interval 1 >/dev/null 2>&1 &
+  local outsider=$!
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "the hand-started watcher never recorded itself, so this case would" \
+         "pass vacuously"
+    kill "$outsider" 2>/dev/null
+    return
+  fi
+  if ! pgrep -f "bin/mcode-watch.sh $ADOPTED_PANE" >/dev/null 2>&1; then
+    note "control: the hand-started watcher is not running, so 'started nothing'" \
+         "below would be vacuous"
+    kill "$outsider" 2>/dev/null
+    return
+  fi
+
+  # Now the event path runs, and must decline.
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+
+  # A second watcher on top of the first means two processes reporting one pane
+  # for the rest of its life, which is the duplicate the lock file could not
+  # prevent and the reason this case is here.
+  local n
+  n="$(pgrep -f "bin/mcode-watch.sh $ADOPTED_PANE" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -ne 1 ]; then
+    note "a watcher the plugin did not start was not respected: ${n} watchers are" \
+         "now running for ${ADOPTED_PANE}. On upgrade every 0.4.1 watcher, and" \
+         "every watcher the README tells a user to start by hand, gets doubled."
+    sed 's/^/          /' "$root/watcher-ran"
+  fi
+
+  # Leave nothing behind. Scoped to this pane's stub, never a blanket pkill:
+  # the developer's own mcode panes have real watchers running, and a test that
+  # kills those is worse than no test.
+  local p
+  for p in $(pgrep -f "bin/mcode-watch.sh $ADOPTED_PANE" 2>/dev/null); do
+    kill "$p" 2>/dev/null
+  done
+}
+
+case_40() { # #84: the event path reports under the pane's NAME when it has one
+  setup_case
+  local copy root
+  copy="$(stage_plugin label)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+  # A pane that HAS a name. The launcher renames every pane it starts, so this
+  # is the launch path's shape; a flock-adopted pane often has no name at all,
+  # which is the other shape and the fallback's job.
+  export FAKE_HERDR_AGENT_NAME="mcode-7"
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
   if ! wait_for_file "$root/watcher-ran" 1000; then
-    note "no watcher started, so the prune never had a chance to run"
+    note "no watcher was started, so there is no label to assert on"
     return
   fi
-  # Give the prune a moment; it runs before the spawn, so by now it has.
-  sleep 0.3
 
-  if [ -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p1.pid" ] || [ -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p2.pid" ]; then
-    note "dead lock files were not pruned; the state dir grows by one entry per" \
-         "pane the user has ever watched and nothing ever clears it"
-    ls "$MCODE_WATCH_LOG_DIR/lock" | sed 's/^/          /'
+  # The name, not the event's label. The event payload carries `agent`, which for
+  # a launched pane is the literal `mcode`; the pane's NAME is `mcode-7`. A
+  # watcher handed `mcode` for a pane called `mcode-7` reports every state under
+  # a name that pane does not have — the second-pane divergence CLAUDE.md
+  # records, reintroduced through the event path.
+  if ! grep -qF "mcode-7" "$root/watcher-ran"; then
+    note "the watcher was not given the pane's name 'mcode-7'; it was given the" \
+         "event's agent label instead, so every state it reports is attributed to" \
+         "an agent name this pane does not have"
+    sed 's/^/          /' "$root/watcher-ran"
+    return
   fi
-  # A LIVE lock must survive, or the prune is just a race that will eventually
-  # delete a running watcher's claim and let a second watcher start.
-  if [ ! -e "$MCODE_WATCH_LOG_DIR/lock/wZ:p3.pid" ]; then
-    note "the prune removed a lock whose owner is alive; that is the opposite bug"
+  if grep -q "mcode"$'\t' "$root/watcher-ran"; then
+    note "the watcher was handed the bare label 'mcode' for a pane named mcode-7"
   fi
-  # And the pane we are actually watching keeps its own.
-  if [ ! -e "$MCODE_WATCH_LOG_DIR/lock/$ADOPTED_PANE.pid" ]; then
-    note "the pane that was just watched has no lock file"
+
+  # And the read is not decorative: with herdr reporting no name, the fallback
+  # is the label, and that is correct rather than a failure. Asserted so the
+  # difference between the two shapes is pinned from both sides.
+  #
+  # A DIFFERENT pane id, and that is load-bearing rather than tidiness:
+  # setup_case reuses $WORK/$CURRENT_CASE, so the staged stub and its marker file
+  # are the same ones the first half already wrote. Re-checking `mcode-7` here
+  # would read the first half's own line and pass for the wrong reason — which
+  # is exactly what happened the first time this was written.
+  unset FAKE_HERDR_AGENT_NAME
+  run_event_handler_at "$copy" "$SECOND_PANE" "minimax-code"
+  if ! wait_for_file_content "$root/watcher-ran" "$SECOND_PANE" 1000; then
+    note "an unnamed pane got no watcher; the label is enough to watch a pane," \
+         "so the fallback must still start one"
+    return
+  fi
+  if ! grep -F "$SECOND_PANE" "$root/watcher-ran" | grep -qF "minimax-code"; then
+    note "for a pane herdr reports no name for, the watcher should fall back to" \
+         "the event's own agent label"
+    sed 's/^/          /' "$root/watcher-ran"
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39)
+case_41() { # #84: a process merely NAMED notmcode-watch.sh is not the watcher
+  setup_case
+  local copy root decoy
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+
+  # The left-hand anchor of the check, pinned.
+  #
+  # `mcode-watch.sh` is a substring of `notmcode-watch.sh`, so a check written
+  # without a left anchor is satisfied by any process whose command line merely
+  # CONTAINS that text. The consequence is not a duplicate watcher, it is the
+  # opposite and worse one: the pane is treated as already watched, so no
+  # watcher is ever started and the pane stays frozen — the #84 symptom, rebuilt
+  # inside the fix for it.
+  #
+  # This exists because the anchor was an addition of mine that no test covered,
+  # and an unverified claim in a comment is exactly what m4's review of #93
+  # (and the architect's) refused to accept about the lock's read-back. Either
+  # the code is proven or it is not there.
+  decoy="$root/bin/notmcode-watch.sh"
+  cat >"$decoy" <<'STUB'
+#!/bin/sh
+echo "decoy $1" >>"$(dirname -- "$0")/../decoy-ran"
+sleep 5
+STUB
+  chmod +x "$decoy"
+  "$decoy" "$ADOPTED_PANE" >/dev/null 2>&1 &
+  local decoy_pid=$!
+  sleep 0.5
+  if ! kill -0 "$decoy_pid" 2>/dev/null; then
+    note "the decoy did not start, so this case would pass vacuously"
+    return
+  fi
+
+  run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
+  assert_rc_zero "$RC"
+  if ! wait_for_file "$root/watcher-ran" 1000; then
+    note "a process merely NAMED notmcode-watch.sh suppressed the real watcher" \
+         "for ${ADOPTED_PANE}; the check is satisfied by any command line that" \
+         "CONTAINS the name, so the pane is never watched at all"
+    return
+  fi
+  if ! grep -qF "$ADOPTED_PANE" "$root/watcher-ran"; then
+    note "a watcher started, but not for ${ADOPTED_PANE}"
+  fi
+
+  # Scoped to this pane's decoy. Never a blanket pkill.
+  kill "$decoy_pid" 2>/dev/null
+}
+
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -1933,6 +2212,65 @@ if [ "${1:-}" = "--list" ]; then
   printf '%s\n' "${ALL_CASES[@]}"
   exit 0
 fi
+
+# Clear watchers an earlier run of this suite left behind, before any case runs. See
+# sweep_orphan_watchers for why this is required now and why the pattern cannot
+# reach the developer's own panes.
+sweep_orphan_watchers
+
+# Preflight: refuse to run if something OUTSIDE this suite is watching a pane id
+# the cases below use.
+#
+# #84 decides "is this pane watched" by reading the process table, and the cases
+# use fixed pane ids — wZ:p8 comes from the captured split fixture and must never
+# be faked, and wZ:p42/43/99 are constants. So any other process watching one of
+# those panes makes the entrypoint decline to start a watcher, and every watcher
+# case then fails with a message describing the wrong thing: "the first event did
+# not start a watcher", when the event did its job and something else was already
+# holding the pane.
+#
+# That is not hypothetical. Debris from ad-hoc probing of the pgrep pattern —
+# stubs in /tmp, started outside any sandbox, watching wZ:p8 and wZ:p42 — turned
+# fourteen cases red with fourteen different lies, and the real cause was one
+# stale process. Diagnosing that from the failure text alone would have been
+# slow. This file's own test-design note ("stubs are started inside a unique temp
+# sandbox so they can never collide with anything on the machine") assumes every
+# watcher on the box belongs to the suite, and that assumption is not safe on a
+# machine where a developer is also hand-running watchers.
+#
+# So: name it once, before anything runs. Nothing is killed here. A watcher
+# belonging to the developer may be perfectly legitimate, and this suite does not
+# get to decide that — it reports and stops.
+foreign_watcher_preflight() { # foreign_watcher_preflight
+  local pattern p cmd found=""
+  # The fixture's wZ:p8 plus this run's three derived ids, so the check covers
+  # exactly the panes the cases below can be suppressed on.
+  local pane
+  for pane in wZ:p8 "$ADOPTED_PANE" "$SECOND_PANE" "$FOREIGN_PANE"; do
+    pattern="(^|[[:space:]/])mcode-watch\\.sh[[:space:]]+${pane}([[:space:]]|\$)"
+    for p in $(pgrep -f "$pattern" 2>/dev/null); do
+      cmd="$(ps -o command= -p "$p" 2>/dev/null)"
+      case "$cmd" in
+        *mcode-plugin-tests.*) continue ;;   # ours, and already swept
+      esac
+      found="${found}  pid ${p}: ${cmd}
+"
+    done
+  done
+  if [ -n "$found" ]; then
+    printf 'tests/run.sh: refusing to run.\n\n' >&2
+    printf 'These panes are watched by processes this suite does not own:\n' >&2
+    printf '%s' "$found" | sed 's/^/  /' >&2
+    printf '\n' >&2
+    printf 'The cases use fixed pane ids, and the entrypoint decides "already\n' >&2
+    printf 'watched" from the process table, so a foreign watcher on any of them\n' >&2
+    printf 'makes every watcher case fail for the wrong reason. Stop those, or run\n' >&2
+    printf 'somewhere they are not running. This suite will not kill them for you:\n' >&2
+    printf 'a watcher on a real pane is the developer'"'"'s business, not a fixture'"'"'s.\n' >&2
+    exit 2
+  fi
+}
+foreign_watcher_preflight
 
 if ! check_stub_responses; then
   printf 'tests/run.sh: fake-herdr canned responses are unusable; refusing to run\n' >&2
@@ -1986,6 +2324,8 @@ for name in "${SELECTED[@]}"; do
     case-37) run_case case-37 case_37 ;;
     case-38) run_case case-38 case_38 ;;
     case-39) run_case case-39 case_39 ;;
+    case-40) run_case case-40 case_40 ;;
+    case-41) run_case case-41 case_41 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

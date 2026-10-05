@@ -255,6 +255,16 @@ ere_escape() { # ere_escape <string>
 pane_is_watched() { # pane_is_watched <pane-id>
   local pane pattern
   pane="$(ere_escape "$1")"
+  # The escaping here is the whole function, and it is easy to get wrong by one
+  # backslash in either direction. What bash must hand pgrep is:
+  #     (^|[[:space:]/])mcode-watch\.sh[[:space:]]+PANE([[:space:]]|$)
+  # so the source needs `\\.` to emit `\.` and `\$` to emit a bare `$`. Writing
+  # `\\\\.` instead emits `\\.` — a LITERAL BACKSLASH followed by any character,
+  # which matches nothing at all — and `\\$` emits `\$`, a literal dollar sign
+  # rather than the end anchor. Both fail silently and in the same direction:
+  # the check never matches, every pane looks unwatched, and the hook starts a
+  # watcher on every single transition. The tests caught that, which is the only
+  # reason it is worth spelling out.
   pattern="(^|[[:space:]/])mcode-watch\\.sh[[:space:]]+${pane}([[:space:]]|\$)"
   pgrep -f "$pattern" >/dev/null 2>&1
 }
@@ -817,32 +827,64 @@ cmd_start() {
 # `--agent minimax-code`. Matching only one of them would leave exactly the
 # panes #84 is filed about unwatched.
 #
-# A NAME the user typed is also accepted, because `agent rename` is what makes a
-# pane name-addressable and the name is a third string. It is matched as a
-# prefix on the mcode/mcode-N sequence, so `mcode-2` is ours and `mcodeish` is
-# not - the `-` is in the pattern rather than a loose `mcode*`.
+# `mcode-N` is a NAME rather than a label, and the launch path never produces
+# one here — the event carries the label, which the launcher sets to the literal
+# `mcode` on every pane it starts. So that branch only fires for a pane somebody
+# renamed by hand. It is kept as defensive code, and a reviewer should not go
+# looking for a caller that reaches it.
+#
+# The digits-only test is a loop rather than a glob on purpose: `mcode-[0-9]*`
+# is ONE digit followed by anything, so it also matches `mcode-2foo`. Harmless —
+# such a name is obviously somebody's mcode — but it is not what the pattern
+# reads like, and a case that asserts `mcode-2` is ours should not silently also
+# bless `mcode-2foo`.
 is_our_agent_label() { # is_our_agent_label <label>
+  local rest
   case "${1:-}" in
-    minimax-code)   return 0 ;;
-    mcode)          return 0 ;;
-    mcode-[0-9]*)   return 0 ;;
-    *)              return 1 ;;
+    minimax-code) return 0 ;;
+    mcode)        return 0 ;;
+    mcode-[0-9]*)
+      rest="${1#mcode-}"
+      # All digits, and at least one.
+      case "$rest" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      return 0
+      ;;
+    *) return 1 ;;
   esac
 }
 
 # The agent's NAME - what `herdr agent get <name>` resolves - read back from
-# herdr rather than guessed.
+# herdr rather than guessed, when herdr has one to give.
 #
-# WHY IT HAS TO BE READ AND NOT ASSUMED. The launcher knows the name because it
-# chose it. This path does not: the event payload carries the agent LABEL and no
-# name, and on an adopted pane the name is whatever flock or the user decided.
-# Guessing `mcode` here would report every state under a name that pane may not
-# have, which is the exact defect CLAUDE.md records about the watcher being
-# hard-coded to `mcode`.
+# THIS IS NOT AVAILABLE FOR EVERY PANE, and the difference is worth stating
+# precisely, because a review of this function (m4, on #93) measured one pane,
+# found no `name`, and concluded the field does not exist. Measured here on
+# 0.9.3, in an isolated instance, register-then-rename:
 #
-# Falls back to the event's own label when the read yields nothing - a pane that
-# is registered but unnamed is still worth watching, and reporting under the
-# label is the honest description of what we know.
+#   agent get <pane>  BEFORE any rename   -> no `name` key at all
+#   agent rename <pane> mcode-3           -> {"name":"mcode-3", ...}
+#   agent get <pane>  AFTER the rename    -> {"name":"mcode-3", ...}
+#   agent list                             -> no `name` key, ever
+#
+# So both shapes are real, and which one a pane has is the whole question:
+#
+#   * a pane the LAUNCHER started was renamed by `agent rename`, so it HAS a
+#     name, and this read is what keeps the watcher from being handed the bare
+#     label `mcode` for what is actually `mcode-3` — the second-pane divergence
+#     CLAUDE.md records, and the reason this read exists.
+#   * a pane some other source registered may never have been renamed, so there
+#     is no name to read, and the event's own label is the honest thing to
+#     report. That is not a degraded guess; the label is what `report-agent`
+#     takes, and herdr keeps the name it was given regardless: measured, a pane
+#     renamed to `mcode-3` still resolved by that name after two further
+#     `report-agent` calls carrying `--agent minimax-code`.
+#
+# `agent list` is deliberately not consulted for a name, even though the
+# pre-existing `next_agent_name` does: it has no `name` field to find, so a
+# search there returns an empty taken-set. (That is a pre-existing bug, not this
+# PR's — reported separately.)
 resolve_agent_name() { # resolve_agent_name <pane-id> <fallback-label>
   local pane="$1" fallback="$2" name=""
   name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"

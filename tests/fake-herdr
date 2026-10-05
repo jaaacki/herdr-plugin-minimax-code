@@ -277,6 +277,29 @@ remembered_session_id() { # prints the remembered id, or nothing at all
 emit_agent_get() { # emit_agent_get
   local sid
   sid="$(remembered_session_id)"
+
+  # FAKE_HERDR_AGENT_NAME models the one thing herdr 0.9.3 has that the default
+  # response lacks: a `name`, on a pane that was actually renamed.
+  #
+  # Measured on 0.9.3, and the shape is the part worth keeping:
+  #   * `agent get` on a pane that was NEVER renamed -> no `name` key at all
+  #   * `agent get` on a pane that WAS renamed       -> {"name":"mcode-3", ...}
+  #   * `agent list`                                 -> no `name` key, ever
+  #
+  # So the default below is not a simplification: it is the unrenamed pane, which
+  # is what a flock-adopted pane looks like. Set the variable and this models the
+  # renamed pane, which is what the launcher produces for every pane it starts.
+  if [ -n "${FAKE_HERDR_AGENT_NAME:-}" ]; then
+    jq -cn --arg p "$src_pane" --arg c "$src_cwd" --arg n "$FAKE_HERDR_AGENT_NAME" '{
+      result: {
+        agent: {agent: "mcode", agent_status: "working",
+                cwd: $c, pane_id: $p, name: $n, agent_session: null},
+        type: "agent_info"
+      }
+    } | del(.result.agent.agent_session)'
+    return
+  fi
+
   if [ -n "$sid" ]; then
     jq -cn --arg s "$sid" --arg p "$src_pane" --arg c "$src_cwd" '{
       result: {
