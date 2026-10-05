@@ -189,6 +189,14 @@ case "${2:-}" in
     exit 0
     ;;
   report-agent)
+    # Opt-in refusal, so a suite can prove the hook RELEASES its once-guard claim
+    # when the registration is refused. Every other report here succeeds, which
+    # would leave the fail-open path untestable — and that path is the one that
+    # decides whether a transient herdr refusal hides a session for good.
+    if [ "${FAKE_HOOK_FAIL:-}" = "report-agent" ]; then
+      emit '{"id":"cli:pane:report_agent","error":{"code":"agent_not_ready","message":"injected"}}'
+      exit 1
+    fi
     emit '{"id":"cli:pane:report_agent","result":{"ok":true}}'
     exit 0
     ;;
