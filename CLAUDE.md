@@ -75,9 +75,26 @@ never had. It is what established that a launched pane appears in `herdr agent l
 that it is addressable both by pane id (`herdr agent get <pane-id>`) and by name
 (`herdr agent get mcode`, installed by `agent rename`).
 
-Resume is wired and **unverified**: `pane report-agent-session` is accepted, but nothing
-demonstrates that a restarted herdr actually restores the session, and the e2e suite makes
-no resume assertion. Treat it as unproven and do not rely on work you cannot redo.
+Herdr accepts a resume command for us, and a restarted herdr re-runs it *if it kept it*. **Do not
+upgrade that to "works", and do not drop the "if it kept it".** Herdr keeps no session id for us
+(no `agent_session`), and it can accept a resume report and still not store it — that is the #99
+failure mode, and the launch line says so itself: `resume command accepted by herdr (exit 0);
+after a restart herdr re-runs … in this pane if it kept it (not verified here, see #99)`. Match
+that line's strength, and do not quote an older one. Proof is by hand in an isolated named
+session (#85/#94); the e2e case is **opt-in** (`MCODE_E2E_RESUME=1`) because it is intermittent,
+about one run in three, cause unknown. Never read a green suite as evidence for this feature.
+
+To check the current state, read the session's **live** `session.json` — never the
+`session-snapshots/*.json` history, which can still show a resume the live state no longer has.
+The path comes from `herdr session list`, so it is right for a named session too; `agent get` and
+`pane get` carry no `agent_resume` at all on 0.9.3.
+
+Three caveats, all measured: **a client must attach**, or while the terminal area is `0x0`
+herdr has no pane to resume into and panes come back as plain shells with nothing logged; two
+`mcode` panes in one cwd restore only one, because herdr keys resume candidates on (source,
+agent, cwd, argv) and keeps the first; and `mcode --continue` resolves by cwd, so a restore with
+no session printing "No saved Session exists in the current workspace" is mcode answering, not
+a failed restore.
 
 ### How the tests reach the real response shape
 
@@ -169,11 +186,20 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
   back, it must use the same `--source` the pane was registered with — see the silent-mismatch
   measurement above.
 - **A self-reported state is only as fresh as the last tick, and a dead watcher never resets
-  it.** `mcode-watch.sh:256` reports on *transitions* only and the pane-gone path at `:243-248`
-  reports nothing, so Herdr keeps the last value indefinitely — a pane can read `working` long
-  after the turn ended. The watcher is `nohup`'d detached with no supervisor, so nothing notices.
-  Check with `pgrep -f "mcode-watch.sh <PANE_ID>"`, re-sync with `bin/mcode-watch.sh <PANE_ID>`
-  (it classifies once and reports, so the fix is immediate).
+  it.** `mcode-watch.sh:338` — `if [ "$state" != "$last" ]` — reports on *transitions* only,
+  and the pane-gone path at `:325-330` reports nothing, so Herdr keeps the last value
+  indefinitely: a pane can read `working` long after the turn ended. The watcher is `nohup`'d
+  detached with no supervisor, so nothing notices. Check with
+  `pgrep -f "mcode-watch.sh <PANE_ID>"`, re-sync with `bin/mcode-watch.sh <PANE_ID>` (it
+  classifies once and reports, so the fix is immediate). *Those line numbers were stale once
+  already, when #83 and #91 grew the header — which is why the code is quoted beside them.
+  Grep the code, not the number.*
+- **Any `minimax-code` pane gets a watcher, not just the ones the action launched** (#84). Herdr
+  fires the `pane.agent_status_changed` hook, `bin/mcode-plugin.sh ensure-watcher` starts a
+  watcher for the pane if none is running, and a flock-adopted pane is included because
+  adoption registers the same label. One watcher per pane, decided by an anchored
+  `pgrep -f "mcode-watch.sh <PANE_ID>"` rather than a lock file — a lock cannot see a watcher
+  that was started by hand or by an older build, which would leave two watchers on one pane.
 - **An `agent_session` on one of our panes may not be ours.** Where `codex` ran in a pane
   earlier, Herdr keeps the *codex* session, inherited from whatever ran there rather than stored
   by this plugin — a plugin-launched pane is a fresh split and carries none, so **read

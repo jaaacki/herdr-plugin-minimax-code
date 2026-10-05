@@ -150,28 +150,24 @@ What a launched pane gets, and what it does not:
 | A name, so `get` / `read` / `wait` resolve by name | ✅ renamed at launch |
 | `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
 | Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
-| Resume after a Herdr restart | ❌ nothing to resume from, because the session report was discarded |
+| Resume after a Herdr restart | ⚠️ herdr accepts the resume command, and re-runs it after a restart if it kept it — proven by hand, CI case gated (#99) |
 | `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
 
-### The session report is attempted, and Herdr throws it away
+### The session id is discarded; the resume command is accepted
 
-Launching a pane now also asks Herdr to record a session id and a resume command,
-so all three of this plugin's reporters run at launch instead of one. **It does not
-work on 0.9.3**, and the launch says so on stderr rather than quietly reporting
-success:
+Launching a pane asks Herdr to record a session id **and** a resume command, and
+Herdr treats those two differently:
 
-```console
-$ bin/mcode-plugin.sh start
-minimax-code: started mcode in pane wZ:p8
-minimax-code: reported session <none> for pane wZ:p8, but could not verify it …
-minimax-code: started the state watcher for pane wZ:p8, so idle/working will follow the pane.
-```
+- the **session id** is refused — Herdr only keeps identity for the agent kinds it
+  enumerates in `herdr agent start`, and `minimax-code` is not one. So there is no
+  `agent_session` on our panes, and the launch says so rather than claiming success;
+- the **resume command** is accepted, and a restarted Herdr re-runs it if it kept it.
 
-Herdr accepts `pane report-agent-session`, exits 0, and persists nothing — it only
-keeps session identity for the agent kinds it enumerates in `herdr agent start`, and
-`minimax-code` is not one. The launch therefore prints an honest "not persisted"
-line, and resume is unavailable. This is Herdr's ceiling, not a plugin bug, and it is
-confirmed independently in `sparkfn/pc-client#2251`.
+This is Herdr's ceiling on identity, not a plugin bug, and it is confirmed
+independently in `sparkfn/pc-client#2251`. It is also the whole of what the
+`--kind` gap costs: Herdr will not store a *session id* for us until it grows
+`--kind minimax-code`, and it needs no such thing to re-run `mcode --continue`
+for us today.
 
 **A session on one of our panes is not automatically ours.** Where `codex` ran in a
 pane earlier and `mcode` was started in it afterwards, Herdr keeps the *codex* session —
@@ -184,8 +180,8 @@ inherited from whatever ran there rather than stored by this plugin, so read
 herdr agent list | jq -r '.result.agents[] | select(.agent_session) | [.agent, .pane_id, .agent_session.source] | @tsv'
 ```
 
-When Herdr gains `--kind minimax-code`, the launch path already reports identity and
-resume starts working with no change here.
+When Herdr gains `--kind minimax-code`, the session id starts being kept too, and
+`herdr agent get <pane>` resolves by identity rather than by label.
 
 ### `agent prompt` and `agent send-keys` do not work — and that is Herdr's ceiling
 
@@ -212,23 +208,49 @@ which only `agent start` can grant.
 
 For genuinely interactive control, attach to the pane instead.
 
-### Resume: wired, not demonstrated
+### Resume: herdr accepts the command, and re-runs it if it kept it
 
-The plugin registers a session identity and a resume command for panes it
-launches, so a Herdr restart has something to resume from. **This has not been
-proven to work end to end** — it has only been shown that Herdr accepts the
-registration, not that a restarted session actually comes back. Treat it as
-unverified, and do not rely on it for work you cannot redo.
+Herdr keeps no session id for `mcode` — there is no `agent_session` on our panes. It
+does accept a **resume command**, and a restarted Herdr re-runs it — *if it kept it*.
+A pane that comes back running `mcode --continue` is the observed result; the accept
+is herdr's word, and the keeping is not verified here.
 
-To check the current state yourself:
+**How well pinned that is, precisely.** It is proven *by hand*: launch a pane, stop the
+server, start it again, attach a client, and the recreated pane runs the real
+`mcode --continue`. There is no continuous test of it. The end-to-end case is gated
+behind `MCODE_E2E_RESUME=1` because it is intermittent — about one run in three, cause
+unknown (#99) — so a green suite is not asserting this for you. Herdr can accept the
+report and still not store it; that is exactly the #99 failure mode, and it is why this
+section stops where it does.
+
+Three things to know before relying on it:
+
+- **A client has to attach.** While Herdr's terminal area is `0x0` — a headless
+  server with no client — it has no pane to resume into. Panes come back as plain
+  shells and nothing is logged. Restart a detached server, see no `mcode`, and
+  this is the usual reason, not a bug.
+- **`mcode --continue` resolves by working directory.** Restored where no session
+  exists, it prints `No saved Session exists in the current workspace`. That is
+  `mcode` answering correctly, not a failed restore.
+- **Two `mcode` panes in one directory restore only one.** Herdr keys resume
+  candidates on (source, agent, cwd, argv) and keeps the first, so the second pane
+  comes back a plain shell and says nothing. Documented, not worked around.
+
+To check the current state yourself. No `herdr` command exposes the resume command — neither
+`agent get` nor `pane get` carries it — so read the session's **live** state file. Take the
+directory from `herdr session list` so this is right for a named session too:
 
 ```bash
-herdr agent list | grep -o '"agent_session":{[^}]*}'   # session identity, if any
-herdr pane report-agent-session --help                 # the resume verb
+DIR="$(herdr session list | awk '$1=="default" {print $3}')"   # or your session's name
+jq -r '[.workspaces[].tabs[].panes[] | select(has("agent_resume")) | .agent_resume
+        | "\(.source)\t\(.agent)\t\(.argv | join(" "))"] | .[]' "$DIR/session.json"
 ```
 
-An agent showing `agent_session` has a registered session. One without it has
-none. Panes this plugin opened may legitimately show no `agent_session`.
+Each line is one pane whose live state carries a resume command. **Do not read
+`session-snapshots/*.json` for this** — that is periodic history, and it can still show a
+resume the live state has since dropped, which is the opposite of what you asked. Empty output
+means no pane currently holds one; on a busy machine that is also what a report herdr accepted
+and did not keep looks like (#99).
 
 ## Driving a launched pane
 
@@ -324,8 +346,11 @@ Encountered in normal use, gathered here so you meet them before you go looking:
    `wait` are unaffected. See above. There is a plugin-side workaround for
    *driving* a pane — [Driving a launched pane](#driving-a-launched-pane) — which
    routes through mcode instead of Herdr and does not lift this ceiling.
-2. **Resume is wired but unverified.** The registration is accepted; that it
-   restores a session has not been demonstrated. See above.
+2. **Resume needs a client, and one pane per directory.** Herdr accepts the resume
+   command, and a restarted Herdr re-runs it if it kept it, so the pane comes back
+   running `mcode --continue` — but only once a client attaches, and when two `mcode`
+   panes share a directory only the first is restored. It is proven by hand, not by CI.
+   See above.
 3. **No screen-manifest detection.** `mcode` ships no Herdr manifest, so Herdr
    cannot detect it from the screen the way it detects `claude`. A local override
    cannot add one either — an override only changes how an agent id Herdr
