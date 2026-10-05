@@ -158,6 +158,78 @@ dlog_exit() {
   return 0
 }
 
+# ---- the once-guard ----------------------------------------------------------
+# ONE REPORT PER SESSION, claimed by a directory, because mkdir is atomic.
+#
+# WHY THIS EXISTS, AGAINST THE HEADER'S OWN CLAIM. The top of this file says it
+# reports agent state exactly ONCE, on SessionStart, and never again. Measured on
+# the authorised run, it did not: pane wT:p8J was registered at 16:30:52 by hook pid
+# 18615 and again at 16:36:17 by hook pid 84070, and both hook processes were
+# parented by the SAME mcode process — both chains end "... 27434 14173 710". One
+# session, one mcode process, two SessionStart events, two registrations of one
+# pane. That is precisely the two-writers-on-one-field fight that the absence of a
+# Stop handler exists to prevent, and it happened anyway.
+#
+# WHY A DIRECTORY AND NOT A FILE. mkdir is the claim that is atomic between two
+# processes on every filesystem this runs on, and it is already the mechanism this
+# repo uses for the watcher's spawn race (#120, #121). A `>` redirect is
+# check-then-act, which is the bug that fix was written against.
+#
+# WHY IT FAILS OPEN, EVERY TIME, AND THE ASYMMETRY IS THE POINT. Three ways this can
+# go wrong, and all three report:
+#   * no session_id in the payload -> nothing to key on, so no guard
+#   * the marker dir is unwritable -> nothing to record in, so no guard
+#   * the report itself failed   -> the claim is RELEASED below, so a later fire of
+#                                   the same session can retry
+# Reporting twice is the behaviour that exists today and is recoverable. Silently
+# not reporting leaves a pane unregistered with nothing in any log to explain it. A
+# guard that can swallow a registration is worse than the double registration it
+# prevents, so every uncertain path here reports.
+#
+# WHY IT IS KEYED ON THE SESSION AND NOT THE PANE. The harm is two writers on one
+# pane's field, but "already done" is a fact about the SESSION. Keying on the pane
+# would suppress a genuinely different session that happened to land in the same
+# pane, and that pane would then carry no registration at all. The suite proves both
+# directions: two fires of one session report once, two sessions in one pane report
+# twice.
+#
+# BOUNDED. One empty directory per session, pruned past GUARD_TTL_MIN. A re-fire is
+# minutes apart; a marker that outlives a day is only costing disk, and this runs on
+# every session a user starts.
+GUARD_TTL_MIN=1440
+REPORTED_DIR=""
+GUARD_MARKER=""
+
+prune_reported() {
+  if [ -n "$REPORTED_DIR" ] && [ -d "$REPORTED_DIR" ]; then
+    find "$REPORTED_DIR" -mindepth 1 -maxdepth 1 -type d -mmin "+$GUARD_TTL_MIN" \
+      -exec rmdir {} + 2>/dev/null || true
+  fi
+  return 0
+}
+
+# claim_report <session-id>
+#   0 claimed (caller owns it, and MUST release it if the report fails)
+#   1 already reported by an earlier fire of this session
+#   2 no guard possible — the caller reports unguarded
+claim_report() {
+  local sid="$1" key
+  [ -n "$sid" ] || return 2
+  # The id becomes a FILENAME, so it is sanitised rather than trusted. The `sid-`
+  # prefix means the name can never be "." or ".." whatever the payload said. A
+  # session id is not attacker-controlled today, but a hook that builds a path out
+  # of stdin does not get to assume that.
+  key="$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
+  [ -n "$key" ] || return 2
+  REPORTED_DIR="$DLOG_DIR/reported"
+  mkdir -p "$REPORTED_DIR" 2>/dev/null || return 2
+  GUARD_MARKER="$REPORTED_DIR/sid-$key"
+  [ -d "$GUARD_MARKER" ] && return 1
+  mkdir "$GUARD_MARKER" 2>/dev/null || return 2
+  prune_reported
+  return 0
+}
+
 # ---- the ancestry chain -------------------------------------------------------
 # Walk order, index 0 = this process, NEAREST first. Nearest wins, so a nested
 # mcode binds to the inner pane rather than the outer one.
@@ -536,7 +608,7 @@ main() {
     return 0
   fi
 
-  local chain found sock pane_id rank hook_cwd
+  local chain found sock pane_id rank hook_cwd hook_sid
   chain="$(chain_walk)"
   log "ancestry chain: $chain"
 
@@ -569,6 +641,13 @@ main() {
   if [ ! -t 0 ]; then
     IFS= read -r -t 1 payload 2>/dev/null || true
   fi
+  hook_sid="$(printf '%s' "$payload" | jq -r 'if type == "object" then (.session_id // empty) else empty end' 2>/dev/null || true)"
+  # Logged on EVERY fire, including fires that end up reporting nothing. Issue #126
+  # is a question about which sessions fired at all, and the durable log could not
+  # answer it because it never recorded the one identifier that distinguishes one
+  # session from the next. A future occurrence should be diagnosable from the file
+  # rather than reconstructed from a pane list weeks later.
+  log "session id: ${hook_sid:-<none: the payload carried no session_id>}"
   hook_cwd="$(printf '%s' "$payload" | jq -r 'if type == "object" then (.cwd // empty) else empty end' 2>/dev/null || true)"
   if [ -n "$hook_cwd" ]; then
     log "prefilter cwd (from the SessionStart payload): $hook_cwd"
@@ -603,6 +682,25 @@ main() {
   rank="$(printf '%s' "$found" | cut -f3)"
   log "proved pane $pane_id in session socket $sock at chain rank $rank"
 
+  # THE ONCE-GUARD, AND IT SITS HERE ON PURPOSE — after the ancestry walk and the
+  # proof, not at the top of the file. A suppressed re-fire must still leave its
+  # chain, its cwd and its proved pane in the durable log. Short-circuiting early
+  # would make "fired and was suppressed" indistinguishable from "never fired",
+  # which is exactly the ambiguity that made issue #126 expensive to reason about.
+  local guard_rc=2
+  claim_report "${hook_sid:-}" && guard_rc=0
+  [ "$guard_rc" = "0" ] || [ ! -d "${GUARD_MARKER:-/nonexistent}" ] || guard_rc=1
+  case "$guard_rc" in
+    1)
+      log "session ${hook_sid:-} was ALREADY reported once; not reporting again."
+      log "the watcher owns this pane from here; a second writer is the fight this file exists to prevent."
+      return 0
+      ;;
+    2)
+      log "no once-guard available for session ${hook_sid:-<none>}; reporting unguarded."
+      ;;
+  esac
+
   # The single report, to the socket the ancestry proved. State is `idle`: the
   # session has just started and no turn is running. From here the watcher owns
   # state, and this hook never reports again.
@@ -614,6 +712,14 @@ main() {
   else
     # Not fatal: herdr refused, and no registration is better than a wrong one.
     log "herdr REFUSED the registration for pane $pane_id; nothing was registered."
+    # THE CLAIM IS RELEASED. A session whose first attempt was refused must not be
+    # permanently suppressed by its own failed attempt — that would turn a
+    # transient herdr refusal into a session that never appears, with nothing in
+    # the log to say why. Claimed-but-failed and never-claimed are the same state.
+    if [ -n "${GUARD_MARKER:-}" ]; then
+      rmdir "$GUARD_MARKER" 2>/dev/null || true
+      log "released the once-guard claim, so a later fire of this session can retry."
+    fi
   fi
   return 0
 }
