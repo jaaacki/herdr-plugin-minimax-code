@@ -112,7 +112,10 @@ Things worth knowing:
   `mcode` 0.6.2 runs at `Full access` where no prompt appears. That gap is
   deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
   session's permission mode with `/permission` and a prompt becomes reachable, at
-  which point the rule can be written from real evidence.
+  which point the rule can be written from real evidence. The session hook below
+  changes *where* a `blocked` report could come from, but has not changed this: its
+  `PermissionRequest` handler is **not** installed, because that event was never
+  observed firing, and shipping a handler for it would be the same lie in a new place.
 - **It deliberately does not call `release-agent`**, and never did once that call
   was understood: it **deletes** the agent entry rather than handing authority back,
   so an earlier version of this watcher made your pane vanish from
@@ -125,6 +128,108 @@ Things worth knowing:
   would have to come from the session store, which is not implemented.
 - Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
   a real captured screen; the comments record which candidates were rejected and why.
+
+## Pane registration for `mcode` you started yourself
+
+Everything above needs the plugin to have opened the pane. A `mcode` you ran by hand in
+some other pane is invisible to Herdr, and no screen watcher can fix that: a watcher has
+to be started *for a pane*, and nothing knew the pane existed.
+
+`mcode` runs plugin lifecycle hooks, so this plugin can now register the pane from
+inside the session itself. Install it once:
+
+```bash
+herdr plugin action invoke jaaacki.minimax-code.minimax-code-install-hook
+# or, from a checkout:
+bin/mcode-plugin.sh install-hook
+```
+
+It copies `mcode-plugin/` into `~/.minimax/plugins/herdr-bootstrap/`, which is where
+`mcode` looks, and then **enables** it — `mcode plugin enable herdr-bootstrap@local`.
+Both halves matter: copying the files is not installing the plugin, because `mcode`
+keeps the enabled state separately, and a plugin that is present but *disabled*
+never fires a hook. The symptom is unusually convincing: the plugin is listed, the
+manifest is valid, and every session starts as though it were not installed.
+
+So the installer **fails** if the plugin does not end up enabled, and prints the
+`mcode plugin list` line as the evidence. That is deliberate: a half-install that
+reports success moves the failure from install time — one clear line and a fixable
+command — to session time, where it is indistinguishable from `mcode` being broken.
+
+It also fails when `mcode` is **not on `PATH`** at all, for the same reason: the
+plugin exists to serve `mcode`, and reporting success for a hook nothing can run is
+the same lie one level up. This is a contract change for headless boxes and build
+agents that install first and run `mcode` later — on such a box, install now exits
+non-zero and the plugin must be enabled by hand before use.
+If you want it gone again:
+
+```bash
+herdr plugin action invoke jaaacki.minimax-code.minimax-code-uninstall-hook
+# or, from a checkout:
+bin/mcode-plugin.sh uninstall-hook
+```
+
+Uninstalling is a first-class operation because the install path is **machine-global**:
+every `mcode` on the box shares `~/.minimax/plugins`, so an install that another agent
+later removes leaves one of you with a plugin half-present. The removal is guarded to
+that one exact path and touches no neighbouring plugin.
+
+Everything ships inert until you run it, the same way
+`agent-detection/minimax-code.toml` ships inert. `mcode` may need a restart to notice
+a plugin you just enabled.
+
+**What it does, and just that:** on `SessionStart` the hook finds the Herdr pane that owns
+the session and registers it, once, as `idle`. That single registration fires
+`pane.agent_status_changed`, which is what starts the watcher described above — and the
+watcher owns every state change from then on. The hook never reports state again and
+never releases the registration, so there is exactly one writer per pane.
+
+**How it finds the pane.** Not from the environment: `mcode` hands hooks a sanitized
+environment with **no `HERDR_*` variables at all**, even when the shell that launched
+`mcode` had `HERDR_PANE_ID` set, and the hook has no controlling terminal to fall back
+on. It walks its own **process ancestry** instead and matches it against each pane's
+`shell_pid`, nearest first — so a nested `mcode` binds to the inner pane, and `cwd` is
+never used to guess. If no pane can be proven, the hook reports nothing and says so; it
+never falls back to the default session, because a registration on the wrong pane is
+worse than no registration.
+
+**It pays for the expensive check only where it has to.** Ancestry is the only thing
+that may register a pane, and answering it costs one `process-info` call per pane — so
+on a machine with many panes that is too much to spend on all of them. The hook first
+asks each session for its panes (one call each) and keeps only those whose `cwd` or
+`foreground_cwd` matches the session's own directory, which it reads from the
+`SessionStart` payload. That is a **filter, never a proof**: two panes in one directory
+is a documented collision, so a directory match buys a single `process-info` call and
+settles nothing, and a pane whose ancestry does not match is discarded exactly as if
+its directory had never been read. If the filter finds nothing that ancestry will
+accept, the hook runs the full search anyway and **says on stderr that it did** — a
+pane's directory can legitimately differ from the project's, and that fallback is an
+ordinary outcome rather than an error, but it should never be a silent one.
+
+**On a machine with a great many panes**, the search is time-bounded, because `mcode`
+kills a hook that overruns its budget and a killed hook is indistinguishable from one
+that never ran. If the bound is reached, the hook **still registers the pane it had
+already proved** and logs a warning that the match may not be the nearest one — so
+running out of time costs accuracy, never the registration. The warning appears in
+`mcode`'s hook diagnostics.
+
+Two things it deliberately does **not** do:
+
+- **It does not deregister on exit.** `mcode` never fired `SessionEnd` for us, on a
+  clean TUI exit or otherwise, so there is no teardown event to hang it on — and
+  `release-agent` deletes rather than releases. Registration is pane-scoped and Herdr
+  drops it with the pane, which is the same answer the watcher reached on its own.
+- **It does not report `blocked`.** See the watcher section above: the event exists in
+  `mcode` but was never observed firing, so it is not registered.
+
+**One limit worth knowing before you install it.** `mcode` hands the hook a sanitized
+environment, and `XDG_CONFIG_HOME` is stripped along with everything else — measured, an
+exported one arrives as literally unset. So the hook always finds Herdr's config
+directory the way a bare `herdr` does: under `$HOME/.config/herdr`. If you run Herdr
+somewhere else — a non-default `XDG_CONFIG_HOME`, or an explicit socket — the hook will
+not see that instance, will not be able to prove which pane it is in, and will decline to
+register. It says so on stderr rather than guessing, and nothing is written. On a default
+setup, which is the ordinary case, this does not arise.
 
 ## What Herdr can see about a launched pane
 
@@ -151,7 +256,7 @@ What a launched pane gets, and what it does not:
 | `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
 | Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
 | Resume after a Herdr restart | ⚠️ herdr accepts the resume command, and re-runs it after a restart if it kept it — proven by hand, CI case gated (#99) |
-| `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
+| `blocked` state | ❌ still unreported. `mcode` *does* expose lifecycle hooks, but `PermissionRequest` was never observed firing, and the session hook below does not register it |
 
 ### The session id is discarded; the resume command is accepted
 

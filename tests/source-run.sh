@@ -35,13 +35,20 @@ repo="$(cd -- "$here/.." && pwd)"
 # The one namespace all three must declare.
 EXPECTED_SOURCE="herdr:minimax-code"
 
-# The three reporters. A new reporter must be added here, or it escapes the
+# The reporters. A new reporter must be added here, or it escapes the
 # check — which is the intended failure mode, since a silent fourth reporter is
 # exactly the problem this suite exists to catch.
+#
+# mcode-plugin/hooks/herdr-bootstrap.sh joined this list in issue #118. It is a
+# REPORTER in the full sense: it calls `pane report-agent` with this namespace,
+# and it is the only path by which a hand-started mcode becomes visible at all.
+# Leaving it out would have been the exact silent-fourth-reporter failure this
+# suite was written to catch, committed by the person adding the fourth.
 REPORTERS=(
   bin/mcode-plugin.sh
   bin/mcode-session.sh
   bin/mcode-watch.sh
+  mcode-plugin/hooks/herdr-bootstrap.sh
 )
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-source-tests.XXXXXX")"

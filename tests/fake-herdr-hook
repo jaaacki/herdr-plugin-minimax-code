@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# tests/fake-herdr-hook — a herdr stub for tests/hook-run.sh ONLY.
+#
+# WHY A SEPARATE STUB. The hook under test is the only caller in this repo of
+# `herdr session list --json` and of `pane process-info`, and it is also the only
+# caller that must address a session by SOCKET rather than by name. tests/fake-herdr
+# has no case for either, and it is shared by ~2400 lines of existing assertions.
+# Extending it would mean touching a fixture that many cases depend on for no
+# benefit; tests/fake-herdr-watch set the precedent of a per-suite stub.
+#
+# WHAT IT MODELS, and nothing else:
+#   session list --json                  -> the fixture's sessions
+#   pane list                            -> the fixture's panes for the socket in
+#                                          $HERDR_SOCKET_PATH
+#   pane process-info --pane <ID>        -> that pane's anchors
+#   pane report-agent <PANE> ...         -> recorded, answered ok
+#
+# EVERY call is appended to $FAKE_HOOK_LOG as
+#   <socket>\t<argv...>
+# with the socket field being the literal string "(unset)" when the caller did not
+# set HERDR_SOCKET_PATH. That is the whole point of the stub: a suite can assert
+# that the hook qualified every call with the socket it proved, and that it never
+# used `--session`.
+#
+# FIXTURE: $FAKE_HOOK_FIXTURE, a JSON document:
+#   {"sessions":[{"name":..,"socket":..,"running":true|false,
+#                 "panes":[{"pane_id":..,"shell_pid":N,"fg_pgid":N,
+#                           "fg_pids":[N],"cwd":".."}]}]}
+#
+# ---- WHY process-info IS SERVED FROM A CACHE, NOT FROM jq --------------------
+# The hook probes one pane at a time, so this stub runs hundreds of times per case,
+# and for the 300-pane case it runs 300 times. Answering each call with its own jq
+# fork made the SUITE the slow thing: eight concurrent jq forks contend for the
+# machine, per-pane cost climbed from ~12 ms to ~140 ms, and the case that exists
+# to prove the scan is affordable started failing on a loaded laptop — a test
+# measuring the test machine, not the code.
+#
+# So the fixture is compiled ONCE per fixture revision into a flat, pre-rendered
+# file of "<socket>\t<pane_id>\t<the exact JSON herdr would return>", and every
+# call after that is a pure-bash lookup with no fork at all. The bytes returned are
+# the same bytes the jq path produced; only the cost of producing them changed.
+# The cache sits beside the fixture, inside the suite's own scratch directory, so
+# it is removed with everything else and never outlives the run.
+
+set -uo pipefail
+
+LOG="${FAKE_HOOK_LOG:-/dev/null}"
+FIXTURE="${FAKE_HOOK_FIXTURE:-}"
+CACHE=""
+
+# Record first, always. A stub that records only the calls it understands would
+# hide the very call this suite exists to catch.
+#
+# ONE printf, not a group of them. The hook probes panes concurrently, so several
+# copies of this stub write here at once. Assembled as a group with two prints, the
+# lines interleaved mid-record and a suite grepping for a call could miss a call
+# that really happened — a failure that reads as "the hook did not report" when the
+# truth is "the log was torn". One short printf to an O_APPEND fd is a single write.
+if [ -n "${HERDR_SOCKET_PATH:-}" ]; then _log_sock="$HERDR_SOCKET_PATH"; else _log_sock="(unset)"; fi
+printf '%s\t%s\n' "$_log_sock" "$*" >>"$LOG" 2>/dev/null
+
+# ---- concurrency observation -------------------------------------------------
+# Opt-in, via FAKE_HOOK_CONC. The hook probes panes in parallel batches, and
+# "there is a loop that backgrounds jobs" is not the same claim as "the probes
+# actually overlap". Recording the high-water mark of simultaneously-live stub
+# processes turns the second claim into something a suite can assert, with no
+# reference to how fast the machine is.
+#
+# The counts are read-modify-written without locking, so a value can be
+# UNDERSTATED when two probes land in the same instant. That is fine for the only
+# question asked of it — is the mark greater than one — because a sequential scan
+# can never produce 2 no matter how it races, while a parallel one produces 2 on
+# every run.
+if [ -n "${FAKE_HOOK_CONC:-}" ]; then
+  _c=0; [ -f "$FAKE_HOOK_CONC.cur" ] && _c="$(cat "$FAKE_HOOK_CONC.cur" 2>/dev/null || echo 0)"
+  case "$_c" in '' | *[!0-9]*) _c=0 ;; esac
+  _c=$((_c + 1)); echo "$_c" >"$FAKE_HOOK_CONC.cur" 2>/dev/null
+  _m=0; [ -f "$FAKE_HOOK_CONC.max" ] && _m="$(cat "$FAKE_HOOK_CONC.max" 2>/dev/null || echo 0)"
+  case "$_m" in '' | *[!0-9]*) _m=0 ;; esac
+  if [ "$_c" -gt "$_m" ]; then echo "$_c" >"$FAKE_HOOK_CONC.max" 2>/dev/null; fi
+  trap 'x=$(( $(cat "$FAKE_HOOK_CONC.cur" 2>/dev/null || echo 1) - 1 )); [ "$x" -ge 0 ] && echo "$x" >"$FAKE_HOOK_CONC.cur" 2>/dev/null' EXIT
+fi
+
+if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
+  printf '{"error":{"code":"no_fixture","message":"FAKE_HOOK_FIXTURE unset or missing"}}\n'
+  exit 1
+fi
+
+emit() { printf '%s\n' "$1"; }
+
+build_cache() {
+  CACHE="$FIXTURE.proc-cache"
+  # The suite removes this file whenever it rewrites the fixture, so "does it
+  # exist" is the whole invalidation test. An mtime comparison was tried first and
+  # is WRONG here: filesystem timestamps have one-second granularity, two cases
+  # written inside the same second compare equal, and the second case silently
+  # probes the FIRST case's pids. A stale cache fails as "my pane was not
+  # reported", which reads like a product bug and is not one.
+  [ -f "$CACHE" ] && return 0
+  jq -r '
+    .sessions[] as $s
+    | $s.panes[]
+    | [ $s.socket, .pane_id,
+        ({id:"cli:pane:process_info",
+          result:{type:"pane_process_info",
+                  process_info:{pane_id:.pane_id,
+                                shell_pid:(.shell_pid // 0),
+                                foreground_process_group_id:(.fg_pgid // 0),
+                                foreground_processes:[(.fg_pids // [])[]|{pid:.}]}}}
+        | tojson) ]
+    | @tsv' "$FIXTURE" >"$CACHE" 2>/dev/null
+}
+
+# Mirrors real herdr, which names the socket it looked for rather than falling back
+# to the default. A test asserting fail-closed behaviour depends on this.
+server_not_running() {
+  emit "{\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at $1\"}}"
+  exit 1
+}
+
+case "${1:-} ${2:-}" in
+  "session list")
+    emit "$(jq -c '{sessions:[.sessions[]|{name,default:(.name=="default"),running,session_dir:"/nonexistent",socket_path:.socket}]}' "$FIXTURE")"
+    exit 0
+    ;;
+esac
+
+if [ "${1:-}" != "pane" ]; then
+  emit '{"error":{"code":"unexpected_verb","message":"fake-herdr-hook does not model this"}}'
+  exit 1
+fi
+
+sock="${HERDR_SOCKET_PATH:-}"
+
+case "${2:-}" in
+  list)
+    out="$(jq -c --arg s "$sock" '
+      (.sessions[] | select(.socket == $s)) as $sess
+      | if $sess == null
+        then {error:{code:"server_not_running",message:("no herdr server is running at " + $s)}}
+        else {id:"cli:pane:list",
+              result:{type:"pane_list",
+                      panes:[$sess.panes[]|{pane_id,cwd,
+                                            foreground_cwd:(.fg_cwd // .cwd)}]}}
+        end' "$FIXTURE")"
+    case "$out" in
+      *'"error"'*) emit "$out"; exit 1 ;;
+    esac
+    emit "$out"
+    exit 0
+    ;;
+  process-info)
+    pane=""
+    prev=""
+    for a in "$@"; do
+      [ "$prev" = "--pane" ] && pane="$a"
+      prev="$a"
+    done
+    if [ -z "$pane" ]; then
+      # Real herdr requires --pane or --current here. Refusing keeps the suite
+      # honest about the flag form the hook must use.
+      emit '{"error":{"code":"bad_args","message":"pane process-info needs --pane <ID>"}}'
+      exit 1
+    fi
+    build_cache
+    # Opt-in, fixed cost per probe. Lets a suite make a scan take a known amount of
+    # TIME instead of an amount that depends on the machine, which is the only way
+    # to test budget behaviour without a timing assertion that is really an
+    # assertion about how fast the runner is. A sleep is a floor, not a ceiling, so
+    # the total only ever grows — the case cannot pass by being fast.
+    [ -n "${FAKE_HOOK_PROBE_DELAY:-}" ] && sleep "$FAKE_HOOK_PROBE_DELAY"
+    hit=""
+    while IFS=$'\t' read -r c_sock c_pane c_json; do
+      if [ "$c_sock" = "$sock" ]; then
+        if [ "$c_pane" = "$pane" ]; then hit="$c_json"; break; fi
+      elif [ -z "${seen_sock:-}" ]; then
+        : # a different session: keep looking, this socket may appear later
+      fi
+    done <"$CACHE"
+    [ -n "$hit" ] || {
+      # An unknown socket and an unknown pane are different answers, and the hook
+      # reads them differently, so decide which one this is.
+      jq -e --arg s "$sock" '.sessions[]|select(.socket==$s)' "$FIXTURE" >/dev/null 2>&1 ||
+        server_not_running "$sock"
+      emit '{"error":{"code":"pane_not_found"}}'
+      exit 1
+    }
+    emit "$hit"
+    exit 0
+    ;;
+  report-agent)
+    emit '{"id":"cli:pane:report_agent","result":{"ok":true}}'
+    exit 0
+    ;;
+  release-agent)
+    # Modelled ONLY so a suite can prove the hook never calls it. It answers
+    # successfully, so a hook that did call it would look like it worked.
+    emit '{"id":"cli:pane:release_agent","result":{"ok":true}}'
+    exit 0
+    ;;
+esac
+
+emit '{"error":{"code":"unexpected_subcommand"}}'
+exit 1
