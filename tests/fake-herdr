@@ -284,11 +284,16 @@ emit_agent_get() { # emit_agent_get
   # Measured on 0.9.3, and the shape is the part worth keeping:
   #   * `agent get` on a pane that was NEVER renamed -> no `name` key at all
   #   * `agent get` on a pane that WAS renamed       -> {"name":"mcode-3", ...}
-  #   * `agent list`                                 -> no `name` key, ever
-  #
+  #   * `agent list`                                 -> `.name` for renamed agents,
+  #                                                    absent for panes that were
+  #                                                    never renamed
   # So the default below is not a simplification: it is the unrenamed pane, which
   # is what a flock-adopted pane looks like. Set the variable and this models the
   # renamed pane, which is what the launcher produces for every pane it starts.
+  #
+  # (An earlier version of this comment said `agent list` has no `name` key
+  # "ever". That was wrong — it was read off panes that had never been renamed.
+  # m1 measured the renamed case and it is present.)
   if [ -n "${FAKE_HERDR_AGENT_NAME:-}" ]; then
     jq -cn --arg p "$src_pane" --arg c "$src_cwd" --arg n "$FAKE_HERDR_AGENT_NAME" '{
       result: {

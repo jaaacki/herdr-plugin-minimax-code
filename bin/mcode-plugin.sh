@@ -866,7 +866,8 @@ is_our_agent_label() { # is_our_agent_label <label>
 #   agent get <pane>  BEFORE any rename   -> no `name` key at all
 #   agent rename <pane> mcode-3           -> {"name":"mcode-3", ...}
 #   agent get <pane>  AFTER the rename    -> {"name":"mcode-3", ...}
-#   agent list                             -> no `name` key, ever
+#   agent list                             -> `.name` for renamed agents, absent
+#                                            for panes that were never renamed
 #
 # So both shapes are real, and which one a pane has is the whole question:
 #
@@ -881,10 +882,12 @@ is_our_agent_label() { # is_our_agent_label <label>
 #     renamed to `mcode-3` still resolved by that name after two further
 #     `report-agent` calls carrying `--agent minimax-code`.
 #
-# `agent list` is deliberately not consulted for a name, even though the
-# pre-existing `next_agent_name` does: it has no `name` field to find, so a
-# search there returns an empty taken-set. (That is a pre-existing bug, not this
-# PR's — reported separately.)
+# WHY `agent get <pane>` AND NOT A SCAN OF `agent list`. Both carry the name for
+# a renamed agent, so this is about addressing rather than availability: the event
+# names a PANE, and `agent get <pane>` answers for exactly that pane, whereas
+# reading a list means matching the right row out of every agent in the session
+# and being certain the match was the intended one. A per-pane key cannot be
+# confused with a neighbour's.
 resolve_agent_name() { # resolve_agent_name <pane-id> <fallback-label>
   local pane="$1" fallback="$2" name=""
   name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"
