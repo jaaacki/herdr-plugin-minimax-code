@@ -388,6 +388,14 @@ unset HERDR_SOCKET_PATH
 # ...and HERDR_SESSION, for the same reason: it would silently retarget every
 # `herdr --session` call at a different server than the one this suite starts.
 unset HERDR_SESSION
+# The hook's durable log lives under ${MINIMAX_DATA_DIR:-$HOME/.minimax}. Isolated here
+# for the same reason XDG_CONFIG_HOME is above: this suite runs the hook for real, and a
+# runner's $HOME is not a place to write. On a developer's machine it is worse than
+# untidy — that file is the only record of what a REAL session's hook did, and issue #126
+# is decided by reading it. Measured on this repo's own machine: 48 of the 54 fires in
+# the real hook.log were test runs, not sessions. Exported once, so the call site below
+# inherits the isolation rather than having to remember it.
+export MINIMAX_DATA_DIR="$WORKDIR/minimax-data"
 HERDR_CONFIG_DIR="$E2E_XDG_ROOT/herdr"
 # XDG_CONFIG_HOME does not move herdr's plugin state dir, which stays under the
 # developer's real ~/.local/state, so watcher logs from this run landed there

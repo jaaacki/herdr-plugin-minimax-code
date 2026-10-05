@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — test isolation
+
+- **The test suites wrote into the real `~/.minimax`.** The hook's durable log lives under
+  `${MINIMAX_DATA_DIR:-$HOME/.minimax}`, and of the six places `tests/hook-run.sh` ran it,
+  only the two durable-log cases passed their own `MINIMAX_DATA_DIR`; the other three, and
+  `tests/e2e/run.sh`, ran it against the developer's real `$HOME`. Measured on this repo's
+  own machine: **48 of the 54 fires in a real user's `hook.log` belonged to the test
+  suite**, along with all 21 refusals in the file. That file is the only record of what a
+  real session's hook did, and issue #126 is decided by reading it — so the suite was
+  destroying the evidence it exists to produce. Both suites now export `MINIMAX_DATA_DIR`
+  once, and a new case fails if that isolation is ever removed.
+
 ## 0.6.1 — one watcher per pane, and a doc that stopped lying
 
 A patch release. No new capability; two fixes, one of them behavioural.
