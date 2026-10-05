@@ -49,6 +49,11 @@ in sync with this directory (it has no `working-with-tasks-chip.txt` either).
 | `idle-with-task-list-footer-2.txt` | `herdr pane read wT:p81 --source detection --lines 40` | `wT:p81` — same shape, second pane. **tail-only**, as above | `idle` |
 | `working-with-task-list-footer.txt` | `herdr pane read wT:p7Z --source detection --lines 40` | `wT:p7Z` — mid-turn, spinner on the live status line, task list above it. **tail-only**, as above | `working` |
 | `working-with-task-list-footer-2.txt` | `herdr pane read wT:p82 --source detection --lines 40` | `wT:p82` — same shape, second pane. **tail-only**, as above | `working` |
+| `idle-empty-composer.txt` | `herdr pane read w1S:p1 --source detection --lines 40` | `w1S:p1` — **launched by this work for this capture**, fresh session, composer empty. **tail-only**: blank lines stripped, all 5 non-blank lines retained (they all fall inside the classifier's 8-line window) | `idle` |
+| `idle-with-single-line-draft.txt` | `herdr pane read w1S:p1 --source detection --lines 40` | same pane, minutes later, one line of text typed and **not** submitted | `idle` |
+| `idle-with-multi-line-draft.txt` | `herdr pane read w1S:p1 --source detection --lines 40` | same pane, same session, three lines of text typed and not submitted | `idle` |
+| `working-with-composer-text.txt` | `herdr pane read w1S:p1 --source detection --lines 40` | same pane, same session, a turn **in flight** with text typed into the composer mid-turn | `working` |
+| `working-with-multiline-composer.txt` | `herdr pane read w1T:p1 --source detection --lines 40` | `w1T:p1` — a second pane launched by this work, a turn **in flight** with a **three-line** draft typed into the composer. **tail-only**: last 10 non-blank lines | `working` |
 
 `wZ:p1A` was created for this issue (`herdr pane split wZ:p4 --direction down --no-focus`, then
 `herdr pane run wZ:p1A "$(command -v mcode)"`) and closed after capture. `wZ:p5` and `wZ:p1`
@@ -80,17 +85,30 @@ is probably not closed. See `Ctrl+T expand` below.
 
 Checked against all the real mcode snapshots:
 
-| Marker | fresh idle | after a turn | idle + task list | working | verdict |
-|---|---|---|---|---|---|
-| `Esc stop` | – | – | – | yes | working |
-| `Ctrl+O details` | – | – | – | yes | working |
-| `Ctrl+T expand` | – | – | **yes** | **yes** | **rejected** |
-| `Start · @` | yes | – | – | – | idle |
-| `● Ready` | yes | – | – | – | idle |
-| `Completed in` | – | yes | yes | – | idle |
-| `Message · Enter send` | – | yes | yes | – | idle |
-| `tok/s` | – | **yes** | **yes** | yes | **rejected** |
-| `Ask Mcode to do anything` | **yes** | **yes** | **yes** | **yes** | **rejected** |
+| Marker | fresh idle | after a turn | idle + task list | unsent draft | working | verdict |
+|---|---|---|---|---|---|---|
+| `Esc stop` | – | – | – | – | yes | working |
+| `Ctrl+O details` | – | – | – | – | yes | working |
+| `Ctrl+T expand` | – | – | **yes** | – | **yes** | **rejected** |
+| `Start · @` | yes | – | – | – | – | idle |
+| `● Ready` | yes | – | – | – | – | idle |
+| `Completed in` | – | yes | yes | yes † | – | idle |
+| `Enter send` (the shared suffix) | – | yes | yes | yes § | – | idle |
+| `Message · Enter send` (one shape) | – | yes | yes | – ‡ | – | idle |
+| `Prompt · Enter send` (one shape) | – | – | – | yes ¶ | – | idle |
+| `Long draft · Ctrl+G edit · Enter send` (one shape) | – | – | – | yes ρ | – | idle |
+| `tok/s` | – | **yes** | **yes** | – | yes | **rejected** |
+| `Ask Mcode to do anything` | **yes** | **yes** | **yes** | – ‡ | **yes** | **rejected** |
+
+† present only when the last turn's completion line is still inside the tail, and
+it scrolls out at 5+ draft lines — so it is not a reliable draft marker.
+‡ the composer hint and the placeholder are *replaced* by the draft text, which is
+the whole mechanism; see the composer section below.
+§ all three hint texts end in it — one line of text, two or more, or an empty
+composer after a turn — and only while the hint is still inside the tail.
+¶ one line of text only. ρ two lines or more, and only while the hint is still
+inside the tail. Both are subsumed by the row above, which is why the table
+carries one rule and not three.
 
 `tok/s` looked like a working signal and is not: it also appears inside
 `Completed in 3s · ⚡ 667 tok/s`, a turn that has **finished**. Using it would have
@@ -216,14 +234,124 @@ before shipping. This one shipped, and only a fresh pair of idle captures found 
 The same 13:05 batch produced one more screen, from pane `wT:p70`. It is
 deliberately **not** in this directory, for two independent reasons.
 
-1. **It exposes a different, still-open defect.** It is an idle screen in a *third*
-   resting shape — the input box reads `Long draft · Ctrl+G edit · Enter send`
-   rather than `Message · Enter send`, and there is no `Completed in` line inside
-   the tail. No marker in `RULES` matches it, and running the watcher against it
-   reports `unknown`, not `idle`. That is a real miss, but it is an **idle-marker
-   gap**, not a working-marker defect, so it is not this issue's business. It is
-   filed separately under epic #88.
-2. **It is not this repo's content to publish.** It is a third team's private
+1. **It is not this repo's content to publish.** It is a third team's private
    correspondence, and tail-only truncation would not save it: the unsent draft
    *is* the defect, so the tail-only rule and a usable fixture pull in opposite
-   directions here. The right answer is a capture from a pane the plugin owns.
+   directions here. The right answer is a capture from a pane the plugin owns —
+   which is what the next section did.
+2. Reading it did pay off, though: its composer read `Long draft · Ctrl+G edit ·
+   Enter send`, which is the hint for a **multi-line** draft. That is a different
+   state from the one-line draft, and it is why the fix below needs two markers
+   rather than one. The shape is reproduced in `idle-with-multi-line-draft.txt`,
+   captured from a pane this work owns.
+
+## The composer has three hint texts, not one — `wT:p70`'s real lesson
+
+Issue #91 assumed the composer hint simply *disappears* when the composer has
+content. It does not. It is **replaced**, with a different string each time the
+composer changes shape. All four states below were captured on **2026-10-05
+~13:4x** from `w1S:p1`, a pane launched by `herdr workspace create` and
+`herdr pane run w1S:p1 "$(command -v mcode)"` for exactly this purpose:
+
+```
+empty, fresh session    Start · @ file or Plugin · / autocomplete
+empty, after a turn     Message · Enter send · Shift+Enter newline
+ONE line of text        Prompt · Enter send · Shift+Enter newline
+TWO lines or more       Long draft · Ctrl+G edit · Enter send
+```
+
+The consequence is the bug: typing into the composer removes the only idle
+marker the tail had (`Start · @` on a fresh session) and substitutes one of its
+own, and the old table knew neither of the new strings. An unsent draft reported
+`unknown`.
+
+That is not cosmetic. An unsent draft is exactly what a failed doorbell leaves
+behind, so this is a state an operator will actually hit.
+
+### The two new rules cannot match a working screen, and that is measured
+
+The obvious way to break this is that mcode lets you type **into the composer
+while a turn is running** — the working status line advertises `Enter steer`. If
+the hint appeared there, a composer marker would report a running turn as idle.
+
+Captured, it does not. Two banked screens, both mid-turn with text in the
+composer:
+
+`working-with-composer-text.txt` — one line typed:
+
+```
+    ⠦ Loading 4s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ────────────────────────────────────────────────────────────────────────
+  ›  text typed into the composer while the turn runs
+```
+
+`working-with-multiline-composer.txt` — **three** lines typed, which is the shape
+that matters, because a multi-line composer is what makes mcode want to print
+`Long draft … Enter send` at all:
+
+```
+    ⠼ Loading 1s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ───────────────────────────────────────────────────────────────────────────
+  ›  typed during a running turn
+     second line of steering text
+     third line of steering text
+```
+
+Neither contains `Enter send` anywhere in its tail. While a turn is in flight the
+status line occupies the hint's row and the composer renders as bare prompt
+lines.
+
+**One rule, not three: `idle|Enter send`.** The leading noun changes with the
+composer's shape (`Message` / `Prompt` / `Long draft`) and the trailing
+affordance does not, so the suffix is the string that survives all three. A
+marker's job is to survive, not to name a shape — three specific rules would need
+a fourth the next time the noun changes. It is still a **phrase**: a bare `Enter`
+would match `Option+Enter queue` on every working screen, which is the same
+mistake as bare `Esc` matching mcode's own changelog prose on a captured idle
+screen.
+
+Across every captured screen the split is clean — `Enter send` in the idle tails,
+`Enter steer` in the working ones, never both, and never in the non-mcode pane:
+
+| | `Enter send` | `Enter steer` |
+|---|---|---|
+| idle captures (5, incl. both task-list ones and the composite) | yes | – |
+| fresh-idle with an empty composer | – | – (matched by `Start · @`) |
+| working captures (6) | **–** | yes |
+| `not-mcode.txt` (a `claude` pane) | – | – |
+
+Proven by mutation: hoisting `idle|Enter send` **above every working rule** leaves
+all 28 cases green, including both working-with-composer cases. So the rule is
+idle-only by *content*, not by table order — the opposite of the `Ctrl+T expand`
+situation, where the ordering was the entire bug. `enter-send-covers-every-composer-hint`
+stops it being "simplified" back to a single hint's noun.
+
+### Rejected: the composer's `›` prompt line
+
+The obvious marker to reach for, and rejected on the same evidence discipline as
+bare `Esc` and `tok/s`. It is on **every** mcode screen, idle and working alike,
+`›` is a generic glyph, and it is precisely what would be needed to cover the gap
+below. It happens to be absent from the one captured non-mcode pane — but one
+sample is not evidence that no other pane carries it, and reporting a foreign
+pane as an idle mcode session is worse than reporting it `unknown`. Pinned by
+`composer-prompt-is-not-a-working-marker`.
+
+### Known limit, measured rather than guessed
+
+The hint renders **above** the composer, so a draft long enough to push its own
+hint out of the 8-line tail matches nothing and still reports `unknown`. Captured
+on the same pane by growing the draft one line at a time:
+
+| draft lines | hint in the 8-line tail? | classification |
+|---|---|---|
+| 1 | yes (`Prompt · Enter send`) | `idle` |
+| 3 | yes (`Long draft · Ctrl+G edit · Enter send`) | `idle` |
+| 4 | yes (`Long draft · Ctrl+G edit · Enter send`) | `idle` |
+| 5 | **gone** | `unknown` |
+| 6 | **gone** | `unknown` |
+
+At 5 lines the tail holds only `›` lines, box rules and the status strip. Closing
+this needs a marker on one of those, and the only candidate is the rejected `›`
+above, so it is documented rather than papered over. Raising `TAIL_LINES` would
+move the boundary but is a global change to every fixture's window, not this
+issue's call.
