@@ -57,6 +57,21 @@ report_count() {
   grep -cF 'report-agent' "$WATCH_LOG" 2>/dev/null || true
 }
 
+# rules_table <script> -> the RULES rows, with the assignment wrapper stripped.
+#
+# The wrapper HAS to come off, and not just for tidiness. `sed -n "/^RULES='/,
+# /'$/p"` puts the FIRST row on the same line as `RULES='`, so any case that then
+# filters those lines on `^(working|idle)\|` silently DROPS the first row. That
+# is not a cosmetic gap: a marker hoisted into first position - the exact thing
+# `working-rules-precede-idle-rules` exists to catch - would be invisible to
+# every structural case at once, including the three absence cases. Found by
+# mutating the table and watching this case stay green; the mutation is in the
+# self-review.
+rules_table() {
+  sed -n "/^RULES='/,/'$/p" "${1:-$WATCH}" 2>/dev/null \
+    | sed -e "s/^RULES='//" -e "s/'\$//" || true
+}
+
 run_case() { CURRENT_CASE="$1"; "$2"; }
 
 # --- cases -------------------------------------------------------------------
@@ -273,7 +288,7 @@ case_chip_is_not_a_working_marker() {
   # script would match this very comment block, and a test that fails on its own
   # documentation is a test nobody keeps.
   local rules
-  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  rules="$(rules_table "$WATCH")"
   if [ -z "$rules" ]; then
     bad "could not read the RULES table from $WATCH; this case cannot assert anything"
     return
@@ -301,7 +316,7 @@ case_ctrl_t_expand_is_not_a_working_marker() {
   # bare grep over the whole script would match the comment block above that
   # explains why the marker was removed.
   local rules
-  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  rules="$(rules_table "$WATCH")"
   if [ -z "$rules" ]; then
     bad "could not read the RULES table from $WATCH; this case cannot assert anything"
     return
@@ -495,7 +510,7 @@ case_working_with_multiline_composer_is_working() {
 case_enter_send_covers_every_composer_hint() {
   setup
   local rules
-  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  rules="$(rules_table "$WATCH")"
   if [ -z "$rules" ]; then
     bad "could not read the RULES table from $WATCH; this case cannot assert anything"
     return
@@ -525,7 +540,7 @@ case_enter_send_covers_every_composer_hint() {
 case_composer_prompt_is_not_a_working_marker() {
   setup
   local rules
-  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  rules="$(rules_table "$WATCH")"
   if [ -z "$rules" ]; then
     bad "could not read the RULES table from $WATCH; this case cannot assert anything"
     return
@@ -536,6 +551,65 @@ case_composer_prompt_is_not_a_working_marker() {
         "report a foreign pane that happens to use it as an idle mcode session." \
         "The screen shapes it would have to cover are listed in the header:"
     printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
+# RULE ORDER IS LOAD-BEARING, AND UNTIL NOW NOTHING PINNED IT.
+#
+# classify() returns the FIRST rule that matches, so the table is not a set of
+# independent markers - it is an ordered decision list. Working before idle is
+# what stops a resting shape from reading as busy, and it is not a stylistic
+# choice: `Ctrl+T expand` (issue #83) was classified correctly only because the
+# working rules were tested first, and the ordering was the entire mechanism of
+# that bug. A table that is reordered, or a new idle row added above the working
+# block, silently changes classification with nothing failing.
+#
+# This case reads the table and asserts the STRUCTURE, so it needs no fixture
+# and cannot be satisfied by any screen. It is deliberately not a set of
+# hand-written expectations: it would keep passing if the markers themselves
+# changed, which is the point - the invariant is about order, not content.
+case_working_rules_precede_idle_rules() {
+  setup
+  local rules rows n=0 last_working=0 first_idle=0
+  rules="$(rules_table "$WATCH")"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  # Only real rows, so the RULES=' and closing quote lines are ignored.
+  rows="$(printf '%s\n' "$rules" | grep -E '^(working|idle)\|' || true)"
+  if [ -z "$rows" ]; then
+    bad "no working|/idle| rows found in the RULES table; this case cannot assert" \
+        "anything about a table it cannot parse:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+    return
+  fi
+  while IFS= read -r line; do
+    n=$(( n + 1 ))
+    case "$line" in
+      working\|*) last_working="$n" ;;
+      idle\|*)    [ "$first_idle" -eq 0 ] && first_idle="$n" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  # Vacuous-assertion guard: a table with only one kind of row would make the
+  # ordering question meaningless, and this case must not pass for that reason.
+  if [ "$last_working" -eq 0 ] || [ "$first_idle" -eq 0 ]; then
+    bad "the RULES table has $last_working working rows and $first_idle idle rows." \
+        "Ordering is only meaningful with both present, so this case would pass" \
+        "vacuously:"
+    printf '%s\n' "$rows" | sed 's/^/          /'
+    return
+  fi
+  if [ "$last_working" -ge "$first_idle" ]; then
+    bad "classify() returns the FIRST matching rule, so a working row at position" \
+        "$last_working sitting after the first idle row at position $first_idle means" \
+        "an idle screen can be read as busy. The working block must be contiguous" \
+        "and first:"
+    printf '%s\n' "$rows" | sed 's/^/          /'
   else
     ok
   fi
@@ -618,6 +692,7 @@ CASES=(
   working-with-multiline-composer-is-working:case_working_with_multiline_composer_is_working
   enter-send-covers-every-composer-hint:case_enter_send_covers_every_composer_hint
   composer-prompt-is-not-a-working-marker:case_composer_prompt_is_not_a_working_marker
+  working-rules-precede-idle-rules:case_working_rules_precede_idle_rules
   unmatched-is-unknown-not-blocked:case_unmatched_is_unknown_not_blocked
   no-traffic-no-report:case_no_traffic_no_report
   transition-reported:case_transition_reported
