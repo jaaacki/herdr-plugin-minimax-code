@@ -26,7 +26,7 @@ bad() { printf 'FAIL  %s\n' "$CURRENT_CASE"; printf '        %s\n' "$*"; CASES_R
 
 BASE_PATH="$PATH"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-watch-tests.XXXXXX")"
-cleanup() { PATH="$BASE_PATH"; rm -rf "$WORK"; }
+cleanup() { PATH="$BASE_PATH"; /bin/rm -rf "$WORK"; }
 trap cleanup EXIT
 
 setup() {

@@ -46,7 +46,7 @@ REPORTERS=(
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mcode-source-tests.XXXXXX")"
 OUT="$WORK/out"
-trap 'rm -rf "$WORK"' EXIT
+trap '/bin/rm -rf "$WORK"' EXIT
 
 CASES_RUN=0
 CASES_FAILED=0

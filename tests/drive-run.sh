@@ -87,7 +87,7 @@ cleanup() {
     printf 'tests/drive-run.sh: KEEP_TMP=1, sandbox left at %s\n' "$WORK" >&2
     return
   fi
-  rm -rf "$WORK"
+  /bin/rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -208,7 +208,7 @@ assert_sqlite_not_queried() {
 # exist is a different case entirely (case 7).
 setup_case() {
   CASE_DIR="$WORK/$CURRENT_CASE"
-  rm -rf "$CASE_DIR"
+  /bin/rm -rf "$CASE_DIR"
   mkdir -p "$CASE_DIR/project"
   mkdir -p "$CASE_DIR/bin" "$CASE_DIR/mcode-home/v2/sqlite"
 
