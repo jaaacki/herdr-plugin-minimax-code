@@ -94,6 +94,33 @@ export FAKE_HOOK_LOG="$WORK/calls.log"
 export FAKE_HOOK_FIXTURE="$WORK/fixture.json"
 : >"$FAKE_HOOK_LOG"
 
+# Isolate the hook's DURABLE LOG, and do it once, for the whole suite.
+#
+# The hook writes to "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap".
+# Six places here run the hook. Two are the durable-log cases, which pass their own
+# MINIMAX_DATA_DIR through `env -i`. The other FOUR inherited the developer's real
+# $HOME: the stand-in pane shell's heredoc below — which is how most cases reach the
+# hook, so it is the largest contributor — and the direct call sites at 352, 428 and
+# 432. That was measured, not assumed: on a machine where this suite had been run
+# three times, 48 of the 54 fires in that developer's REAL
+# ~/.minimax/state/herdr-bootstrap/hook.log were this suite — fake panes w1:p1,
+# w1:real, w3:real — and all 21 refusals in the file belonged to it too.
+#
+# That file is the only record of what a real session's hook did (issue #126
+# turns on reading it), so a suite that writes into it destroys the evidence it
+# exists to produce. It is the same state-isolation rule this file already
+# applies to HERDR_SOCKET_PATH above, for the same reason.
+#
+# Exported rather than passed per call site, so a case added later inherits the
+# isolation instead of having to remember it. tests/e2e/run.sh had the same gap.
+#
+# No `mkdir -p` here, and deliberately so: the hook's own dlog does it. A guard that
+# dereferenced this variable would abort the whole suite under `set -u` the moment
+# anyone removed the export — taking the case that exists to catch that removal with
+# it. Verified by mutation: with the export removed, this suite now fails on
+# suite-env-isolates-the-durable-log instead of dying before it gets there.
+export MINIMAX_DATA_DIR="$WORK/minimax-data"
+
 # Simulate the environment mcode actually gives a hook. This is not cosmetic: run
 # from inside a herdr pane, the suite would otherwise hand the hook a live
 # HERDR_SOCKET_PATH for the owner's real server, which is exactly the variable
@@ -1162,10 +1189,53 @@ FAKEEOF
   fi
 }
 
+# The suite must not write into the DEVELOPER's real durable log.
+#
+# The hook writes to "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap". Any case
+# that runs the hook without its own MINIMAX_DATA_DIR therefore writes into the machine
+# owner's real ~/.minimax. That was measured rather than assumed: on this repo's own
+# machine, 48 of the 54 fires in the real hook.log belonged to THIS SUITE — fake panes
+# w1:p1, w1:real, w3:real — along with all 21 refusals in the file.
+#
+# It matters because that file is the only record of what a real session's hook did;
+# issue #126 is decided by reading it. A suite that fills it with fixtures destroys the
+# evidence it exists to produce.
+#
+# This asserts the AMBIENT environment rather than passing its own, on purpose. The two
+# durable-log cases above already prove the hook writes where it is told; what can rot is
+# a call site added later that forgets. Ambient isolation is inherited, per-call-site
+# isolation has to be remembered, and what has to be remembered is what gets forgotten.
+case_suite_env_isolates_the_durable_log() {
+  local logf
+  if [ -z "${MINIMAX_DATA_DIR:-}" ]; then
+    note "MINIMAX_DATA_DIR is unset; every hook run here writes to the real \$HOME/.minimax"
+    return
+  fi
+  logf="$MINIMAX_DATA_DIR/state/herdr-bootstrap/hook.log"
+  /bin/rm -f "$logf" 2>/dev/null
+
+  # A fixture with no panes at all, so the hook refuses and registers nothing. The
+  # assertion is only that it got as far as writing its log.
+  write_fixture '{"sessions":[{"name":"ambient","socket":"'"$WORK"'/ambient.sock","running":true,"panes":[]}]}'
+  reset_log
+  (
+    cd "$WORK" || exit 1
+    printf '%s' "{\"session_id\":\"ambient\",\"cwd\":\"$WORK\"}" |
+      HERDR_BIN_PATH="$STUB" /bin/bash "$HOOK" SessionStart
+  ) >/dev/null 2>&1 || true
+  reset_log
+
+  if [ ! -f "$logf" ]; then
+    note "a hook run with the suite's own environment wrote no log to $logf"
+    note "the hook resolved its log path somewhere else — most likely the real \$HOME"
+  fi
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
   hook-writes-a-durable-log-when-it-registers-nothing:case_hook_writes_a_durable_log_even_when_it_registers_nothing
+  suite-env-isolates-the-durable-log:case_suite_env_isolates_the_durable_log
   manifest-command-uses-braced-plugin-root:case_manifest_command_uses_the_braced_plugin_root
   manifest-command-actually-executes:case_manifest_command_actually_executes
   pane-is-found-by-ancestry-not-cwd:case_pane_is_found_by_ancestry_not_cwd
