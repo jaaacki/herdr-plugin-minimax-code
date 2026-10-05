@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.1 — one watcher per pane, and a doc that stopped lying
+
+A patch release. No new capability; two fixes, one of them behavioural.
+
+### Fixed
+
+- **The watcher spawn race (#120, #121).** `ensure_watcher` decided "no watcher" with
+  `pgrep` and *then* spawned, so two hooks landing in that window both spawned. The
+  e2e suite caught it as exactly-one-watcher failures on 2 of 10 runs. The spawn window
+  is now claimed with `mkdir`, so only one caller can be inside it; `pgrep` still
+  decides whether a watcher is already running, including one started by hand. The
+  claim is released as soon as the child is visible or has exited, so a dead watcher
+  can still be replaced — and a loser does not take a claim that has already
+  disappeared.
+- **Registration reads raced their own effect (#120, #121).** A pane can be visible
+  before `report-agent` returns, and `agent_not_found` between a prompt and its
+  `send-keys` is that same flap. Those reads now poll for up to 10 s.
+  `agent_not_ready` is still returned immediately.
+
+### Fixed — documentation
+
+- **`CLAUDE.md` said a hook command must be anchored on `$CLAUDE_PLUGIN_ROOT` "which
+  does expand".** It does not, and that sentence is why the hook shipped broken in the
+  first place: an installed, enabled, loaded plugin that silently registered nothing.
+  It now teaches the braced `${PLUGIN_ROOT}`, states the mechanism, and points out
+  that `HERDR_PLUGIN_ROOT` — documented three lines away — obeys the *opposite* rule.
+
+### Unchanged
+
+The scope from 0.6.0 still stands exactly as written: sessions started by typing `mcode`
+into an existing shell register; a pane created by `herdr pane run mcode` is **not yet
+proven** and its cause is still open (issue #126). This release does not claim to close
+it.
+
 ## 0.6.0 — a hand-started `mcode` registers itself
 
 ### What this release is
