@@ -508,8 +508,8 @@ case_report_unresolved_id_still_records_resume() {
   # two mechanisms, two writes, and a read-back that must not speak for the one it
   # did not check.
   assert_stderr_mentions "MANUAL resume is unaffected: 'mcode --continue' re-resolves by workspace"
-  # The resume really was reported despite the missing id — the case's subject.
-  assert_stderr_mentions "resume command recorded"
+  # The resume really was accepted despite the missing id — the case's subject.
+  assert_stderr_mentions "resume command accepted by herdr"
   # The identity flag must be absent, and the resume argv present on both calls.
   assert_log_lacks "--agent-session-id"
   assert_log_exactly "$(expected_report_sequence)"
@@ -796,12 +796,25 @@ case_report_resume_records_outcome() {
   run_session report
   assert_rc_zero "$RC"
 
-  assert_stderr_mentions "resume command recorded"
+  assert_stderr_mentions "resume command accepted by herdr (exit 0)"
   assert_stderr_mentions "'$DEFAULT_RESUME_CMD'"
   assert_stderr_mentions "after a restart"
-  # NOT a paragraph. The old read-back wrote four sentences to say this; this is
-  # the one line that has to survive.
-  assert_stderr_lacks_match "NOT CONFIRMED|UNVERIFIED|is NOT stored: that is verified"
+  # The hedge is REQUIRED, not forbidden. This assertion used to ban
+  # `NOT CONFIRMED|UNVERIFIED`, which meant the suite failed the moment the line
+  # was corrected to what #99 supports — a check that looked like rigour and
+  # locked the overclaim in. m4 caught it on #94.
+  #
+  # What is still forbidden is the overclaim itself, and the opposite direction:
+  # this line must NOT say the resume is lost either, or an accepted report reads
+  # as a discard and the mechanism in daily use looks dead. So the banned set is
+  # now the two things that are actually wrong — claiming it was stored, and
+  # claiming it was dropped — and the required phrase is checked above.
+  assert_stderr_lacks_match "resume command recorded|resume command is stored|it was stored"
+  assert_stderr_lacks_match "resume command (is|was) (NOT stored|discarded|lost)"
+  # And the hedge must be present, so a later edit cannot quietly drop it back to
+  # a confident claim without this failing first.
+  assert_stderr_mentions "if it kept it"
+  assert_stderr_mentions "not verified here, see #99"
   # And the ID half is not conflated with it: herdr stores no id here, which is a
   # different fact with its own line, not an inference from this one.
   assert_stderr_matches "session"
@@ -836,7 +849,9 @@ case_report_resume_refusal_is_reported() {
   # "restart-restore is dead" when the mechanism in daily use is untouched.
   assert_stderr_matches "Manual resume is unaffected"
   # The refusal is NOT dressed as a successful write, and not as a discard either.
-  assert_stderr_lacks_match "resume command recorded"
+  # Matched on "accepted", not the old "recorded": a refusal must not produce the
+  # success line, and the success line is what says "accepted by herdr (exit 0)".
+  assert_stderr_lacks_match "resume command accepted"
   assert_stderr_lacks_match "NOT stored"
 }
 

@@ -541,20 +541,29 @@ issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if h
   session_argv+=(--)
   session_argv+=("${resume_argv[@]}")
 
-  # The exit status IS the verification, and that is worth saying once here rather
-  # than re-deriving in a comment three functions away: herdr refuses this call
-  # outright when it will not record the resume, answering `resume_not_accepted`
-  # when the reporter does not hold the pane (src/app/api/plugins/panes.rs:1683).
-  # So 0 means recorded and non-zero means refused, and neither needs a second
-  # source to confirm it.
+  # The exit status says herdr ACCEPTED the report, and that is the ONLY thing it
+  # says. herdr refuses this call outright when it will not record the resume,
+  # answering `resume_not_accepted` when the reporter does not hold the pane
+  # (src/app/api/plugins/panes.rs:1683), so 0 means accepted and non-zero means
+  # refused, and the status is passed through rather than swallowed.
   #
-  # ONE GAP, stated rather than papered over. herdr also re-checks the argv when it
-  # captures the snapshot and drops the resume if `validate_resume_argv` rejects it
-  # — an absolute path, or an argv containing an apostrophe or a control character.
-  # That check runs at CAPTURE time, not at report time, so a 0 here does not cover
-  # it. The default (`mcode --continue`) is well inside what validates, and
-  # tests/e2e/run.sh proves the whole round trip against a real herdr rather than
-  # trusting this reasoning.
+  # ACCEPTED IS NOT STORED. The comment here used to say "0 means recorded, and
+  # neither needs a second source to confirm it", and #99 falsifies that: the
+  # report goes to the CORRECT session socket with the real herdr binary, herdr
+  # returns 0, and that session's own log records no `pane.report_agent*` at all
+  # while its snapshot has no `agent_resume`. About one run in three.
+  #
+  # So a 0 here is herdr's word and nothing more, and the line below is worded to
+  # keep "accepted" and "kept" apart rather than to assert the second. Persistence
+  # is a capture-time question this call does not answer, which is also why the
+  # e2e case that would answer it is gated behind MCODE_E2E_RESUME=1.
+  #
+  # A SECOND, INDEPENDENT reason a 0 does not prove storage: herdr re-checks the
+  # argv when it captures the snapshot and drops the resume if `validate_resume_argv`
+  # rejects it — an absolute path, or an argv containing an apostrophe or a control
+  # character. That check runs at CAPTURE time, not report time. The default
+  # (`mcode --continue`) is well inside what validates.
+  #
   # The status is PASSED THROUGH, not swallowed. Both callers do `if ! issue_
   # session_report; then die ...`, and that contract is what makes a refusal
   # visible: the launcher treats `attach` as best-effort, so a refusal surfaces as
@@ -562,7 +571,7 @@ issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if h
   # branches because `log` succeeded would quietly disarm that.
   local out rc=0
   if out=$("$HERDR" "${session_argv[@]}" 2>&1); then
-    log "mcode-session: resume command recorded; herdr re-runs '${MCODE_RESUME_CMD}' in this pane after a restart."
+    log "mcode-session: resume command accepted by herdr (exit 0); after a restart herdr re-runs '${MCODE_RESUME_CMD}' in this pane if it kept it (not verified here, see #99)."
   else
     rc=$?
     # Whitespace collapsed rather than newlines deleted: two stderr lines arrive
