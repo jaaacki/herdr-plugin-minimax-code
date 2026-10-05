@@ -145,8 +145,17 @@ bin/mcode-plugin.sh install-hook
 ```
 
 It copies `mcode-plugin/` into `~/.minimax/plugins/herdr-bootstrap/`, which is where
-`mcode` looks — it ships inert until you run that, the same way
-`agent-detection/minimax-code.toml` ships inert. `mcode` may need a restart to notice.
+`mcode` looks, and then **enables** it — `mcode plugin enable herdr-bootstrap@local`.
+Both halves matter: copying the files is not installing the plugin, because `mcode`
+keeps the enabled state separately, and a plugin that is present but *disabled*
+never fires a hook. The symptom is unusually convincing: the plugin is listed, the
+manifest is valid, and every session starts as though it were not installed. The
+installer checks the state afterwards and, if the plugin did not end up enabled,
+says so and prints the command that fixes it rather than reporting success.
+
+Everything ships inert until you run it, the same way
+`agent-detection/minimax-code.toml` ships inert. `mcode` may need a restart to notice
+a plugin you just enabled.
 
 **What it does, and just that:** on `SessionStart` the hook finds the Herdr pane that owns
 the session and registers it, once, as `idle`. That single registration fires

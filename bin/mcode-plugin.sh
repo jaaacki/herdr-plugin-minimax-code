@@ -963,6 +963,65 @@ cmd_ensure_watcher() {
 # inert, exactly as `agent-detection/minimax-code.toml` ships inert. Shipping the
 # files and activating them are separate acts, and only the user should choose the
 # second one — this action is that choice, made explicit and repeatable.
+# enable_mcode_plugin — turn the freshly-copied plugin ON, and check that it took.
+#
+# Copying the files is NOT installing the plugin. mcode keeps a plugin's enabled
+# state separately from its presence, and a plugin that is present but DISABLED
+# never fires a single hook: the manifest loads cleanly, `mcode plugin list`
+# shows the plugin sitting right there, and every session starts as though it
+# were not installed at all. That is the same "enabled, nothing happens" shape
+# this whole issue exists to end, arriving through the installer instead of
+# through the hook.
+#
+# Measured on this machine, and it is the reason a real mcode ran the plugin
+# without ever firing it: mcode's own probe read enabled=false until
+# `mcode plugin enable <id>@local` was run, and fired 52 times only afterwards.
+# `mcode plugin list --json` reports the state as
+# `.installed[] | select(.pluginId == $id) | .enabled`.
+#
+# Returns non-zero when the plugin is not enabled, and says exactly what to run.
+# It does NOT die: the files are installed and correct, so this is a warning
+# about a follow-up step, not a failed install. Pretending it succeeded — or
+# telling the user to go and look — is what produced the original defect.
+enable_mcode_plugin() {
+  local mcode_bin state
+  mcode_bin="$(command -v mcode 2>/dev/null || true)"
+  if [ -z "$mcode_bin" ]; then
+    log "minimax-code: mcode is not on PATH, so the plugin cannot be enabled from here."
+    log "minimax-code: the files are installed but INERT. Before starting mcode, run:"
+    log "minimax-code:   mcode plugin enable herdr-bootstrap@local"
+    return 1
+  fi
+
+  if ! "$mcode_bin" plugin enable herdr-bootstrap@local >/dev/null 2>&1; then
+    log "minimax-code: 'mcode plugin enable herdr-bootstrap@local' failed."
+    log "minimax-code: the files are installed but may be INERT; check 'mcode plugin list'."
+    return 1
+  fi
+
+  # jq is how the plugin reads herdr's JSON at runtime, but the installer must not
+  # hard-depend on it: fall back to the human-readable list, where the two states
+  # are `[*] ... enabled` and `[-] ... disabled`.
+  if command -v jq >/dev/null 2>&1; then
+    state="$("$mcode_bin" plugin list --json 2>/dev/null | jq -r --arg id "herdr-bootstrap@local" \
+      '[.installed[]? | select(.pluginId == $id) | .enabled] | first // "absent"' 2>/dev/null)"
+  else
+    state="$("$mcode_bin" plugin list 2>/dev/null \
+      | grep 'herdr-bootstrap@local' | grep -q 'enabled' && echo true || echo unknown)"
+  fi
+
+  if [ "$state" = "true" ]; then
+    log "minimax-code: plugin enabled; its SessionStart hook fires from the next mcode session on."
+    return 0
+  fi
+
+  log "minimax-code: the plugin is installed but NOT enabled (state: ${state:-unknown})."
+  log "minimax-code: a disabled plugin never fires its hooks, so mcode would start and"
+  log "minimax-code: register nothing. Run this, then start mcode:"
+  log "minimax-code:   mcode plugin enable herdr-bootstrap@local"
+  return 1
+}
+
 cmd_install_hook() {
   local dir dest_root dest
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
@@ -1001,7 +1060,14 @@ cmd_install_hook() {
   log "minimax-code: installed the mcode SessionStart hook into $dest"
   log "minimax-code: it registers a pane ONCE per session and never reports state;"
   log "minimax-code: bin/mcode-watch.sh, which that registration starts, owns state from then on."
-  log "minimax-code: mcode may need a restart to pick the plugin up: mcode plugin list"
+
+  # Installed is not enabled. This is the step whose absence made the plugin look
+  # broken: present on disk, listed by `mcode plugin list`, and never once fired.
+  if enable_mcode_plugin; then
+    log "minimax-code: start mcode and the pane registers itself on SessionStart."
+  else
+    log "minimax-code: NOT DONE until the plugin is enabled — see the command above."
+  fi
   return 0
 }
 

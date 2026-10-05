@@ -819,6 +819,87 @@ case_cwd_matching_nothing_falls_back_loudly() {
   fi
 }
 
+# 19. install-hook ENABLES the plugin, and checks that it took.
+#
+#     Copying the files is not installing the plugin. mcode keeps enabled state
+#     separately from presence, and a present-but-disabled plugin never fires a
+#     hook — the manifest loads, `mcode plugin list` shows it, and every session
+#     starts as if it were not there. That is exactly the failure this PR was
+#     chasing for a day, and it is reachable from the installer, so the installer
+#     is where the test belongs.
+#
+#     This case runs the real installer with a fake `mcode` first on PATH and a
+#     throwaway data dir, then asserts on what the installer actually asked mcode
+#     to do. A textual check for the string "plugin enable" would pass on a
+#     comment; this one cannot.
+case_install_hook_enables_the_plugin() {
+  local fake="$WORK/fakebin" data="$WORK/fakedata" out="$WORK/install.out"
+  mkdir -p "$fake" "$data" 2>/dev/null || { note "cannot create the fake bin dir"; return; }
+
+  # A fake mcode that records its argv, and reports the plugin enabled or not
+  # according to M4_FAKE_ENABLED — so the installer's VERIFICATION step is under
+  # test too, not just the call.
+  cat >"$fake/mcode" <<'FAKEEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$M4_FAKE_LOG"
+case "${1:-} ${2:-}" in
+  "plugin enable") exit 0 ;;
+  "plugin list")
+    if [ "${M4_FAKE_JSON:-}" = "1" ]; then
+      if [ "${M4_FAKE_ENABLED:-true}" = "true" ]; then
+        printf '{"installed":[{"pluginId":"herdr-bootstrap@local","enabled":true}]}\n'
+      else
+        printf '{"installed":[{"pluginId":"herdr-bootstrap@local","enabled":false}]}\n'
+      fi
+    fi
+    printf '[-] herdr-bootstrap@local\tdisabled\n'
+    exit 0
+    ;;
+esac
+exit 0
+FAKEEOF
+  chmod +x "$fake/mcode"
+
+  export M4_FAKE_LOG="$WORK/mcode-calls.log"
+  export M4_FAKE_JSON=1
+  : >"$M4_FAKE_LOG"
+
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
+    /bin/sh "$repo/bin/mcode-plugin.sh" install-hook >"$out" 2>&1
+
+  if ! grep -q '^plugin enable herdr-bootstrap@local$' "$M4_FAKE_LOG" 2>/dev/null; then
+    note "install-hook never ran 'mcode plugin enable herdr-bootstrap@local'"
+    note "a plugin left disabled never fires a hook; mcode calls were: $(tr '\n' '|' <"$M4_FAKE_LOG" 2>/dev/null)"
+  fi
+  if ! grep -q 'plugin list' "$M4_FAKE_LOG" 2>/dev/null; then
+    note "install-hook enabled the plugin without ever checking whether it took"
+  fi
+  if ! grep -qi 'enabled' "$out" 2>/dev/null; then
+    note "install-hook said nothing about the enabled state; a silent install that is"
+    note "inert is the failure this case exists to catch. output: $(head -3 "$out" | tr '\n' '|')"
+  fi
+
+  # The other half: if mcode reports the plugin still disabled, the installer must
+  # say so and name the command. Reporting success here would be a lie the user
+  # cannot check without reading the source.
+  # Exported, not just set: the fake runs as a child process and an unexported
+  # variable is invisible to it, which would silently make this half assert nothing.
+  export M4_FAKE_ENABLED=false
+  : >"$M4_FAKE_LOG"
+  local out2="$WORK/install2.out"
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
+    /bin/sh "$repo/bin/mcode-plugin.sh" install-hook >"$out2" 2>&1
+  if ! grep -q 'NOT enabled' "$out2" 2>/dev/null; then
+    note "mcode reported the plugin disabled and install-hook did not say so"
+    note "output: $(head -4 "$out2" | tr '\n' '|')"
+  fi
+  if ! grep -q 'mcode plugin enable herdr-bootstrap@local' "$out2" 2>/dev/null; then
+    note "install-hook did not name the command that would fix it"
+  fi
+
+  unset M4_FAKE_LOG M4_FAKE_JSON M4_FAKE_ENABLED
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
@@ -838,6 +919,7 @@ CASES=(
   budget-expiry-is-announced:case_budget_expiry_is_announced
   budget-trip-still-registers-what-it-found:case_budget_trip_still_registers_what_it_found
   install-never-uses-a-bare-rm:case_install_never_uses_a_bare_rm
+  install-hook-enables-the-plugin:case_install_hook_enables_the_plugin
 )
 
 if [ "${1:-}" = "--list" ]; then
