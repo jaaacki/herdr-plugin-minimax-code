@@ -1,0 +1,10 @@
+    ✓ [redacted]
+    ✓ [redacted]
+    ○ [redacted]
+    … +5 more · 7/8 done · 1 pending · Ctrl+T expand
+  ✓ Tasks · 4 results ready · /tasks details
+    Message · Enter send · Shift+Enter newline                                                                                                     Tip: /rewind restores an earlier turn
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/[redacted] │ ◇ [redacted] │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 88% left

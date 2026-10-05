@@ -242,6 +242,7 @@ setup_case() {
   # pane's id, and the result would depend on where it was launched from rather
   # than on the case. Each `report` case sets the variable deliberately.
   unset HERDR_PANE_ID
+
 }
 
 # `resolve` and `report` both resolve against the *current* working directory,
@@ -293,6 +294,12 @@ EXPECTED_STATE="working"
 # wrong one. This is the value the other two reporters use too.
 EXPECTED_SOURCE="herdr:minimax-code"
 EXPECTED_LABEL="mcode"
+# The resume command the script sends unless a case overrides it. Written as a
+# literal here rather than read out of the script under test: a test that derived
+# its own expectation from the implementation would agree with any value,
+# including the wrong one. It is also the exact argv inside the captured snapshot
+# in tests/e2e/fixtures, which is what lets the seeded happy path match.
+DEFAULT_RESUME_CMD="mcode --continue"
 
 expected_report_sequence() { # expected_report_sequence [session-id]
   local sid="${1:-}"
@@ -488,16 +495,21 @@ case_report_unresolved_id_still_records_resume() {
   assert_rc_zero "$RC"
 
   assert_stderr_mentions "no session id could be resolved"
-  # The corrected claim, and the wording has moved twice, so this asserts the
-  # sentence rather than a loosened match — the distinction is the whole point of
-  # the case and a regex would let it rot back unnoticed.
+  # The claim, scoped by name. What is true: the MANUAL `mcode --continue`
+  # re-resolves by workspace and needs no id. What is not: any statement about
+  # herdr restart-restore, which is a different mechanism fed by a different write.
+  # Conflating the two is the defect #71 exists to close, and it is why the line
+  # says MANUAL rather than "resume".
   #
-  # What is true: the MANUAL `mcode --continue` re-resolves by workspace and needs
-  # no id. What is not: that herdr restart-restore is fine, which is a different
-  # mechanism fed by a different write, is discarded outright on 0.9.3, and is
-  # therefore unverifiable rather than verified-absent. "Unverifiable" is not
-  # "unaffected", and conflating them is the defect #71 exists to close.
-  assert_stderr_mentions "MANUAL resume is unaffected: 'mcode --continue' re-resolves by workspace and needs no session id"
+  # Issue #85 changed what sits behind the distinction, not the distinction: this
+  # comment used to claim restart-restore "is discarded outright on 0.9.3, and is
+  # therefore unverifiable", which #85 disproved — herdr keeps the resume command
+  # and a restart runs it. What survives is the reason the sentence is scoped:
+  # two mechanisms, two writes, and a read-back that must not speak for the one it
+  # did not check.
+  assert_stderr_mentions "MANUAL resume is unaffected: 'mcode --continue' re-resolves by workspace"
+  # The resume really was accepted despite the missing id — the case's subject.
+  assert_stderr_mentions "resume command accepted by herdr"
   # The identity flag must be absent, and the resume argv present on both calls.
   assert_log_lacks "--agent-session-id"
   assert_log_exactly "$(expected_report_sequence)"
@@ -663,21 +675,40 @@ case_readback_warns_when_session_dropped() {
   # Asserted as a whole sentence, not as the fragment "Session identity is NOT
   # stored". The short form would let a future edit append "…and neither is the
   # resume command" and stay green — which is precisely the over-claim that
-  # shipped once, asserting a measurement nobody took. The resume command's fate
-  # is not observable through this API: `agent get` exposes no resume field, so
-  # it can only be called unverifiable, never lost. The trailing clause
+  # shipped once, asserting a measurement nobody took. The trailing clause
   # ("verified by the read-back, not inferred") is what pins that distinction:
   # it is the difference between a fact this run established and an assumption
   # it dressed up as one.
-  assert_stderr_mentions "Session identity is NOT stored: that is verified by the read-back, not inferred."
-  # The consequence, in the issue's substance rather than its exact prose: the
-  # id is gone and so is the resume command, because herdr discarded the whole
-  # report rather than one field of it.
-  assert_stderr_matches 'not (persist|stored|save)|discard|drop|unavailab|not available'
-  assert_stderr_matches 'resume'
-  # And the user is told this is herdr's ceiling, not a plugin fault, so they
-  # do not go looking for a bug here that is not here.
-  assert_stderr_matches 'herdr|0\.9\.3'
+  #
+  # CHANGED BY ISSUE #85, and the change is the point. The sentence used to end
+  # there, and everything after it was the bug: "Whether herdr kept the resume
+  # command is a separate question this API cannot answer … so ASSUME herdr
+  # restart-restore is unavailable rather than rely on it." That was an
+  # assumption presented as a finding. herdr DOES keep the resume command, in
+  # `agent_resume` in the session snapshot, and a restart DOES run it. So the
+  # sentence now stops at the id, says the id's absence is expected rather than a
+  # fault, and hands the resume command to a read-back of its own.
+  #
+  # The pin is now on the SCOPE, and deliberately shorter than the sentence it
+  # replaced. The old needle required "verified by the read-back, not inferred"
+  # inside one long sentence, which pinned a paragraph that ran on every launch.
+  # The two facts that actually carry this case are kept: that the id is NOT
+  # stored, and that it was VERIFIED rather than assumed. What is gone is the
+  # resume — it is no longer read back from a file at all, so there is nothing
+  # about a "separate field" to assert, and its outcome is its own line from
+  # issue_session_report.
+  assert_stderr_matches "the id is NOT stored, verified by the read-back"
+  # The id's absence is EXPECTED for mcode — herdr keeps a session id only for the
+  # agent kinds it enumerates — and the user is told so, so they do not go looking
+  # for a bug here that is not here.
+  assert_stderr_matches "agent kinds it enumerates"
+  # The retired claim, asserted absent. "assume herdr restart-restore is
+  # unavailable" is false and was the defect; a future edit must not bring it back
+  # in any wording, which is why the needle is the verb and not the sentence.
+  assert_stderr_lacks_match 'assume.{0,40}(restart-restore|resume).{0,30}unavailab'
+  # And the resume is not mentioned as a casualty of the dropped id, which is the
+  # conflation the whole issue is about.
+  assert_stderr_lacks_match 'resume command is a separate field'
 }
 
 # 17. A different failure from a dropped write, and it must not be reported as
@@ -699,7 +730,10 @@ case_readback_distinguishes_unverifiable_from_dropped() {
   # the write, and skipping it would lose the identity on a herdr that works.
   assert_log_order "pane	report-agent	" "pane	report-agent-session"
   # Inability to read is its own message, and it is not a claim of loss.
-  assert_stderr_matches 'could not verify|cannot verify|unable to verify|not be verified'
+  # The short line says UNVERIFIED and spells out what that is not, so the
+  # needle is the word plus its contrast rather than a phrase from a sentence
+  # that no longer exists.
+  assert_stderr_matches 'UNVERIFIED|neither stored nor lost'
   assert_stderr_lacks_match 'not (persist|stored|save)|discard|unavailab|not available'
 }
 
@@ -738,6 +772,90 @@ case_readback_unverifiable_when_no_id_sent() {
   # failed a correct implementation for saying the true thing.
 }
 
+# --- the resume report: issue #85 ---------------------------------------------
+# Everything above checks the session ID. These two check the RESUME COMMAND, and
+# they check it where the answer is actually available: the report's own exit
+# status. herdr refuses a resume it will not record (`resume_not_accepted`,
+# src/app/api/plugins/panes.rs:1683) rather than dropping it quietly, so 0 means
+# recorded and non-zero means refused, and no second source is needed.
+#
+# The obvious second source — reading herdr's session file — was built and then
+# removed. herdr debounces session saves by five seconds, so a read taken while a
+# launch is still running finds the resume absent on essentially every launch, and
+# the read-back said "NOT CONFIRMED" every time. A check that is wrong almost every
+# time is worse than no check, which is why the outcome is now the exit status.
+# The real proof that a stored resume is restored is a real restart, in
+# tests/e2e/run.sh, where no fixture can stand in for it.
+
+# 19. The resume command was recorded, and the one line says so. Short on purpose:
+#     this runs on every launch and every attach.
+case_report_resume_records_outcome() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+
+  run_session report
+  assert_rc_zero "$RC"
+
+  assert_stderr_mentions "resume command accepted by herdr (exit 0)"
+  assert_stderr_mentions "'$DEFAULT_RESUME_CMD'"
+  assert_stderr_mentions "after a restart"
+  # The hedge is REQUIRED, not forbidden. This assertion used to ban
+  # `NOT CONFIRMED|UNVERIFIED`, which meant the suite failed the moment the line
+  # was corrected to what #99 supports — a check that looked like rigour and
+  # locked the overclaim in. m4 caught it on #94.
+  #
+  # What is still forbidden is the overclaim itself, and the opposite direction:
+  # this line must NOT say the resume is lost either, or an accepted report reads
+  # as a discard and the mechanism in daily use looks dead. So the banned set is
+  # now the two things that are actually wrong — claiming it was stored, and
+  # claiming it was dropped — and the required phrase is checked above.
+  assert_stderr_lacks_match "resume command recorded|resume command is stored|it was stored"
+  assert_stderr_lacks_match "resume command (is|was) (NOT stored|discarded|lost)"
+  # And the hedge must be present, so a later edit cannot quietly drop it back to
+  # a confident claim without this failing first.
+  assert_stderr_mentions "if it kept it"
+  assert_stderr_mentions "not verified here, see #99"
+  # And the ID half is not conflated with it: herdr stores no id here, which is a
+  # different fact with its own line, not an inference from this one.
+  assert_stderr_matches "session"
+}
+
+# 20. A refusal is reported as a refusal, in herdr's own words. The launcher
+#     treats `attach` as best-effort, so a refusal that passed silently would look
+#     exactly like a resume that was recorded.
+case_report_resume_refusal_is_reported() {
+  setup_case
+  export HERDR_PANE_ID="$PANE"
+  # A herdr with no such verb is a refusal as far as the entrypoint is concerned:
+  # non-zero out, and an explanation on stderr to quote. The stub models it as
+  # `report-agent-session-unsupported`.
+  export FAKE_HERDR_FAULT="report-agent-session-unsupported"
+
+  # NON-zero, and that is the pre-existing contract, not something #85 changed:
+  # both callers do `if ! issue_session_report; then die`, and that is what makes a
+  # refusal visible at all. The launcher treats `attach` as best-effort, so a
+  # swallowed status would be indistinguishable from a recorded resume.
+  run_session report
+  assert_rc_nonzero "$RC"
+
+  assert_stderr_mentions "resume REFUSED by herdr"
+  # herdr's own words, not our paraphrase: the message quotes what herdr said, so
+  # the needle is a string that could only have come from herdr. It is the
+  # FAKE_HERDR_FAULT announcement rather than the stub's second line because the
+  # line is capped at ~110 characters of quoted text, and the stub says its piece
+  # twice — the announcement first, and that is the one still visible.
+  assert_stderr_matches "FAKE_HERDR_FAULT=report-agent-session-unsupported"
+  # The thing that does still work is said, so a refusal is not read as
+  # "restart-restore is dead" when the mechanism in daily use is untouched.
+  assert_stderr_matches "Manual resume is unaffected"
+  # The refusal is NOT dressed as a successful write, and not as a discard either.
+  # Matched on "accepted", not the old "recorded": a refusal must not produce the
+  # success line, and the success line is what says "accepted by herdr (exit 0)".
+  assert_stderr_lacks_match "resume command accepted"
+  assert_stderr_lacks_match "NOT stored"
+}
+
+
 # --- driver ------------------------------------------------------------------
 run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
@@ -771,6 +889,8 @@ CASES=(
   readback-warns-when-session-dropped:case_readback_warns_when_session_dropped
   readback-distinguishes-unverifiable-from-dropped:case_readback_distinguishes_unverifiable_from_dropped
   readback-unverifiable-when-no-id-sent:case_readback_unverifiable_when_no_id_sent
+  report-resume-records-outcome:case_report_resume_records_outcome
+  report-resume-refusal-is-reported:case_report_resume_refusal_is_reported
 )
 
 if [ ! -x "$FAKE_HERDR" ]; then

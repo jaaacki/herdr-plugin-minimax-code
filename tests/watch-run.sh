@@ -57,6 +57,21 @@ report_count() {
   grep -cF 'report-agent' "$WATCH_LOG" 2>/dev/null || true
 }
 
+# rules_table <script> -> the RULES rows, with the assignment wrapper stripped.
+#
+# The wrapper HAS to come off, and not just for tidiness. `sed -n "/^RULES='/,
+# /'$/p"` puts the FIRST row on the same line as `RULES='`, so any case that then
+# filters those lines on `^(working|idle)\|` silently DROPS the first row. That
+# is not a cosmetic gap: a marker hoisted into first position - the exact thing
+# `working-rules-precede-idle-rules` exists to catch - would be invisible to
+# every structural case at once, including the three absence cases. Found by
+# mutating the table and watching this case stay green; the mutation is in the
+# self-review.
+rules_table() {
+  sed -n "/^RULES='/,/'$/p" "${1:-$WATCH}" 2>/dev/null \
+    | sed -e "s/^RULES='//" -e "s/'\$//" || true
+}
+
 run_case() { CURRENT_CASE="$1"; "$2"; }
 
 # --- cases -------------------------------------------------------------------
@@ -108,6 +123,61 @@ case_stale_scrollback_is_idle() {
   run_watch wZ:p5 --once
   if [ "$(reported_states)" = "idle" ]; then ok
   else bad "a stale spinner in scrollback must not read as working, got '$(reported_states)'"; fi
+}
+
+# --- the task-list footer: the Ctrl+T defect (issue #83) ---------------------
+#
+# `Ctrl+T expand` is part of mcode's task-list footer, and the footer is a
+# RESTING shape: it stays on screen after a turn ends. Both idle fixtures are
+# real captures (a live `Message · Enter send` prompt with a task list above it),
+# both carry `Ctrl+T expand` inside the 8-line tail classify() reads, and both
+# were classified `working` because the working rules are tested before the idle
+# ones. A live watcher therefore reported busy on a finished turn.
+#
+# These fixtures come from panes this plugin does not own, so they are banked
+# tail-only: the last 10 non-blank lines, with third-party task titles withheld
+# as `[redacted]`. That is why each is exactly 10 lines and carries no scrollback
+# - see the rule in tests/fixtures/detection/README.md. The footer and the live
+# status line both sit inside the retained window, which is what makes these
+# cases falsifiable.
+#
+# The two idle cases are the fix's falsification surface: put the rule back and
+# both go red.
+
+case_idle_task_list_footer_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Y --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an idle screen whose tail carries the task-list footer must classify 'idle', got '$(reported_states)'"; fi
+}
+
+case_idle_task_list_footer_2_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p81 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "second idle task-list-footer capture must classify 'idle', got '$(reported_states)'"; fi
+}
+
+# The other half, and the one that stops the fix from being a regression: the
+# footer must not be the thing that DETECTS working either. These two captures
+# carry the same footer AND a live `Esc stop` status line, and they must stay
+# `working` on the strength of that status line alone.
+case_working_task_list_footer_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Z --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "a working screen carrying the task-list footer must still classify 'working', got '$(reported_states)'"; fi
+}
+
+case_working_task_list_footer_2_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p82 --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "second working task-list-footer capture must classify 'working', got '$(reported_states)'"; fi
 }
 
 # A pane that is not mcode at all matches no marker. The watcher must say
@@ -218,7 +288,7 @@ case_chip_is_not_a_working_marker() {
   # script would match this very comment block, and a test that fails on its own
   # documentation is a test nobody keeps.
   local rules
-  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  rules="$(rules_table "$WATCH")"
   if [ -z "$rules" ]; then
     bad "could not read the RULES table from $WATCH; this case cannot assert anything"
     return
@@ -229,6 +299,317 @@ case_chip_is_not_a_working_marker() {
         "queued pane, and never clears. Measured evidence first, as bare Esc and tok/s" \
         "were both given and then dropped:"
     printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
+# CTRL+T EXPAND MUST NOT BE A WORKING MARKER - the same discipline as the chip
+# case above, pointed at a marker that actually WAS in the table and shipped.
+#
+# Unlike the chip, this one is pinned twice: the four classification cases prove
+# the behaviour, and this case pins the decision. Both fail if the rule returns,
+# so this is not a test that passes against a fiction.
+case_ctrl_t_expand_is_not_a_working_marker() {
+  setup
+  # Scoped to the RULES assignment only, for the same reason as the chip case: a
+  # bare grep over the whole script would match the comment block above that
+  # explains why the marker was removed.
+  local rules
+  rules="$(rules_table "$WATCH")"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'Ctrl+T expand'; then
+    bad "Ctrl+T expand is back in the RULES table. It is part of the task-list" \
+        "footer, which is a RESTING shape that survives the end of a turn, so it" \
+        "reads as working on an idle prompt with a task list. Working rules are" \
+        "tested first, so the footer wins. Every captured working screen also" \
+        "carries 'Esc stop', which is what should be doing this work:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
+# THE HEADER MUST NOT CLAIM A LIFECYCLE THE LAUNCHER NO LONGER HAS.
+#
+# bin/mcode-watch.sh used to document itself as a FOREGROUND process: "the
+# foreground job of whichever pane ran it, so closing that pane or pressing
+# Ctrl-C ends it", "nothing is detached", "nothing is spawned per mcode pane".
+# All of that stopped being true in 0.4.1, when the launcher started one watcher
+# per mcode pane with `nohup ... &` + `disown` (issue #75), and the header was
+# left behind as a lie. A comment that misstates how a long-lived background
+# process is stopped is not cosmetic: it is the first thing a reader debugging a
+# watcher that outlived its pane would rely on.
+#
+# Both halves are falsifiable, which is the point: the first fails if the stale
+# wording comes back, the second fails if the launcher ever stops detaching.
+# Reading bin/mcode-plugin.sh from here is not an ownership claim on it - the
+# same cross-file read tests/source-run.sh already does across all three
+# reporters.
+case_detached_doc_matches_launcher() {
+  setup
+  local plugin="$root/bin/mcode-plugin.sh"
+  local header
+  # The header only: the word "detached" is legitimately used later in the file
+  # when explaining why detaching needed no supervisor, so a bare grep over the
+  # whole script would match the corrected text and pass for the wrong reason.
+  header="$(sed -n '2,30p' "$WATCH" 2>/dev/null || true)"
+  if [ -z "$header" ]; then
+    bad "could not read the header of $WATCH; this case cannot assert anything"
+    return
+  fi
+  local stale=""
+  case "$header" in *"FOREGROUND process"*) stale="FOREGROUND process" ;; esac
+  case "$header" in *"Nothing is detached"*) stale="${stale:+$stale, }Nothing is detached" ;; esac
+  case "$header" in *"nothing is spawned per mcode pane"*) stale="${stale:+$stale, }nothing is spawned per mcode pane" ;; esac
+  if [ -n "$stale" ]; then
+    bad "the header still claims: $stale. The launcher nohup-disowns one watcher" \
+        "per mcode pane since 0.4.1, so the watcher outlives the shell that started" \
+        "it. Lifetime is tied to the WATCHED PANE via the pane-gone path, not to the" \
+        "pane you launched from:"
+    printf '%s\n' "$header" | sed 's/^/          /'
+    return
+  fi
+  # The positive half. The banned strings above only catch a verbatim revert, so
+  # the header must also positively name how it is ACTUALLY started. A header
+  # that describes the lifecycle without naming `nohup` is describing something
+  # else, and that is the paraphrase this check exists to catch. This is why the
+  # corrected header explains itself in its own words rather than quoting the
+  # wording it replaced: a literal ban is only meaningful if the surrounding
+  # prose avoids those literals too.
+  case "$header" in
+    *nohup*) ;;
+    *)
+      bad "the header describes how this process is started and stopped but never" \
+          "names nohup, so it is describing a lifecycle this file no longer has. If" \
+          "the launcher genuinely stopped detaching, fix the header and this case" \
+          "together, deliberately:"
+      printf '%s\n' "$header" | sed 's/^/          /'
+      return
+      ;;
+  esac
+  if [ ! -f "$plugin" ]; then
+    bad "$plugin is missing, so the launcher half of this case cannot be checked"
+    return
+  fi
+  # The launcher's own spawn: nohup, the watcher path, backgrounded, then disown.
+  #
+  # ANCHORED TO THE START OF THE LINE, AND THAT IS THE WHOLE POINT. An earlier
+  # revision of this case used `grep -qF 'disown'`, which matched the COMMENT at
+  # mcode-plugin.sh:251-254 explaining what disown does - so deleting the real
+  # `disown` call at :272 left this case green. A guard that a comment can satisfy
+  # is not a guard, and it is worse than no guard: it reads like the lifecycle is
+  # pinned when nothing is. Every comment in that file starts with `#`, so
+  # requiring the token to open a line (after optional indent) matches the
+  # statement and cannot match the prose about it. The `&` is required for the
+  # same reason: `nohup` without `&` would still run in the foreground.
+  if ! grep -qE '^[[:space:]]*nohup[[:space:]]+"?\$watcher"?.*&[[:space:]]*$' "$plugin"; then
+    bad "the launcher no longer starts the watcher as a detached nohup background" \
+        "job. If the watcher is no longer detached, the header must say so, and this" \
+        "case wants a human decision about which way it moved."
+    return
+  fi
+  if ! grep -qE '^[[:space:]]*disown([[:space:]]|$)' "$plugin"; then
+    bad "the launcher no longer disowns the watcher. Watched on: a matching comment" \
+        "is not a call, and this case is anchored to the start of the line so it can" \
+        "only be satisfied by the statement itself."
+    return
+  fi
+  ok
+}
+
+# --- the composer holding an unsent draft (issue #91) ------------------------
+#
+# What mcode prints above the input box depends on what is IN the composer, and
+# there are three texts, not one:
+#
+#   empty, fresh session   Start · @ file or Plugin · / autocomplete
+#   empty, after a turn    Message · Enter send · Shift+Enter newline
+#   ONE line of text       Prompt · Enter send · Shift+Enter newline
+#   TWO lines or more      Long draft · Ctrl+G edit · Enter send
+#
+# So typing into the composer REMOVES the only idle marker the tail had and
+# substitutes one of its own, and a typed-but-unsubmitted draft used to report
+# `unknown`. That is not cosmetic: an unsent draft is exactly what a failed
+# doorbell leaves behind, so this is a state worth classifying.
+#
+# All four fixtures come from ONE pane this work launched (w1S:p1), captured
+# minutes apart in a single session, so the only thing that varies between them
+# is the composer. That is what makes them a comparison rather than four
+# unrelated pictures.
+
+# The control: the same pane, the same session, composer empty. If this ever
+# stops being `idle`, the draft cases below prove nothing.
+case_composer_empty_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-empty-composer.txt"; export WATCH_SNAPSHOTS
+  run_watch w1S:p1 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an empty composer must classify 'idle', got '$(reported_states)'"; fi
+}
+
+case_single_line_draft_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-single-line-draft.txt"; export WATCH_SNAPSHOTS
+  run_watch w1S:p1 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an unsent one-line draft must classify 'idle', got '$(reported_states)'"; fi
+}
+
+# Two or more lines changes the hint text again, to a completely different
+# string, so this is a second marker and not a variation on the first.
+case_multi_line_draft_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-multi-line-draft.txt"; export WATCH_SNAPSHOTS
+  run_watch w1S:p1 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an unsent multi-line draft must classify 'idle', got '$(reported_states)'"; fi
+}
+
+# THE CASE THAT ANSWERS "can the new rule match a working screen?".
+#
+# Typing into the composer mid-turn is possible - mcode offers "Enter steer" -
+# so it is the obvious way for a draft marker to over-match, and this is the one
+# screen where that would show up. It carries a working status line AND text in
+# the composer, and it must stay `working`. Measured on the live pane: a working
+# screen shows the spinner line and a plain `›` composer, and neither draft hint
+# renders at all.
+case_working_with_composer_text_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-composer-text.txt"; export WATCH_SNAPSHOTS
+  run_watch w1S:p1 --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "a working screen with text in the composer must stay 'working', got '$(reported_states)'"; fi
+}
+
+# The same question asked of a MULTI-LINE composer, which is the shape that
+# matters. A one-line draft renders no hint at all while a turn runs, so the case
+# above could pass without the hint ever being suppressed - it would only prove
+# that a hint-less screen works. A multi-line composer is what makes mcode want
+# to print `Long draft ... Enter send`, so this is the screen where the broad
+# `Enter send` rule could genuinely be misread as idle.
+#
+# This is the capture that LICENSES the rule. Its tail carries a live spinner
+# and `Esc stop`, three typed composer lines, and no `Enter send` anywhere.
+case_working_with_multiline_composer_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-multiline-composer.txt"; export WATCH_SNAPSHOTS
+  run_watch w1T:p1 --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "a working screen with a multi-line composer must stay 'working', got '$(reported_states)'"; fi
+}
+
+# The invariant itself: all three hint texts end in the same affordance, so one
+# rule has to match all of them. If this is narrowed back to a single hint's
+# leading noun - `Message · Enter send` alone, say - the two draft cases go red,
+# because their screens no longer carry that word. This is what stops the rule
+# being "simplified" back into a shape that only works for an empty composer.
+case_enter_send_covers_every_composer_hint() {
+  setup
+  local rules
+  rules="$(rules_table "$WATCH")"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'idle|Enter send'; then
+    if printf '%s\n' "$rules" | grep -qF 'Message · Enter send'; then
+      bad "the table still pins a single hint's leading noun as well as the stable" \
+          "suffix. `Message` only appears when the composer is EMPTY, so that rule" \
+          "covers one shape and the drafts fall through to unknown:"
+      printf '%s\n' "$rules" | sed 's/^/          /'
+    else
+      ok
+    fi
+  else
+    bad "there is no \`idle|Enter send\` rule, so an unsent draft reports unknown." \
+        "Every composer hint ends in that affordance - Message, Prompt and" \
+        "Long draft all do - and it is the only part that does not change shape:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  fi
+}
+
+# The decision, pinned. The composer's `›` prompt line is the obvious marker to
+# reach for - it is on every mcode screen and it survives a draft long enough to
+# push the hint out of the tail - and it is rejected here for the same reason
+# bare `Esc` and `tok/s` were: it does not discriminate. It is on idle AND
+# working screens alike, and it is a generic glyph.
+case_composer_prompt_is_not_a_working_marker() {
+  setup
+  local rules
+  rules="$(rules_table "$WATCH")"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF '›'; then
+    bad "the composer's prompt line is in the RULES table. It is on every mcode" \
+        "screen, idle and working alike, and the glyph is generic, so it would" \
+        "report a foreign pane that happens to use it as an idle mcode session." \
+        "The screen shapes it would have to cover are listed in the header:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
+# RULE ORDER IS LOAD-BEARING, AND UNTIL NOW NOTHING PINNED IT.
+#
+# classify() returns the FIRST rule that matches, so the table is not a set of
+# independent markers - it is an ordered decision list. Working before idle is
+# what stops a resting shape from reading as busy, and it is not a stylistic
+# choice: `Ctrl+T expand` (issue #83) was classified correctly only because the
+# working rules were tested first, and the ordering was the entire mechanism of
+# that bug. A table that is reordered, or a new idle row added above the working
+# block, silently changes classification with nothing failing.
+#
+# This case reads the table and asserts the STRUCTURE, so it needs no fixture
+# and cannot be satisfied by any screen. It is deliberately not a set of
+# hand-written expectations: it would keep passing if the markers themselves
+# changed, which is the point - the invariant is about order, not content.
+case_working_rules_precede_idle_rules() {
+  setup
+  local rules rows n=0 last_working=0 first_idle=0
+  rules="$(rules_table "$WATCH")"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  # Only real rows, so the RULES=' and closing quote lines are ignored.
+  rows="$(printf '%s\n' "$rules" | grep -E '^(working|idle)\|' || true)"
+  if [ -z "$rows" ]; then
+    bad "no working|/idle| rows found in the RULES table; this case cannot assert" \
+        "anything about a table it cannot parse:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+    return
+  fi
+  while IFS= read -r line; do
+    n=$(( n + 1 ))
+    case "$line" in
+      working\|*) last_working="$n" ;;
+      idle\|*)    [ "$first_idle" -eq 0 ] && first_idle="$n" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  # Vacuous-assertion guard: a table with only one kind of row would make the
+  # ordering question meaningless, and this case must not pass for that reason.
+  if [ "$last_working" -eq 0 ] || [ "$first_idle" -eq 0 ]; then
+    bad "the RULES table has $last_working working rows and $first_idle idle rows." \
+        "Ordering is only meaningful with both present, so this case would pass" \
+        "vacuously:"
+    printf '%s\n' "$rows" | sed 's/^/          /'
+    return
+  fi
+  if [ "$last_working" -ge "$first_idle" ]; then
+    bad "classify() returns the FIRST matching rule, so a working row at position" \
+        "$last_working sitting after the first idle row at position $first_idle means" \
+        "an idle screen can be read as busy. The working block must be contiguous" \
+        "and first:"
+    printf '%s\n' "$rows" | sed 's/^/          /'
   else
     ok
   fi
@@ -273,7 +654,16 @@ if [ ! -x "$WATCH" ]; then
 fi
 if [ ! -f "$FIX/idle.txt" ] || [ ! -f "$FIX/working.txt" ] ||
    [ ! -f "$FIX/idle-after-working.txt" ] || [ ! -f "$FIX/not-mcode.txt" ] ||
-   [ ! -f "$FIX/stale-scrollback.txt" ]; then
+   [ ! -f "$FIX/stale-scrollback.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer-2.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer-2.txt" ] ||
+   [ ! -f "$FIX/idle-empty-composer.txt" ] ||
+   [ ! -f "$FIX/idle-with-single-line-draft.txt" ] ||
+   [ ! -f "$FIX/idle-with-multi-line-draft.txt" ] ||
+   [ ! -f "$FIX/working-with-composer-text.txt" ] ||
+   [ ! -f "$FIX/working-with-multiline-composer.txt" ]; then
   printf 'FAIL  preflight: captured detection fixtures are missing\n' >&2
   exit 2
 fi
@@ -289,6 +679,20 @@ CASES=(
   classify-empty-is-unknown:case_classify_empty_is_unknown
   classify-post-turn-is-idle:case_classify_post_turn_is_idle
   stale-scrollback-is-idle:case_stale_scrollback_is_idle
+  idle-task-list-footer-is-idle:case_idle_task_list_footer_is_idle
+  idle-task-list-footer-2-is-idle:case_idle_task_list_footer_2_is_idle
+  working-task-list-footer-is-working:case_working_task_list_footer_is_working
+  working-task-list-footer-2-is-working:case_working_task_list_footer_2_is_working
+  ctrl-t-expand-is-not-a-working-marker:case_ctrl_t_expand_is_not_a_working_marker
+  detached-doc-matches-launcher:case_detached_doc_matches_launcher
+  composer-empty-is-idle:case_composer_empty_is_idle
+  single-line-draft-is-idle:case_single_line_draft_is_idle
+  multi-line-draft-is-idle:case_multi_line_draft_is_idle
+  working-with-composer-text-is-working:case_working_with_composer_text_is_working
+  working-with-multiline-composer-is-working:case_working_with_multiline_composer_is_working
+  enter-send-covers-every-composer-hint:case_enter_send_covers_every_composer_hint
+  composer-prompt-is-not-a-working-marker:case_composer_prompt_is_not_a_working_marker
+  working-rules-precede-idle-rules:case_working_rules_precede_idle_rules
   unmatched-is-unknown-not-blocked:case_unmatched_is_unknown_not_blocked
   no-traffic-no-report:case_no_traffic_no_report
   transition-reported:case_transition_reported
