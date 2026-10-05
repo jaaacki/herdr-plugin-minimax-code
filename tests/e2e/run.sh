@@ -275,7 +275,7 @@ EOF
     # every run, so it goes explicitly.
     if [ -n "$HERDR_CONFIG_DIR" ] && [ -d "$HERDR_CONFIG_DIR/sessions/$SESSION" ]; then
       rmdir "$HERDR_CONFIG_DIR/sessions/$SESSION" 2>/dev/null \
-        || rm -rf "$HERDR_CONFIG_DIR/sessions/$SESSION" 2>/dev/null
+        || /bin/rm -rf "$HERDR_CONFIG_DIR/sessions/$SESSION" 2>/dev/null
     fi
   fi
 
@@ -303,8 +303,8 @@ EOF
   # empty directory behind, because the running server still holds and recreates
   # files under it. A suite whose whole selling point is "does not touch your
   # machine" must not leave anything in /tmp either.
-  [ -n "$E2E_XDG_ROOT" ] && [ -d "$E2E_XDG_ROOT" ] && rm -rf "$E2E_XDG_ROOT" 2>/dev/null
-  [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR" 2>/dev/null
+  [ -n "$E2E_XDG_ROOT" ] && [ -d "$E2E_XDG_ROOT" ] && /bin/rm -rf "$E2E_XDG_ROOT" 2>/dev/null
+  [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && /bin/rm -rf "$WORKDIR" 2>/dev/null
   return $rc
 }
 

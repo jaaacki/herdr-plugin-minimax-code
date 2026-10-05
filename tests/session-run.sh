@@ -66,7 +66,7 @@ cleanup() {
     printf 'tests/session-run.sh: KEEP_TMP=1, sandbox left at %s\n' "$WORK" >&2
     return
   fi
-  rm -rf "$WORK"
+  /bin/rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -221,7 +221,7 @@ assert_readback_after_session_report() {
 # a committed fixture must not be mutated by running the suite.
 setup_case() {
   CASE_DIR="$WORK/$CURRENT_CASE"
-  rm -rf "$CASE_DIR"
+  /bin/rm -rf "$CASE_DIR"
   mkdir -p "$CASE_DIR/project"
   cp -R "$STORE_FIXTURE" "$CASE_DIR/store"
 

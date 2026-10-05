@@ -177,7 +177,7 @@ trim_log() { # trim_log <path>
   size="$(wc -c <"$path" 2>/dev/null || printf 0)"
   [ "${size:-0}" -gt 1048576 ] || return 0
   tail -c 204800 "$path" >"$path.trimmed" 2>/dev/null && mv -f "$path.trimmed" "$path" 2>/dev/null
-  rm -f "$path.trimmed" 2>/dev/null || true
+  /bin/rm -f "$path.trimmed" 2>/dev/null || true
 }
 
 # A pane id arrives from a JSON payload, so it is validated rather than trusted,
@@ -579,7 +579,7 @@ cmd_start() {
     if ! get_out=$("$HERDR" pane get "$source_pane" 2>"$get_err_file"); then
       get_err="$(<"$get_err_file")"
     fi
-    rm -f "$get_err_file"
+    /bin/rm -f "$get_err_file"
   else
     # No temp file available. Degrade rather than fail: we just lose the reason.
     get_out=$("$HERDR" pane get "$source_pane" 2>/dev/null) || get_out=""
