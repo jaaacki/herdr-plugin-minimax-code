@@ -104,8 +104,61 @@ fail() {
   while [ $# -gt 0 ]; do printf '        %s\n' "$1"; shift; done
 }
 
+# A case that is deliberately not run, and says so.
+#
+# This suite's founding rule is that a skipped e2e is a false assurance - which is
+# why it refuses to skip when herdr is missing. The one exception is the resume
+# case, gated behind MCODE_E2E_RESUME=1 by architect decision (issue #85): it is
+# red roughly a third of the time for a reason that is upstream of this plugin,
+# and a permanently-red case trains everyone to ignore the whole suite.
+#
+# So it skips BY DEFAULT, and a skip that could be mistaken for a pass is exactly
+# what must not happen here. Three things make it unmissable: the word `skip`
+# rather than `ok`, the reason on the next line, and 99 - a number that cannot be
+# read as a case count, so someone skimming a green run still sees that something
+# did not run. It is never counted as passed.
+CASES_SKIPPED=0
+skip() { # skip <name> <reason>
+  CASES_RUN=$((CASES_RUN + 1))
+  CASES_SKIPPED=$((CASES_SKIPPED + 1))
+  printf 'skip  %s\n' "$1"
+  printf '        99: %s\n' "$2"
+}
+
+# Kill every watcher THIS CHECKOUT started, and only those.
+#
+# The discriminator is this worktree's absolute script path, and it has to be. The
+# pane-id match cleanup already used can only catch a watcher whose pane was
+# recorded in CREATED_PANES, and two watchers outlived a run and made the NEXT
+# run's event-hook case count two watchers on one pane - a run measuring the
+# debris of an earlier one. A blanket `pkill -f mcode-watch.sh` would fix that and
+# break something much worse: the developer's real panes run their INSTALLED copy,
+# so their watchers' argv does not contain this worktree's path, while every
+# blanket match takes them out too. This suite has already damaged this machine
+# once by being careless about exactly that boundary.
+#
+# `kill` is a request, not a receipt, so there is a bounded wait and a SIGKILL
+# behind it - the same reasoning as the per-pane teardown above.
+kill_own_watchers() { # kill_own_watchers <when>
+  local wp n=0 waited=0
+  for wp in $(pgrep -f -- "$repo/bin/mcode-watch.sh" 2>/dev/null); do
+    kill "$wp" 2>/dev/null && n=$((n + 1))
+  done
+  while [ "$waited" -lt 2000 ]; do
+    pgrep -f -- "$repo/bin/mcode-watch.sh" >/dev/null 2>&1 || break
+    sleep 0.1 2>/dev/null || sleep 1
+    waited=$((waited + 100))
+  done
+  for wp in $(pgrep -f -- "$repo/bin/mcode-watch.sh" 2>/dev/null); do
+    kill -9 "$wp" 2>/dev/null
+  done
+  if [ "$n" -gt 0 ]; then
+    printf 'e2e: %s: stopped %s watcher(s) belonging to this checkout\n' "$1" "$n" >&2
+  fi
+  return 0
+}
+
 # ── cleanup: runs whatever happens, and leaves nothing behind ────────────────
-# Every resource this suite creates is recorded here and torn down in reverse.
 # The brief's criterion 6 is "leave no panes, no sessions, no registry changes",
 # so cleanup is not best-effort: a failure below is reported, never swallowed.
 #
@@ -186,6 +239,13 @@ cleanup() {
   done <<EOF
 $CREATED_PANES
 EOF
+
+  # Then the belt to that loop's braces: kill every watcher THIS checkout started,
+  # whatever pane it was watching. The loop above can only kill a watcher whose
+  # pane was recorded, and two outlived a run and made the NEXT run's event-hook
+  # case count two watchers on one pane - so a later run was measuring the debris
+  # of an earlier one.
+  kill_own_watchers "teardown"
 
   # BEFORE the server is killed, and that ordering is the whole point of the
   # escape hatch: the plugin's command log lives in the server's memory, so a
@@ -958,6 +1018,26 @@ resume_failure_mode() {
 run_case_resume_restored() {
   local name="resume: a restart re-runs the recorded resume command in the recreated pane"
 
+  # GATED, off by default (architect decision, issue #85). The reasoning and the
+  # evidence are in .git/flock-review/self-85-rev4-evidence.md; the short version
+  # is that this case fails roughly one run in three for a cause that is upstream
+  # of this plugin, and an always-red case is how suites get ignored wholesale.
+  #
+  # The failure is understood, not ignored. It is NOT the shell-only-pane case the
+  # stub fix addressed: the plugin's own log shows herdr accepting the resume
+  # (exit 0) from the CORRECT session socket, and that same session's server log
+  # recording no report request at all. That is issue #99, and it stays tracked
+  # there rather than as a permanently-red case here.
+  #
+  # When this is switched on, run it where the failure is visible and the machine
+  # is otherwise quiet - it is the only case here that stops and restarts the
+  # server, so it is also the only one that leaves debris if it dies.
+  if [ "${MCODE_E2E_RESUME:-0}" != "1" ]; then
+    skip "$name" \
+      "gated behind MCODE_E2E_RESUME=1. Known-flaky for a cause upstream of this plugin (issue #99): herdr returns 0 for a resume report while its own session log records no report. Run: MCODE_E2E_RESUME=1 ./tests/e2e/run.sh"
+    return
+  fi
+
   # PREFLIGHT: no other e2e server may be alive. Every run mints the same pane id
   # w1:p2, so a leaked server from an earlier run owns a pane with that exact
   # name — and a report naming w1:p2 then SUCCEEDS against the wrong server
@@ -1336,6 +1416,17 @@ LINKED_BY_US=1
 WARNINGS="$("$HERDR" plugin list --json 2>/dev/null \
   | jq -c --arg id "$PLUGIN_ID" '.result.plugins[]? | select(.plugin_id == $id) | (.warnings // [])' 2>/dev/null)"
 
+# PREFLIGHT, before the server starts and before anything is linked: clear any
+# watcher this checkout left behind in an EARLIER run. Teardown does the same on
+# the way out, and both are needed - teardown alone cannot help a run that follows
+# a crashed one, and that is exactly the case where a stale watcher sits on pane
+# w1:p2 and makes the event-hook case count two.
+#
+# Scoped to this checkout's own script path, for the reason given on
+# kill_own_watchers: the developer's real watchers run their installed copy and
+# must survive this untouched.
+kill_own_watchers "preflight"
+
 # The stub launcher MUST be on PATH before the server starts: the action is
 # spawned by the server and inherits the server's environment, not this
 # script's. See prepare_stub_mcode for what that cost on the first CI run.
@@ -1365,7 +1456,15 @@ if [ "$WARNINGS" != "[]" ] && [ -n "$WARNINGS" ]; then
   CASES_FAILED=$((CASES_FAILED + 1))
 fi
 if [ "$CASES_FAILED" -eq 0 ]; then
-  printf '%d case(s), all passed\n' "$CASES_RUN"
+  # The skip count rides on the green line. A suite that says "all passed" while
+  # one case did not run is the false assurance this file exists to remove, and
+  # the number is what stops someone reading only the last line from missing it.
+  if [ "$CASES_SKIPPED" -gt 0 ]; then
+    printf '%d case(s), all passed, %s SKIPPED (99 above - see the skip reason)\n' \
+      "$CASES_RUN" "$CASES_SKIPPED"
+  else
+    printf '%d case(s), all passed\n' "$CASES_RUN"
+  fi
   exit 0
 fi
 printf '%d case(s), %d failed\n' "$CASES_RUN" "$CASES_FAILED"
