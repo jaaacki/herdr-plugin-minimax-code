@@ -180,29 +180,11 @@ trim_log() { # trim_log <path>
   rm -f "$path.trimmed" 2>/dev/null || true
 }
 
-# pane_lock_file - the per-pane lock: a single file holding the pid of whatever
-# is currently responsible for watching that pane.
-#
-# A FILE, created with `set -C` (noclobber), not a directory created with mkdir.
-# Both are atomic "create or fail" primitives, and the file wins for a reason
-# that only showed up on a real machine: reclaiming a directory lock means
-# `rm -rf` on it, and `rm` is a program a user can replace. On the machine this
-# was developed on, `rm` is a shim that PRINTS ITS SUCCESS MESSAGE TO STDOUT -
-# so `lock="$(acquire_pane_lock ...)"` captured that message along with the
-# path, and every write to "$lock/pid" then went to a filename that did not
-# exist. The lock survived without a pid, which reads as "a start is in
-# progress", and the pane could never be watched again. Overwriting one small
-# file needs no delete at all, so no `rm` sits on the path that decides whether a
-# pane gets a watcher.
-pane_lock_file() { # pane_lock_file <pane-id>
-  printf '%s/lock/%s.pid\n' "$(watch_log_dir)" "$1"
-}
-
-# A pane id is used to build a PATH here, so it is validated rather than
-# trusted. Same shape rule cmd_start applies to a split response, and for the
-# same reason: these strings come from a JSON payload, and a payload is data.
-# `:` is legal in a POSIX filename; `/` is not, and that is the character that
-# would actually hurt.
+# A pane id arrives from a JSON payload, so it is validated rather than trusted,
+# and it is about to be embedded in a regular expression. Same shape rule
+# cmd_start applies to a split response, and for the same reason: these strings
+# are data. `:` is legal in a POSIX filename; `/` is not, and that is the
+# character that would actually hurt.
 valid_pane_id() { # valid_pane_id <value>
   case "${1:-}" in
     ''|*[!A-Za-z0-9_.:-]*) return 1 ;;
@@ -211,85 +193,70 @@ valid_pane_id() { # valid_pane_id <value>
   esac
 }
 
-# lock_owner_pid <lockfile> - print the pid recorded in the lock, or nothing.
-lock_owner_pid() { # lock_owner_pid <lockfile>
-  local pid
-  [ -f "$1" ] || return 1
-  pid="$(cat "$1" 2>/dev/null || true)"
-  case "$pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  printf '%s\n' "$pid"
+# Escape a string for use as a LITERAL inside an ERE.
+#
+# A pane id may legally contain `.`, which in a regular expression means "any
+# character". That is a small hole, but this is a value from an untrusted
+# payload on its way to a process-matching pattern, so the whole metacharacter
+# set is escaped rather than the one character that happens to be reachable
+# today. Cheap, and it does not need a second argument whenever the allowed
+# character set widens.
+ere_escape() { # ere_escape <string>
+  printf '%s' "$1" | sed 's/[][\\.*^$(){}|+?\/]/\\&/g'
 }
 
-# pid_is_alive <pid>
-pid_is_alive() { # pid_is_alive <pid>
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  kill -0 "$1" 2>/dev/null
-}
-
-# claim_pane_lock <pane-id> - succeed only if this process now owns the pane.
+# pane_is_watched <pane-id> - is a state watcher already running for this pane?
 #
-# Three-step protocol, and each step exists because the two before it were not
-# enough:
+# WHY A PROCESS CHECK AND NOT A LOCK FILE. There was one, and it was wrong in a
+# way only real machines reveal. A lock file records the watchers THIS code
+# started, so it is blind to every watcher it did not:
 #
-#   1. Create the lock with noclobber. Atomic: exactly one caller wins, and the
-#      winner is the one allowed to start a watcher.
-#   2. If it already exists, read the owner. A LIVE owner means someone is
-#      already doing the job - decline, and start nothing.
-#   3. If the owner is gone (or was never written), take it over by overwriting
-#      the pid, then READ IT BACK. The read-back is the part that makes takeover
-#      safe: two handlers can both see a dead owner and both write, so the write
-#      alone proves nothing. Whoever's pid is in the file afterwards is the
-#      winner, and the loser declines. Without this, "exactly one watcher" would
-#      hold only when two events never arrived at the same instant.
+#   * every watcher started by a 0.4.1 launcher - which is to say, all of them
+#     at the moment a user upgrades, and
+#   * the hand-run `bin/mcode-watch.sh <PANE_ID>` that the README tells people
+#     to run as the fix for a frozen state.
 #
-# On success the file holds the CLAIMING shell's pid for the moment between the
-# claim and the fork, so a second handler arriving in that window sees a live
-# pid and declines. The real watcher pid overwrites it immediately after.
-claim_pane_lock() { # claim_pane_lock <pane-id>
-  local pane="$1" lockfile owner
-  lockfile="$(pane_lock_file "$pane")"
-  mkdir -p "$(dirname -- "$lockfile")" 2>/dev/null || return 1
-
-  # Step 1. `$$` in a subshell is still this shell's pid, which is what we want
-  # recorded: it is a process that is definitely alive right now.
-  if ( set -C; printf '%s\n' "$$" >"$lockfile" ) 2>/dev/null; then
-    return 0
-  fi
-
-  # Step 2.
-  owner="$(lock_owner_pid "$lockfile" || true)"
-  if [ -n "$owner" ] && pid_is_alive "$owner"; then
-    return 1
-  fi
-
-  # Step 3. Nobody home, or a lock from a process that died without cleaning up.
-  printf '%s\n' "$$" >"$lockfile" 2>/dev/null || return 1
-  # Step 3b, the read-back that makes the takeover a contest rather than a
-  # race. An unreadable or unparseable file counts as NOT ours.
-  owner="$(lock_owner_pid "$lockfile" || true)"
-  [ "$owner" = "$$" ]
-}
-
-# Drop lock files whose watcher is gone. Without this a pane that closes leaves
-# its lock behind forever, and the state dir accumulates one file per pane the
-# user has ever watched. `rm -f` on a single file, so a replacement `rm` that
-# prints to stdout cannot corrupt anything here - nothing captures this output.
-prune_dead_locks() { # prune_dead_locks
-  local root f owner
-  root="$(watch_log_dir)"
-  root="${root%/watch}/lock"
-  [ -d "$root" ] || return 0
-  for f in "$root"/*.pid; do
-    [ -f "$f" ] || continue
-    owner="$(lock_owner_pid "$f" || true)"
-    if [ -z "$owner" ] || ! pid_is_alive "$owner"; then
-      rm -f "$f" 2>/dev/null || true
-    fi
-  done
+# Both are live processes holding a pane, and on the next status change the
+# lock would read "not watched", start a second watcher, and two watchers would
+# report the same pane for the rest of its life. The lock was tracking the
+# wrong thing: not "is this pane watched", but "did I start it".
+#
+# The process table is the single source of truth for that question, and it is
+# the only one that already contains the 0.4.1 and hand-run cases for free.
+#
+# THE PATTERN, and both ends of it are load-bearing:
+#
+#   (^|[[:space:]/])mcode-watch\.sh[[:space:]]+PANE([[:space:]]|$)
+#
+#   * The left anchor stops a file merely NAMED `notmcode-watch.sh` from being
+#     taken for the real watcher. Measured: it is.
+#   * The right side must accept WHITESPACE as well as end-of-string. An
+#     end-anchor alone looks right and is not: a watcher started as
+#     `mcode-watch.sh wZ:p8 --interval 1` has a command line that continues
+#     after the pane id, so `mcode-watch.sh wZ:p8$` does NOT match it. That is
+#     the exact shape the README's hand-run fix takes, so an end-anchored
+#     pattern fails to see precisely the watchers it exists to find. Measured
+#     with the process table verified clean, one watcher at a time:
+#         mcode-watch.sh wZ:p8                        end-anchored: MATCH
+#         mcode-watch.sh wZ:p8 --interval 1           end-anchored: MISS
+#         mcode-watch.sh wZ:p8 --interval 1  refined: MATCH
+#   * Requiring the separator to be whitespace or `/` also stops a watcher on
+#     `wZ:p80` from being counted as a watcher on `wZ:p8`.
+#
+# # ponytail: two hooks arriving in the same instant can BOTH pass this check
+# and both start a watcher, because there is nothing atomic about it. The old
+# lock was atomic and blind; this is accurate and racy. The race is accepted:
+# transitions on a pane are sparse (measured: three identical re-reports of one
+# state produce zero events), and a duplicate watcher only re-reports states the
+# original is already reporting, because mcode-watch.sh is transition-only. The
+# cost of closing the race properly - an atomic claim - is a lock file again,
+# which is the thing that was blind. One watcher per start path, no state file
+# to go stale, and a narrow duplicate window, is the trade.
+pane_is_watched() { # pane_is_watched <pane-id>
+  local pane pattern
+  pane="$(ere_escape "$1")"
+  pattern="(^|[[:space:]/])mcode-watch\\.sh[[:space:]]+${pane}([[:space:]]|\$)"
+  pgrep -f "$pattern" >/dev/null 2>&1
 }
 
 # ensure_watcher - THE spawn path. Starts bin/mcode-watch.sh for a pane, at
@@ -364,22 +331,22 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
     log="/dev/null"
   fi
 
-  # Prune OTHER panes' dead locks BEFORE taking this one, and take this one's
-  # before forking. Both orderings are load-bearing; see the comments on
-  # prune_dead_locks and claim_pane_lock.
-  prune_dead_locks
-
-  # The lock is claimed BEFORE anything is spawned and held by a live pid, so a
-  # second trigger for a pane that already has a live watcher starts nothing.
-  # This is the half of #84 that the event hook makes necessary: the hook fires
-  # on the watcher's own first report, so without this every state transition
-  # would double the watcher.
-  if ! claim_pane_lock "$pane"; then
+  # Is this pane ALREADY watched? Checked before anything is spawned, and it is
+  # the half of #84 the event hook makes necessary: the hook fires on the
+  # watcher's own first report, so without this every state transition would
+  # double the watcher.
+  #
+  # `pgrep` is checked for first, not assumed. Without it the question is
+  # unanswerable, and the two available answers are both wrong: spawning risks
+  # the duplicate this check exists to prevent, and refusing would leave panes
+  # unwatched - the defect #84 is filed about. So a missing pgrep spawns, says
+  # so on the launch path, and the log records that the guarantee was degraded.
+  if ! command -v pgrep >/dev/null 2>&1; then
+    [ -n "$launch_line" ] && log "minimax-code: \`pgrep\` is not on PATH, so this plugin cannot tell whether pane ${pane} is already watched and has started a watcher anyway. If a watcher was already running - one started before an upgrade, or one you started by hand - there are now two reporting the same pane. Everything else about the pane is unaffected; only the duplicate is."
+  elif pane_is_watched "$pane"; then
     [ -n "$launch_line" ] && log "minimax-code: pane ${pane} already has a state watcher, so none was started."
     return 0
   fi
-  local lockfile
-  lockfile="$(pane_lock_file "$pane")"
 
   if [ -n "$logdir" ]; then
     trim_log "$log"
@@ -402,13 +369,12 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
   # does not signal it. Harmless if it fails: nohup already ignores SIGHUP.
   MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
     nohup "$watcher" "$pane" >>"$log" 2>&1 &
-  local watcher_pid=$!
   disown 2>/dev/null || true
 
-  # The lock now carries the WATCHER's pid rather than this shell's, so the next
-  # trigger asks the right question - is the watcher still running - instead of
-  # asking about a handler that exited microseconds ago and would read as dead.
-  printf '%s\n' "$watcher_pid" >"$lockfile" 2>/dev/null || true
+  # No pid is recorded anywhere, and that is the point of this revision: the next
+  # trigger reads the process table rather than a file this code wrote, so it
+  # also sees a watcher that a 0.4.1 launcher or a person started. A record only
+  # of our own spawns was the reason the previous version could not see them.
 
   if [ -n "$launch_line" ]; then
     log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. Its log is ${log}. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
