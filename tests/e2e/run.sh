@@ -132,6 +132,27 @@ cleanup() {
     for wp in $(pgrep -f "mcode-watch.sh $tp" 2>/dev/null); do
       kill "$wp" 2>/dev/null
     done
+    # WAIT for the watchers to actually be gone before this function returns.
+    #
+    # `kill` is a request, not a receipt, and a watcher being asked to exit is
+    # still visible to pgrep for a moment. tests/run.sh has two leak probes
+    # (cases 22 and 23) whose whole purpose is to see any watcher left running
+    # from this checkout — and running that suite immediately after this one made
+    # them fire on a watcher that was on its way out. A test that fails on a
+    # process which has already been asked to stop is a test teaching the reader
+    # to ignore it, so the wait is part of the cleanup rather than a nicety.
+    #
+    # Bounded, because a watcher that ignores SIGTERM must not hang the suite.
+    # KILL after the bound, so the guarantee holds either way.
+    local waited=0
+    while [ "$waited" -lt 2000 ]; do
+      pgrep -f "mcode-watch.sh $tp" >/dev/null 2>&1 || break
+      sleep 0.1 2>/dev/null || sleep 1
+      waited=$((waited + 100))
+    done
+    for wp in $(pgrep -f "mcode-watch.sh $tp" 2>/dev/null); do
+      kill -9 "$wp" 2>/dev/null
+    done
   done <<EOF
 $CREATED_PANES
 EOF
