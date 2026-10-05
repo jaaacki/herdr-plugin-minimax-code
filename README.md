@@ -357,6 +357,21 @@ Encountered in normal use, gathered here so you meet them before you go looking:
    *already knows* is detected; it cannot introduce a new id. This is precisely
    why state reporting is the opt-in watcher described above.
 
+   The package does ship a manifest for it, `agent-detection/minimax-code.toml`,
+   with every rule read out of a captured `mcode` screen rather than guessed. On
+   0.9.3 it is **inert, and installing it changes nothing**: `mcode` is not an id
+   Herdr knows, so the file is dropped without a warning. When a Herdr does know
+   the id, install it with:
+
+   ```bash
+   mkdir -p ~/.config/herdr/agent-detection
+   cp agent-detection/minimax-code.toml ~/.config/herdr/agent-detection/mcode.toml
+   ```
+
+   Name the copy for the agent **id** the manifest declares, `mcode`, not for the
+   filename it ships under: Herdr lists and names its manifests by id, so the id
+   is the only name guaranteed to resolve.
+
 ## What it exposes
 
 | Trigger | Menu title | Kind | Does |
