@@ -1,6 +1,6 @@
 id = "jaaacki.minimax-code"
 name = "MiniMax Code"
-version = "0.5.2"
+version = "0.6.0"
 min_herdr_version = "0.9.3"
 description = "Start MiniMax Code in a new pane for the active worktree"
 platforms = ["linux", "macos"]
@@ -24,6 +24,36 @@ title = "Start MiniMax Code in this worktree"
 description = "Launch `mcode` in a new pane for the active worktree"
 contexts = ["workspace", "pane"]
 command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]
+
+# Install the mcode-side SessionStart hook (issue #118).
+#
+# This is the only way a mcode that a person started BY HAND ever becomes visible
+# to herdr. mcode loads plugins from its own directory (`~/.minimax/plugins`),
+# not from this checkout, so the hook files ship inert and this action is the
+# separate, explicit act that activates them.
+#
+# The hook registers a pane ONCE, on SessionStart, and never reports state again:
+# that single registration fires `pane.agent_status_changed`, which is what starts
+# the watcher that owns state. One reporter per pane, by construction.
+[[actions]]
+id = "minimax-code-install-hook"
+title = "Install the MiniMax Code session hook"
+description = "Register every mcode session's pane with herdr, including hand-started ones"
+contexts = ["workspace", "global"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" install-hook"]
+
+# The counterpart, and it exists because the install path is MACHINE-GLOBAL:
+# every mcode on the box shares ~/.minimax/plugins. An install that another
+# agent later removes leaves one of you with a plugin half-present and no idea
+# whose state it is, which is a collision m3 hit with a probe of their own.
+# Removal is therefore an operation of this plugin, not a `mcode plugin remove`
+# a user has to know to run by hand.
+[[actions]]
+id = "minimax-code-uninstall-hook"
+title = "Uninstall the MiniMax Code session hook"
+description = "Stop mcode sessions from self-registering; removes the shared plugin directory"
+contexts = ["workspace", "global"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" uninstall-hook"]
 
 # ---------------------------------------------------------------------------
 # Lifecycle, NOT notification. Read this before adding a second event or

@@ -1,0 +1,18 @@
+{
+  "name": "herdr-bootstrap",
+  "version": "0.1.0",
+  "description": "Register this mcode session's pane with herdr once, at SessionStart, so the plugin's watcher can own its state. Inert unless installed by the plugin's install action.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env bash \"${PLUGIN_ROOT}/hooks/herdr-bootstrap.sh\" SessionStart",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
