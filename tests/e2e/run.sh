@@ -383,6 +383,10 @@ unset HERDR_SOCKET_PATH
 # `herdr --session` call at a different server than the one this suite starts.
 unset HERDR_SESSION
 HERDR_CONFIG_DIR="$E2E_XDG_ROOT/herdr"
+# XDG_CONFIG_HOME does not move herdr's plugin state dir, which stays under the
+# developer's real ~/.local/state, so watcher logs from this run landed there
+# (#108). The server and every plugin command it spawns inherit this.
+export MCODE_WATCH_LOG_DIR="$E2E_XDG_ROOT/watch"
 
 # ── case 1: a real server starts and a real session bootstraps ───────────────
 # A fresh session has zero panes, and a bare `pane split` answers
@@ -827,8 +831,12 @@ run_case_event_watcher() {
   fi
 
   # And the per-pane log, since the other half of #84 is that a watcher which
-  # dies must leave a trace. The path is only asserted when the suite pointed
-  # the state dir somewhere disposable, which it does not by default.
+  # dies must leave a trace. It must land in this run's disposable root, not
+  # the developer's real state dir (#108).
+  if [ ! -s "$MCODE_WATCH_LOG_DIR/$pane.log" ]; then
+    fail "$name" "no watcher log at $MCODE_WATCH_LOG_DIR/$pane.log; it went somewhere outside this run's temp root"
+    return
+  fi
   pass "$name"
 }
 
