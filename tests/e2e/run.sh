@@ -59,6 +59,7 @@ ACTION_LOG=""
 
 CASES_RUN=0
 CASES_FAILED=0
+ANY_FAILED=0
 SESSION=""
 SERVER_PID=""
 WORKDIR=""
@@ -97,6 +98,7 @@ pass() { CASES_RUN=$((CASES_RUN + 1)); printf 'ok    %s\n' "$1"; }
 fail() {
   CASES_RUN=$((CASES_RUN + 1))
   CASES_FAILED=$((CASES_FAILED + 1))
+  ANY_FAILED=1
   printf 'FAIL  %s\n' "$1"
   shift
   while [ $# -gt 0 ]; do printf '        %s\n' "$1"; shift; done
@@ -117,6 +119,34 @@ fail() {
 cleanup() {
   local rc=$?
   set +e
+
+  # On a FAILING run, the evidence is copied out BEFORE anything is torn down —
+  # and specifically before the server is killed, because the plugin's command log
+  # lives in the server's memory and dies with it.
+  #
+  # This is not belt-and-braces. The resume case has failed twice for two
+  # different reasons, and the first time it failed the diagnosis was guessed
+  # from an action log and a snapshot that cleanup had already deleted, which is
+  # how a real refusal got reported as a lost record. Whatever comes next is
+  # upstream of this plugin, and "report back with the herdr log around the
+  # clear" is unanswerable unless the log survives the run that produced it.
+  #
+  # Kept OUTSIDE the isolated root on purpose: that root is deleted below, and an
+  # evidence directory inside it would be deleted a few lines later.
+  if [ "$ANY_FAILED" = "1" ] && [ -n "$SESSION" ]; then
+    local ev="/tmp/mcode-e2e-evid-$SESSION"
+    mkdir -p "$ev" 2>/dev/null
+    for f in "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" \
+             "$HERDR_CONFIG_DIR/sessions/$SESSION/session.json" \
+             "$WORKDIR/server.log" "$WORKDIR/server-restart.log" "$WORKDIR/attach.log"
+    do
+      [ -f "$f" ] && cp "$f" "$ev/" 2>/dev/null
+    done
+    "$HERDR" --session "$SESSION" plugin log list --plugin "$PLUGIN_ID" \
+      >"$ev/plugin-log.json" 2>/dev/null
+    printf 'e2e: FAILING RUN — evidence kept at %s\n' "$ev" >&2
+    printf 'e2e:   server log: %s/herdr-server.log\n' "$ev" >&2
+  fi
 
   # Every pane this suite created, and the detached watcher each one started.
   #
@@ -847,6 +877,75 @@ await_resume_in_snapshot() { # await_resume_in_snapshot <seconds>
   return 1
 }
 
+# ── triage for "the resume token never appeared" ────────────────────────────
+# The three facts below are read separately from the case so the DECISION about
+# what they mean can be tested without a race. See resume_failure_mode.
+
+# 1 if the plugin's own log says herdr REFUSED the resume report.
+#
+# Read from the FULL record rather than from the 200-char tail action_log_tail
+# prints. The refusal line is the plugin's narration, and it sits behind whatever
+# the launcher printed before it, so a truncated field can push it out of view —
+# which would make this guard quietly miss the exact failure it exists to name.
+action_refused_resume() {
+  "$HERDR" --session "$SESSION" plugin log list --plugin "$PLUGIN_ID" 2>/dev/null \
+    | jq -r '[.result.logs[]? | select(.action_id == "minimax-code-start")] | last
+             | ((.stdout // "") + "\n" + (.stderr // ""))' 2>/dev/null \
+    | grep -qF 'resume REFUSED by herdr'
+}
+
+# 1 if the snapshot holds any agent_resume at all. Deliberately "any", not "for
+# this pane": a resume restored from ANOTHER pane still proves the mechanism, and
+# the only case that can produce one is the dedupe collision documented in the
+# plugin header. Treating that as a pass would be wrong, so this feeds a
+# diagnosis and never a verdict.
+snapshot_has_resume() {
+  [ "$(jq -e '[.workspaces[]?.tabs[]?.panes[]? | select(.agent_resume)] | length > 0' \
+        "$(session_snapshot)" 2>/dev/null)" = "true" ]
+}
+
+# 1 if herdr ever saw a client connect. herdr skips deferred agent resumes while
+# the terminal area is 0x0, which is the state of a headless server with no
+# client attached (src/app/agent_resume.rs:99).
+client_ever_connected() {
+  grep -q "client connected" "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" 2>/dev/null
+}
+
+# The server's own lines for the refusal. This is the evidence the next reader
+# needs and the thing that was missing when a refusal first showed up: the
+# action log says herdr said no, and only the server log says why.
+resume_refusal_evidence() {
+  grep -hF 'resume_not_accepted' \
+    "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" \
+    "$WORKDIR/server.log" 2>/dev/null | tail -3 | cut -c1-190 | tr '\n' ' '
+}
+
+# WHICH of the several real causes explains a missing resume token.
+#
+#   $1 1 if herdr refused the report
+#   $2 1 if the snapshot holds an agent_resume
+#   $3 1 if a client ever connected
+#
+# Pure — three facts in, one mode out, no herdr and no sleeping — and that is the
+# point. A triage that can only run once a race has already bitten gets its
+# wording wrong the first time it matters, and it did: this function did not
+# exist until a refusal was observed, and the inline `if`s it replaced reported
+# that refusal as "the resume was reported and herdr ACCEPTED it, but the
+# snapshot never gained it". That is a false claim about herdr — it refused, on
+# purpose, having stored nothing to lose — and it points the next reader at a
+# dropped-record bug that does not exist.
+#
+# `refused` is tested first and wins outright for the same reason: when herdr
+# refuses, every record-based verdict below it is answering a different question.
+resume_failure_mode() {
+  if [ "$1" -eq 1 ]; then printf 'refused\n'; return 0; fi
+  if [ "$2" -eq 1 ]; then
+    if [ "$3" -eq 1 ]; then printf 'stored-but-no-token\n'; else printf 'no-client\n'; fi
+    return 0
+  fi
+  printf 'lost\n'
+}
+
 run_case_resume_restored() {
   local name="resume: a restart re-runs the recorded resume command in the recreated pane"
 
@@ -942,27 +1041,46 @@ run_case_resume_restored() {
     return
   fi
 
-  # A failure here has three quite different causes and they must not be
+  # A failure here has four quite different causes and they must not be
   # collapsed, because the fix for each is different. So say which one it looks
   # like instead of printing "resume did not happen" and leaving it there.
-  if [ "$(jq -c '[.workspaces[]?.tabs[]?.panes[]? | select(.agent_resume) | .agent_resume] | length' \
-            "$(session_snapshot)" 2>/dev/null)" = "0" ]; then
-    fail "$name" "the resume was reported and herdr ACCEPTED it, but the snapshot never gained it" \
-      "action log: ${ACTION_LOG}" \
-      "the stub was confirmed running before this poll, so a long-lived process was" \
-      "in place and this is not the known shell-only-pane case. The herdr server log" \
-      "around this pane is the next thing to read; do NOT add a retry, because a" \
-      "retry would hide a real regression as thoroughly as it would hide a flake."
-  elif ! grep -q "client connected" "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" 2>/dev/null; then
-    fail "$name" "no client ever connected, so herdr's pending resume had a 0x0 terminal area" \
-      "herdr skips deferred agent resumes when no client is attached" \
-      "see tests/e2e/attach-pty.py"
-  else
-    fail "$name" "the resume was stored and a client connected, but the token never appeared" \
-      "expected token: $RESUME_PROOF" \
-      "action log: ${ACTION_LOG}" \
-      "pane tail: $(printf '%s' "$content" | tail -c 200 | tr -d '\000')"
-  fi
+  # resume_failure_mode holds the decision and is tested without a race.
+  local mode
+  mode="$(resume_failure_mode \
+            "$(action_refused_resume && printf 1 || printf 0)" \
+            "$(snapshot_has_resume && printf 1 || printf 0)" \
+            "$(client_ever_connected && printf 1 || printf 0)")"
+  case "$mode" in
+    refused)
+      fail "$name" "herdr REFUSED the resume report, so it stored nothing and there is no record to lose" \
+        "action log: ${ACTION_LOG}" \
+        "herdr says: $(resume_refusal_evidence)" \
+        "this is NOT the accepted-then-lost case and NOT a missing feature: herdr" \
+        "rejects a resume_argv whose reporter does not hold the pane, and the" \
+        "reporter is whatever holds the pane at the moment of the report. Whether" \
+        "the pane was still ours at that instant is the open question, and the" \
+        "server log above is the evidence for it. Do NOT add a retry."
+      ;;
+    no-client)
+      fail "$name" "no client ever connected, so herdr's pending resume had a 0x0 terminal area" \
+        "herdr skips deferred agent resumes when no client is attached" \
+        "see tests/e2e/attach-pty.py"
+      ;;
+    stored-but-no-token)
+      fail "$name" "the resume was stored and a client connected, but the token never appeared" \
+        "expected token: $RESUME_PROOF" \
+        "action log: ${ACTION_LOG}" \
+        "pane tail: $(printf '%s' "$content" | tail -c 200 | tr -d '\000')"
+      ;;
+    *)
+      fail "$name" "the resume was reported and herdr ACCEPTED it, but the snapshot never gained it" \
+        "action log: ${ACTION_LOG}" \
+        "the stub was confirmed running before this poll, so a long-lived process was" \
+        "in place and this is not the known shell-only-pane case. The herdr server log" \
+        "around this pane is the next thing to read; do NOT add a retry, because a" \
+        "retry would hide a real regression as thoroughly as it would hide a flake."
+      ;;
+  esac
 }
 
 # ── refusal guard ────────────────────────────────────────────────────────────
@@ -1062,6 +1180,62 @@ self_test_isolation() {
   return 1
 }
 
+# Self-test for the resume triage, run as part of the suite.
+#
+#   ./tests/e2e/run.sh --self-test-triage
+#
+# The triage exists to stop a failure being described wrongly, and the way it
+# was described wrongly is a fact worth keeping in front of the next editor: a
+# herdr REFUSAL was reported as "the resume was reported and herdr ACCEPTED it,
+# but the snapshot never gained it". Both halves of that sentence are false —
+# herdr refused, and it stored nothing that could be lost — and the cost of the
+# false claim was a hunt for a dropped-record bug in herdr that does not exist.
+#
+# So the decision is pure, and the pure part is checked here with no herdr, no
+# server and no sleeping. The only case that would catch the original defect is
+# the FIRST one: refused must not be reported as a lost record, and the two must
+# stay different strings even when the record and client facts are identical.
+self_test_triage() {
+  local failures=0 total=6
+
+  check() { # check <expected-mode> <label> <refused> <has-record> <client>
+    local want="$1" label="$2" got
+    got="$(resume_failure_mode "$3" "$4" "$5")"
+    if [ "$got" = "$want" ]; then
+      printf 'ok    triage: %s\n' "$label"
+    else
+      printf 'FAIL  triage: %s (wanted %s, got %s)\n' "$label" "$want" "$got" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  # The regression this function was written for: identical record and client
+  # facts, opposite verdicts, decided only by whether herdr refused.
+  check refused            "a refusal is never reported as a lost record" 1 0 0
+  check lost               "accepted but no record, with a client"          0 0 1
+  # A refusal outranks every record-based verdict. If a stale record from an
+  # earlier pane is present, it must not turn this into a pass-looking diagnosis.
+  check refused            "a refusal outranks a record already in the snapshot" 1 1 1
+  check lost               "nothing recorded and no client: still a lost record" 0 0 0
+  # "no client" is reachable ONLY alongside a record. That is inherited from the
+  # inline branches this function replaced, where the no-record case was tested
+  # first and swallowed everything else, and it is the one mapping here that is
+  # easy to "fix" into being wrong — the draft of this self-test asserted
+  # otherwise and was corrected by the run below, which is the whole reason it
+  # exists rather than a comment.
+  check no-client          "recorded, but no client ever attached"           0 1 0
+  check stored-but-no-token "recorded and connected, but the token is absent" 0 1 1
+
+  if [ "$failures" -eq 0 ]; then
+    printf -- '---\n'
+    printf '6 case(s), all passed\n'
+    return 0
+  fi
+  printf -- '---\n'
+  printf '%d case(s), %d failed\n' "$total" "$failures" >&2
+  return 1
+}
+
 # Where the developer's REAL config lives, computed once. Used only by the
 # refusal guard — never as a path anything else in this file reads or writes.
 # Resolved by asking herdr nothing and looking at the environment the way herdr
@@ -1084,6 +1258,10 @@ fi
 case "${1:-}" in
   --self-test-isolation)
     self_test_isolation
+    exit $?
+    ;;
+  --self-test-triage)
+    self_test_triage
     exit $?
     ;;
 esac
@@ -1113,6 +1291,12 @@ WARNINGS="$("$HERDR" plugin list --json 2>/dev/null \
 # spawned by the server and inherits the server's environment, not this
 # script's. See prepare_stub_mcode for what that cost on the first CI run.
 prepare_stub_mcode
+
+# Both self-tests run inside the full suite, not only behind their flags: a
+# guard or a decision that is only exercised on demand is one that silently rots
+# between the runs nobody remembers making.
+self_test_isolation
+self_test_triage
 
 run_case_bootstrap
 run_case_launch
