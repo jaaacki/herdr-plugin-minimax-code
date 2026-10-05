@@ -1,0 +1,40 @@
+
+  ├ ✓ Read task result · bg_781…
+  └ • Thought for 0.1s
+
+  ● PR A is green — pipeline 1475, all 13 steps. Let me report that, then finish the PR B diagnosis.
+
+  ├ • Ran  Report PR A to architect · 3 output lines
+  └ • Thought for 0.0s
+
+  ● The planted errors all print. So the silence must be a path where tsc's output is redirected away and the exit code is non-zero. Testing that directly.
+
+  ├ • Ran  Test listFilesOnly exit code and stream split under a type error · 6 output lines
+  └ • Thought for 0.1s
+
+  ● --listFilesOnly exits 0 even with a type error, and tsc writes diagnostics to stdout. That's the mechanism. Confirming the exact trigger.
+
+  └ • Ran  Battery of error shapes against listFilesOnly exit code · 4 output lines
+
+  ● The rm -rf guard is racing my mkdir. Using the workspace copy instead.
+
+  ├ • Ran  Copy tree for probe · 1 output line
+  ├ • Ran  Battery of error shapes · 8 output lines
+  └ • Thought for 0.0s
+
+  ● Found it. A syntax error makes --listFilesOnly exit 1 with the diagnostic on stdout — which line 129 redirects into $work/files.out, where set -e kills the script and the EXIT
+    trap then deletes the only copy. Let me confirm end-to-end.
+
+  └ • Ran  End-to-end repro of the silent death · 17 output lines
+
+    ✓ PR A: mutation-prove each new test in isolation (8 mutations, all caught)
+    ● PR A: commit, push, open PR to dev, ci-wait (home), report with pipeline
+    ○ PR B: diagnose why fleet-typecheck dies silently between --listFilesOnly and --noEmit
+    … +5 more · 4/8 done · 3 pending · Ctrl+T expand
+  ✓ Tasks · 1 result ready · /tasks details
+    ⠼ Loading 20min27s · ⚡ 36184 tok/s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/pc-client │ ◇ Process architect message in flock inbox │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 71% left

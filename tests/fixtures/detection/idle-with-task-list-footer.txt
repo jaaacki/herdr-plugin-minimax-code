@@ -1,0 +1,40 @@
+    I also found and fixed a real cleanup miss: the remote branch docs-1528-skill-codex-m1 had survived my earlier teardown. I confirmed its tree was byte-identical to the
+    squash-merge before deleting it, and fast-forwarded local main from ed53a30e to 2625da53. No m1 branch or worktree remains in either repo.
+
+    The thing you need to know: the v1 reap took the P4 evidence
+
+    You ruled the no-liveness reap deliberate and I accepted that — the v1 verb dies in the same release, so a live v1 team's state is dead weight. That reasoning covers
+    coordination state. It does not cover the work products, and those are gone.
+
+    ~/.adaai/state/flock/fl-20261004-3oe8/ went from 148 entries to 7. What survives is only cursors/architect.json, events.jsonl, lock.watcher, watcher-state.json and watcher.log.
+    Deleted with no copy anywhere on the machine:
+
+    - All five P4 records — p4-run-results.md, p4-run2/3/final-results.md, p4-1531-acceptance-record.md
+    - All six P4 run databases (p4-run1-v1.db … p4-run4-2fb0ead1.db)
+    - Every review and PR-body file the team produced, plus bodies/ — the full text of every message this team exchanged
+
+    I searched ~/.adaai and ~/Dev for all of it. Nothing. These were never committed and never posted to GitHub, so the P4 acceptance evidence for #1531 is unrecoverable from this
+    machine. The GitHub side is intact — #1568 and #2476 findings live in their PRs, the T9a and lead-notify histories are in #1571 and #1573 — but the measurement record itself is
+    what is lost.
+
+    I did not reconstruct the P4 record from memory. A record I cannot source is worse than a missing one, and inventing one to fill a gap is exactly the failure mode this whole
+    epic is built to prevent. I also did not re-create files in the old v1 path, since that root is now reaped on every update and anything placed there is lost the same way.
+
+    Reported as done on ref 1575 with the flag in the body; the architect was woken (seq 74). I've asked for a ruling: accept the loss and say so in the epic close, or authorise a
+    re-measurement against v2. The second is new work, so I'm not starting it unasked. Standing by.
+
+    report copy (~/.adaai/flock/m1-done-1575-and-reap-flag.md)
+
+    └ Completed in 6min6s · ⚡ 25678 tok/s
+
+    ✓ Migrate to flock v2: join fl-20261005-ozmb as m1, read guide once
+    ✓ Report done on ref 1575 in v2, with the P4-evidence-loss flag from the v1 reap
+    ○ Await architect's word on P4 record: accept the loss, or authorise a v2 re-measurement
+    … +5 more · 7/8 done · 1 pending · Ctrl+T expand
+  ✓ Tasks · 4 results ready · /tasks details
+    Message · Enter send · Shift+Enter newline                                                                                                     Tip: /rewind restores an earlier turn
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/pc-client │ ◇ 处理 architect 的 flock 消息并汇报 │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 88% left

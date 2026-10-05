@@ -110,6 +110,54 @@ case_stale_scrollback_is_idle() {
   else bad "a stale spinner in scrollback must not read as working, got '$(reported_states)'"; fi
 }
 
+# --- the task-list footer: the Ctrl+T defect (issue #83) ---------------------
+#
+# `Ctrl+T expand` is part of mcode's task-list footer, and the footer is a
+# RESTING shape: it stays on screen after a turn ends. Both of these are real
+# idle captures (a live `Message · Enter send` prompt with a task list above it),
+# both carry `Ctrl+T expand` inside the 8-line tail, and both were classified
+# `working` because the working rules are tested before the idle ones. A live
+# watcher therefore reported busy on a finished turn.
+#
+# These two cases are the whole fix's falsification surface: put the rule back
+# and both go red.
+
+case_idle_task_list_footer_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Y --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an idle screen whose tail carries the task-list footer must classify 'idle', got '$(reported_states)'"; fi
+}
+
+case_idle_task_list_footer_2_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p81 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "second idle task-list-footer capture must classify 'idle', got '$(reported_states)'"; fi
+}
+
+# The other half, and the one that stops the fix from being a regression: the
+# footer must not be the thing that DETECTS working either. These two captures
+# carry the same footer AND a live `Esc stop` status line, and they must stay
+# `working` on the strength of that status line alone.
+case_working_task_list_footer_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Z --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "a working screen carrying the task-list footer must still classify 'working', got '$(reported_states)'"; fi
+}
+
+case_working_task_list_footer_2_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p82 --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "second working task-list-footer capture must classify 'working', got '$(reported_states)'"; fi
+}
+
 # A pane that is not mcode at all matches no marker. The watcher must say
 # `unknown` and must NOT invent `blocked`. This case is the one that can actually
 # fail: feeding it only idle/working snapshots would pass whether or not the
@@ -234,6 +282,35 @@ case_chip_is_not_a_working_marker() {
   fi
 }
 
+# CTRL+T EXPAND MUST NOT BE A WORKING MARKER - the same discipline as the chip
+# case above, pointed at a marker that actually WAS in the table and shipped.
+#
+# Unlike the chip, this one is pinned twice: the four classification cases prove
+# the behaviour, and this case pins the decision. Both fail if the rule returns,
+# so this is not a test that passes against a fiction.
+case_ctrl_t_expand_is_not_a_working_marker() {
+  setup
+  # Scoped to the RULES assignment only, for the same reason as the chip case: a
+  # bare grep over the whole script would match the comment block above that
+  # explains why the marker was removed.
+  local rules
+  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'Ctrl+T expand'; then
+    bad "Ctrl+T expand is back in the RULES table. It is part of the task-list" \
+        "footer, which is a RESTING shape that survives the end of a turn, so it" \
+        "reads as working on an idle prompt with a task list. Working rules are" \
+        "tested first, so the footer wins. Every captured working screen also" \
+        "carries 'Esc stop', which is what should be doing this work:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
 case_source_namespace_is_herdr_minimax_code() {
   setup
   WATCH_SNAPSHOTS="$FIX/idle.txt"; export WATCH_SNAPSHOTS
@@ -273,7 +350,11 @@ if [ ! -x "$WATCH" ]; then
 fi
 if [ ! -f "$FIX/idle.txt" ] || [ ! -f "$FIX/working.txt" ] ||
    [ ! -f "$FIX/idle-after-working.txt" ] || [ ! -f "$FIX/not-mcode.txt" ] ||
-   [ ! -f "$FIX/stale-scrollback.txt" ]; then
+   [ ! -f "$FIX/stale-scrollback.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer-2.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer-2.txt" ]; then
   printf 'FAIL  preflight: captured detection fixtures are missing\n' >&2
   exit 2
 fi
@@ -289,6 +370,11 @@ CASES=(
   classify-empty-is-unknown:case_classify_empty_is_unknown
   classify-post-turn-is-idle:case_classify_post_turn_is_idle
   stale-scrollback-is-idle:case_stale_scrollback_is_idle
+  idle-task-list-footer-is-idle:case_idle_task_list_footer_is_idle
+  idle-task-list-footer-2-is-idle:case_idle_task_list_footer_2_is_idle
+  working-task-list-footer-is-working:case_working_task_list_footer_is_working
+  working-task-list-footer-2-is-working:case_working_task_list_footer_2_is_working
+  ctrl-t-expand-is-not-a-working-marker:case_ctrl_t_expand_is_not_a_working_marker
   unmatched-is-unknown-not-blocked:case_unmatched_is_unknown_not_blocked
   no-traffic-no-report:case_no_traffic_no_report
   transition-reported:case_transition_reported

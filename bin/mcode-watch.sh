@@ -95,7 +95,7 @@ esac
 # later without the classification being rewritten.
 #
 # Every marker was checked against every captured snapshot in
-# tests/fixtures/detection/, not just the one it was read from. Three candidates
+# tests/fixtures/detection/, not just the one it was read from. Four candidates
 # were REJECTED on that evidence:
 #
 #   tok/s   appears inside "Completed in 3s - 667 tok/s", a turn that has
@@ -107,17 +107,35 @@ esac
 #   Esc     on its own. mcode's own changelog prose contains "pressing Esc on an
 #           empty Composer", so a bare "Esc" matches a captured IDLE screen.
 #           Markers must be phrases.
+#   Ctrl+T expand
+#           REMOVED, and this one was shipped as a working marker first. It is
+#           part of mcode's task-list footer ("... +5 more - 7/8 done - 1
+#           pending - Ctrl+T expand"), which is a RESTING shape: the footer
+#           stays on screen after a turn finishes, so it sits inside the tail
+#           on an idle prompt that still has a task list. Working rules are
+#           tested before idle, so the footer won and an idle session was
+#           reported working - a live watcher lying about a finished turn.
+#           Every captured WORKING screen also carries "Esc stop" on the live
+#           status line, so the footer added no coverage and its removal costs
+#           nothing. Banked captures and provenance:
+#           tests/fixtures/detection/README.md.
 #
-# Order matters: working is tested before idle. mcode has THREE resting shapes,
-# not two - a fresh session ("Start - @"), a finished turn ("Completed in"), and
-# mid-flight. A finished turn is idle and is the common case; a watcher keyed only
-# on the fresh-session shape reports unknown for nearly every session.
+# Order matters: working is tested before idle. mcode has more than two resting
+# shapes - a fresh session ("Start - @"), a finished turn ("Completed in"), an
+# idle session still showing a task list, a drafted message, and mid-flight. A
+# finished turn is idle and is the common case; a watcher keyed only on the
+# fresh-session shape reports unknown for nearly every session.
+#
+# "More than two" is a floor, not a count. Each capture batch so far has added a
+# resting shape the one before it did not have, so the table below should be read
+# as covering the shapes that have been OBSERVED, not as an exhaustive list of
+# the states mcode can be in. A shape with no marker here classifies `unknown`,
+# which is the honest answer for an unread screen - see classify().
 #
 # These are never word-split on whitespace: each line is read whole and split on
 # '|' only. That is what caused the "Esc" bug documented in classify().
 RULES='working|Esc stop
 working|Ctrl+O details
-working|Ctrl+T expand
 working|⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠭⠫
 idle|Start · @
 idle|● Ready

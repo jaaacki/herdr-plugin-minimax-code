@@ -1,0 +1,40 @@
+    └───────┴─────────────────┴──────────────┴───────────────────────────────────────────────────────────────────────────────────────┘
+
+    The env form's post-resume behaviour is unspecified across trials, and wrong in both. A refusal beats either, so I'm rejecting it on measurement rather than taste: codex simply
+    has no fact about which pane it's in.
+
+    The boundary that would have fooled me
+
+    codex exec is correct by default — ppid 13636, not the daemon, so it sees its own pane with no flags at all. The entire defect class is invisible to it. My first control
+    "passed" and I only caught it by checking the ppid. m6's finding stands because they measured interactive TUIs, but any exec-based verification of this issue proves nothing.
+
+    Design and size
+
+    m6's file-record form, with one addition I'd argue is the load-bearing part: a record that outlives its procodex mis-binds undetectably — nothing inside a codex command
+    distinguishes "S in P1" from "S in P2". So fix the lifetime, not the contents: procodex deletes the record when the TUI it launched exits. Then a resume through procodex
+    re-mints correctly, and a resume outside it finds no record and is refused — m6's constraint 1 made true rather than intended.
+
+    Size: launcher side 0 against the cap (procodex lives outside fleet/); flock side ~36 core lines (18 read/validate, 12 resolveCaller, 6 seam). Against 4350/4350 that does not
+    fit. That's the real blocker on #1572, and I flagged it as the architect's and m6's decision — I won't delete identity rules to make room, having made and reverted that mistake
+    once in this PR.
+
+    Two product calls I flagged rather than decided: a codex session resumed outside procodex stops working, and vanilla codex is refused. Both belong in the spec and guide or they
+    read as bugs.
+
+    Housekeeping: scratch workspace w1P closed, /tmp/m4meas left for m6 to re-read, shared daemon 17483 untouched — it's 19h old and other agents depend on it, and it's also what
+    makes the defect measurable.
+
+    Full write-up: ~/.adaai/flock/m4-codex-identity-measurement-1572.md
+
+    └ Completed in 22min1s · ⚡ 21881 tok/s
+
+    ✓ #1572: design written; sent to m6 for review and to the architect with its size
+    ✓ Scratch workspace w1P closed, /tmp probe files left for m6; shared daemon untouched
+    ○ Await architect+m6 on #1572 before any code (zero budget headroom is the blocker)
+    … +3 more · 5/6 done · 1 pending · Ctrl+T expand
+    Message · Enter send · Shift+Enter newline                                                                                                     Tip: /rewind restores an earlier turn
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ~/Dev/pc-client │ ◇ Process flock inbox message from architect │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 36% left
