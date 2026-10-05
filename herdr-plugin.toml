@@ -42,6 +42,19 @@ description = "Register every mcode session's pane with herdr, including hand-st
 contexts = ["workspace", "global"]
 command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" install-hook"]
 
+# The counterpart, and it exists because the install path is MACHINE-GLOBAL:
+# every mcode on the box shares ~/.minimax/plugins. An install that another
+# agent later removes leaves one of you with a plugin half-present and no idea
+# whose state it is, which is a collision m3 hit with a probe of their own.
+# Removal is therefore an operation of this plugin, not a `mcode plugin remove`
+# a user has to know to run by hand.
+[[actions]]
+id = "minimax-code-uninstall-hook"
+title = "Uninstall the MiniMax Code session hook"
+description = "Stop mcode sessions from self-registering; removes the shared plugin directory"
+contexts = ["workspace", "global"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" uninstall-hook"]
+
 # ---------------------------------------------------------------------------
 # Lifecycle, NOT notification. Read this before adding a second event or
 # repurposing this one.

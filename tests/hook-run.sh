@@ -864,12 +864,9 @@ FAKEEOF
   export M4_FAKE_JSON=1
   : >"$M4_FAKE_LOG"
 
-  # Run it the way a user and the herdr action do - by its shebang - not through
-  # /bin/sh. The script is bash (`set -o pipefail`), and /bin/sh is dash on Linux,
-  # so the first version of this case died on ubuntu with "Illegal option
-  # -o pipefail" while passing on macOS, where /bin/sh is bash.
   PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
     "$repo/bin/mcode-plugin.sh" install-hook >"$out" 2>&1
+  local rc=$?
 
   if ! grep -q '^plugin enable herdr-bootstrap@local$' "$M4_FAKE_LOG" 2>/dev/null; then
     note "install-hook never ran 'mcode plugin enable herdr-bootstrap@local'"
@@ -878,21 +875,27 @@ FAKEEOF
   if ! grep -q 'plugin list' "$M4_FAKE_LOG" 2>/dev/null; then
     note "install-hook enabled the plugin without ever checking whether it took"
   fi
-  if ! grep -qi 'enabled' "$out" 2>/dev/null; then
-    note "install-hook said nothing about the enabled state; a silent install that is"
-    note "inert is the failure this case exists to catch. output: $(head -3 "$out" | tr '\n' '|')"
+  if ! grep -q 'mcode plugin list reports' "$out" 2>/dev/null; then
+    note "install-hook did not print the plugin list line; a hint to go and check"
+    note "is how a disabled plugin got reported as an upstream mcode bug"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    note "install-hook exited $rc on a plugin it successfully enabled"
   fi
 
-  # The other half: if mcode reports the plugin still disabled, the installer must
-  # say so and name the command. Reporting success here would be a lie the user
-  # cannot check without reading the source.
-  # Exported, not just set: the fake runs as a child process and an unexported
-  # variable is invisible to it, which would silently make this half assert nothing.
+  # The other half, and the one that matters: if mcode reports the plugin still
+  # disabled, the install FAILS. A warn-and-return-success here would move the
+  # failure from install time to session time, where a user cannot tell a
+  # half-install from a broken mcode.
   export M4_FAKE_ENABLED=false
   : >"$M4_FAKE_LOG"
-  local out2="$WORK/install2.out"
+  local out2="$WORK/install2.out" rc2=0
   PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
-    "$repo/bin/mcode-plugin.sh" install-hook >"$out2" 2>&1
+    "$repo/bin/mcode-plugin.sh" install-hook >"$out2" 2>&1 || rc2=$?
+  if [ "$rc2" -eq 0 ]; then
+    note "mcode reported the plugin disabled and install-hook still exited 0;"
+    note "copying files into a directory is not an install"
+  fi
   if ! grep -q 'NOT enabled' "$out2" 2>/dev/null; then
     note "mcode reported the plugin disabled and install-hook did not say so"
     note "output: $(head -4 "$out2" | tr '\n' '|')"
@@ -900,8 +903,60 @@ FAKEEOF
   if ! grep -q 'mcode plugin enable herdr-bootstrap@local' "$out2" 2>/dev/null; then
     note "install-hook did not name the command that would fix it"
   fi
+  unset M4_FAKE_ENABLED
+}
 
-  unset M4_FAKE_LOG M4_FAKE_JSON M4_FAKE_ENABLED
+# 20. uninstall-hook takes the plugin back OFF this machine.
+#
+#     The install path is machine-global — every mcode on the box shares
+#     ~/.minimax/plugins — so an install that another agent later removes leaves
+#     one of you with a plugin half-present and no idea whose state it is. m3 hit
+#     that collision with a probe of their own, so removal is a first-class
+#     operation here rather than a `mcode plugin remove` a user has to know about.
+#
+#     It also runs the same exact-path guard as the installer, because a removal
+#     is the operation where a wrong path is most destructive.
+case_uninstall_hook_removes_the_plugin() {
+  local fake="$WORK/fakebin2" data="$WORK/fakedata2" out="$WORK/uninstall.out"
+  mkdir -p "$fake" "$data" 2>/dev/null || { note "cannot create the fake bin dir"; return; }
+
+  # A fake mcode that does NOT remove the directory, so the case exercises the
+  # installer's own cleanup path — the one that has to be safe.
+  cat >"$fake/mcode" <<'FAKEEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$M4_FAKE_LOG"
+case "${1:-} ${2:-}" in
+  "plugin list") printf '[-] herdr-bootstrap@local\tdisabled\n'; exit 0 ;;
+esac
+exit 0
+FAKEEOF
+  chmod +x "$fake/mcode"
+
+  export M4_FAKE_LOG="$WORK/mcode-calls2.log"
+  : >"$M4_FAKE_LOG"
+  mkdir -p "$data/plugins/herdr-bootstrap/.claude-plugin" \
+           "$data/plugins/herdr-bootstrap/hooks" 2>/dev/null
+  printf '{}' >"$data/plugins/herdr-bootstrap/.claude-plugin/plugin.json" 2>/dev/null
+  printf 'x' >"$data/plugins/herdr-bootstrap/hooks/herdr-bootstrap.sh" 2>/dev/null
+  printf 'neighbour' >"$data/plugins/some-other-plugin" 2>/dev/null
+
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
+    "$repo/bin/mcode-plugin.sh" uninstall-hook >"$out" 2>&1
+  local rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    note "uninstall-hook exited $rc; output: $(head -3 "$out" | tr '\n' '|')"
+  fi
+  if ! grep -q '^plugin remove herdr-bootstrap@local$' "$M4_FAKE_LOG" 2>/dev/null; then
+    note "uninstall-hook did not ask mcode to remove the plugin"
+  fi
+  if [ -e "$data/plugins/herdr-bootstrap" ]; then
+    note "uninstall-hook left the plugin directory behind; it would keep loading"
+  fi
+  if [ ! -e "$data/plugins/some-other-plugin" ]; then
+    note "uninstall-hook removed a NEIGHBOURING plugin; it must touch only its own"
+  fi
+  unset M4_FAKE_LOG
 }
 
 CASES=(
@@ -924,6 +979,7 @@ CASES=(
   budget-trip-still-registers-what-it-found:case_budget_trip_still_registers_what_it_found
   install-never-uses-a-bare-rm:case_install_never_uses_a_bare_rm
   install-hook-enables-the-plugin:case_install_hook_enables_the_plugin
+  uninstall-hook-removes-the-plugin:case_uninstall_hook_removes_the_plugin
 )
 
 if [ "${1:-}" = "--list" ]; then

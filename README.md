@@ -149,9 +149,24 @@ It copies `mcode-plugin/` into `~/.minimax/plugins/herdr-bootstrap/`, which is w
 Both halves matter: copying the files is not installing the plugin, because `mcode`
 keeps the enabled state separately, and a plugin that is present but *disabled*
 never fires a hook. The symptom is unusually convincing: the plugin is listed, the
-manifest is valid, and every session starts as though it were not installed. The
-installer checks the state afterwards and, if the plugin did not end up enabled,
-says so and prints the command that fixes it rather than reporting success.
+manifest is valid, and every session starts as though it were not installed.
+
+So the installer **fails** if the plugin does not end up enabled, and prints the
+`mcode plugin list` line as the evidence. That is deliberate: a half-install that
+reports success moves the failure from install time — one clear line and a fixable
+command — to session time, where it is indistinguishable from `mcode` being broken.
+If you want it gone again:
+
+```bash
+herdr plugin action invoke jaaacki.minimax-code.minimax-code-uninstall-hook
+# or, from a checkout:
+bin/mcode-plugin.sh uninstall-hook
+```
+
+Uninstalling is a first-class operation because the install path is **machine-global**:
+every `mcode` on the box shares `~/.minimax/plugins`, so an install that another agent
+later removes leaves one of you with a plugin half-present. The removal is guarded to
+that one exact path and touches no neighbouring plugin.
 
 Everything ships inert until you run it, the same way
 `agent-detection/minimax-code.toml` ships inert. `mcode` may need a restart to notice
