@@ -225,11 +225,16 @@ registerable. Five traps, all measured, none of them guessable:
 
 - **A hook gets a SANITIZED environment: no `HERDR_*` at all.** 57 variables, captured in
   full, while the launching shell had `HERDR_PANE_ID` set. `HERDR_SOCKET_PATH`,
-  `XDG_CONFIG_HOME` and everything else are stripped too. Consequence: **a bare `herdr`
-  call from a hook reaches the DEFAULT session and nothing else**, and so does every
-  variable *you* export — a probe that logs to `$MY_LOG` writes to `/dev/null` and looks
-  exactly like "the plugin is enabled but no event fires". That symptom cost two runs and
-  nearly put a false "matcher is mandatory" gotcha in this file.
+  `XDG_CONFIG_HOME` and everything else are stripped too — an exported
+  `XDG_CONFIG_HOME` arrives inside a live hook as literally `<unset>`. Consequence: a
+  bare `herdr` call from a hook reaches the **DEFAULT** session and nothing else, and
+  the hook always resolves the config root the way a bare `herdr` does, under
+  `$HOME/.config/herdr`. A Herdr running on a non-default root is therefore invisible
+  to the hook, which then cannot prove its pane and declines — loudly, writing nothing.
+  And so does every variable *you* export: a probe that logs to `$MY_LOG` writes to
+  `/dev/null` and looks exactly like "the plugin is enabled but no event fires". That
+  symptom cost two runs and nearly put a false "matcher is mandatory" gotcha in this
+  file.
 - **The hook has no controlling terminal** — `tty_stdin`/`stdout`/`stderr` are all false,
   in `mcode exec` *and* in the interactive TUI. So the terminal device cannot identify a
   pane either. The hook walks its **process ancestry** and matches `shell_pid` /

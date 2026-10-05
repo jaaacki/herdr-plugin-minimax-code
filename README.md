@@ -172,6 +172,15 @@ Two things it deliberately does **not** do:
 - **It does not report `blocked`.** See the watcher section above: the event exists in
   `mcode` but was never observed firing, so it is not registered.
 
+**One limit worth knowing before you install it.** `mcode` hands the hook a sanitized
+environment, and `XDG_CONFIG_HOME` is stripped along with everything else — measured, an
+exported one arrives as literally unset. So the hook always finds Herdr's config
+directory the way a bare `herdr` does: under `$HOME/.config/herdr`. If you run Herdr
+somewhere else — a non-default `XDG_CONFIG_HOME`, or an explicit socket — the hook will
+not see that instance, will not be able to prove which pane it is in, and will decline to
+register. It says so on stderr rather than guessing, and nothing is written. On a default
+setup, which is the ordinary case, this does not arise.
+
 ## What Herdr can see about a launched pane
 
 A pane this plugin opened is a first-class Herdr agent. It shows up in
