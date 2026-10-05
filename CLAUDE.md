@@ -76,10 +76,11 @@ that it is addressable both by pane id (`herdr agent get <pane-id>`) and by name
 (`herdr agent get mcode`, installed by `agent rename`).
 
 Resume works, and the docs must not claim more than that. Herdr keeps no session id for us (no
-`agent_session`), but it **accepts a resume command** and a restarted herdr **re-runs** it, so
-the pane comes back running `mcode --continue`. **Do not upgrade that to "works".** Herdr can
-accept the report and still not store it — that is the #99 failure mode, and the launch's
-`resume command recorded` line is herdr's *acceptance*, not a read-back. Proof is by hand in an
+`agent_session`), but it **accepts a resume command**, and a restarted herdr **re-runs** it *if
+it kept it*. **Do not upgrade that to "works", and do not drop the "if it kept it".** Herdr can
+accept the report and still not store it — that is the #99 failure mode, and the launch line is
+`resume command accepted by herdr (exit 0); after a restart herdr re-runs … in this pane if it
+kept it (not verified here, see #99)`. Match that line's strength. Proof is by hand in an
 isolated named session (#85/#94); the e2e case is **opt-in** (`MCODE_E2E_RESUME=1`) because it
 is intermittent, about one run in three, cause unknown. Never read a green suite as evidence
 for this feature.

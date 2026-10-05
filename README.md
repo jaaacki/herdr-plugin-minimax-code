@@ -150,7 +150,7 @@ What a launched pane gets, and what it does not:
 | A name, so `get` / `read` / `wait` resolve by name | ✅ renamed at launch |
 | `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
 | Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
-| Resume after a Herdr restart | ✅ herdr accepts the resume command and re-runs it after a restart — see how well that is pinned |
+| Resume after a Herdr restart | ✅ herdr accepts the resume command, and re-runs it after a restart if it kept it — see how well that is pinned |
 | `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
 
 ### The session id is discarded; the resume command is accepted
@@ -161,7 +161,7 @@ Herdr treats those two differently:
 - the **session id** is refused — Herdr only keeps identity for the agent kinds it
   enumerates in `herdr agent start`, and `minimax-code` is not one. So there is no
   `agent_session` on our panes, and the launch says so rather than claiming success;
-- the **resume command** is accepted, and a restarted Herdr re-runs it.
+- the **resume command** is accepted, and a restarted Herdr re-runs it if it kept it.
 
 This is Herdr's ceiling on identity, not a plugin bug, and it is confirmed
 independently in `sparkfn/pc-client#2251`. It is also the whole of what the
@@ -208,20 +208,20 @@ which only `agent start` can grant.
 
 For genuinely interactive control, attach to the pane instead.
 
-### Resume: herdr accepts the command, and re-runs it after a restart
+### Resume: herdr accepts the command, and re-runs it if it kept it
 
 Herdr keeps no session id for `mcode` — there is no `agent_session` on our panes. It
-does accept a **resume command**, and a restarted Herdr re-runs it, so the pane comes
-back running `mcode --continue`.
+does accept a **resume command**, and a restarted Herdr re-runs it — *if it kept it*.
+A pane that comes back running `mcode --continue` is the observed result; the accept
+is herdr's word, and the keeping is not verified here.
 
 **How well pinned that is, precisely.** It is proven *by hand*: launch a pane, stop the
 server, start it again, attach a client, and the recreated pane runs the real
 `mcode --continue`. There is no continuous test of it. The end-to-end case is gated
 behind `MCODE_E2E_RESUME=1` because it is intermittent — about one run in three, cause
-unknown (#99) — so a green suite is not asserting this for you, and the launch's own
-"resume command recorded" line is herdr's acceptance, not a read-back. Herdr can accept
-the report and still not store it; that is exactly the #99 failure mode, and it is why
-this section stops where it does.
+unknown (#99) — so a green suite is not asserting this for you. Herdr can accept the
+report and still not store it; that is exactly the #99 failure mode, and it is why this
+section stops where it does.
 
 Three things to know before relying on it:
 
@@ -345,7 +345,7 @@ Encountered in normal use, gathered here so you meet them before you go looking:
    *driving* a pane — [Driving a launched pane](#driving-a-launched-pane) — which
    routes through mcode instead of Herdr and does not lift this ceiling.
 2. **Resume needs a client, and one pane per directory.** Herdr accepts the resume
-   command and re-runs it after a restart, so a restarted Herdr brings the pane back
+   command, and a restarted Herdr re-runs it if it kept it, so the pane comes back
    running `mcode --continue` — but only once a client attaches, and when two `mcode`
    panes share a directory only the first is restored. It is proven by hand, not by CI.
    See above.
