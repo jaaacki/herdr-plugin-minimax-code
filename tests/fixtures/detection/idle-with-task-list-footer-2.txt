@@ -1,0 +1,10 @@
+    └ Completed in 22min1s · ⚡ 21881 tok/s
+    ✓ [redacted]
+    ✓ [redacted]
+    ○ [redacted]
+    … +3 more · 5/6 done · 1 pending · Ctrl+T expand
+    Message · Enter send · Shift+Enter newline                                                                                                     Tip: /rewind restores an earlier turn
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/[redacted] │ ◇ [redacted] │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 36% left

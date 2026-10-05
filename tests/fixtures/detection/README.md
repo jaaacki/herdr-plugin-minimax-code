@@ -4,14 +4,38 @@ These are the inputs `bin/mcode-watch.sh` classifies. Nothing here is invented:
 each file is real output from a real `mcode` or non-mcode pane, and every rule in
 the watcher was read out of these files rather than assumed.
 
-Captured **2026-10-04** (~05:20–05:40 +0800) against **herdr 0.9.3**
-(`~/.local/bin/herdr`), mcode **v0.6.2** (`~/.minimax-code/bin/mcode`).
+Captured **2026-10-04** (~05:20–05:40 +0800) and **2026-10-05** (~13:05 +0800) against
+**herdr 0.9.3** (`~/.local/bin/herdr`), mcode **v0.6.2** (`~/.minimax-code/bin/mcode`).
 
-**One edit was made after capture**, and it is the only one: `not-mcode.txt` contained
-the operator's real home directory inside the captured screen text, now rendered
-`~/…`. These files ship inside the public release tarball. The pane ids, the screen
-contents and every classification in the table below are exactly as captured.
-`tests/fixtures/agent-detection/` holds the same captures under the same rule.
+**Captures from panes this plugin does not own are banked TAIL-ONLY.** The repo is
+public and these files ship in the release tarball, so a full 40-line snapshot of
+someone else's pane is not ours to publish: their scrollback carries their private
+work — issue and PR numbers, incident write-ups, file paths, in-flight diagnoses.
+The rule for such a capture is:
+
+1. **Keep only the live tail.** The last 10 non-blank lines, a superset of the 8
+   non-blank lines `classify()` reads (`TAIL_LINES=8`). Every marker a case depends
+   on must survive inside the classifier's own 8 lines, or the case cannot fail and
+   the fixture is decoration.
+2. **Withhold private text inside even that tail.** Task titles are the author's own
+   words, so they are private too: the title's *words* become `[redacted]` and its
+   glyphs (`✓ ● ○ │ └`) are kept, so a reader can still see it was a task entry and
+   not a marker. The same applies to the cwd segment of the status strip.
+3. **Record both edits** in the provenance row, per file.
+
+Redaction is applied by an allow-list of *structural* shapes — the footer, the Tasks
+chip, the live status lines, box rules, the composer placeholder, the strip — and
+anything not on that list is redacted by default. Default-deny, because a line shape
+nobody has classified must be reviewed by a human rather than published by omission.
+
+**One edit was made after capture** in the older files, and it is the only one:
+`not-mcode.txt` contained the operator's real home directory inside the captured
+screen text, now rendered `~/…`. These files ship inside the public release tarball.
+The pane ids, the screen contents and every classification in the table below are
+exactly as captured, except where a row records that the capture is tail-only.
+`tests/fixtures/agent-detection/` holds an older subset of these captures, under the
+same scrub rule; it is the input to the shipped screen-manifest check and is not kept
+in sync with this directory (it has no `working-with-tasks-chip.txt` either).
 
 | File | Exact capture command | Pane | Classified |
 |---|---|---|---|
@@ -21,6 +45,10 @@ contents and every classification in the table below are exactly as captured.
 | `not-mcode.txt` | `herdr pane read wZ:p1 --source detection --lines 40` | `wZ:p1` — a `claude` pane, not mcode at all | `unknown` |
 | `stale-scrollback.txt` | **constructed**, see below | — | `idle` |
 | `working-with-tasks-chip.txt` | `herdr pane read wZ:p2W --source detection --lines 40` | `wZ:p2W` — a pane with a background task in flight | `working` |
+| `idle-with-task-list-footer.txt` | `herdr pane read wT:p7Y --source detection --lines 40` | `wT:p7Y` — idle at a `Message · Enter send` prompt, task list above it. **tail-only**: last 10 non-blank lines of the 40-line capture; scrollback withheld (third-party private content); task titles within the tail replaced with `[redacted]` | `idle` |
+| `idle-with-task-list-footer-2.txt` | `herdr pane read wT:p81 --source detection --lines 40` | `wT:p81` — same shape, second pane. **tail-only**, as above | `idle` |
+| `working-with-task-list-footer.txt` | `herdr pane read wT:p7Z --source detection --lines 40` | `wT:p7Z` — mid-turn, spinner on the live status line, task list above it. **tail-only**, as above | `working` |
+| `working-with-task-list-footer-2.txt` | `herdr pane read wT:p82 --source detection --lines 40` | `wT:p82` — same shape, second pane. **tail-only**, as above | `working` |
 
 `wZ:p1A` was created for this issue (`herdr pane split wZ:p4 --direction down --no-focus`, then
 `herdr pane run wZ:p1A "$(command -v mcode)"`) and closed after capture. `wZ:p5` and `wZ:p1`
@@ -42,27 +70,36 @@ after a turn     └ Completed in 3s · ⚡ 667 tok/s
 `after a turn` is idle, and it is the *common* case. A watcher that only knew
 `Start · @` would have reported `unknown` for nearly every finished session.
 
-## Markers, and the two that were rejected on the evidence
+**Read that title as "three as of 2026-10-04", not as a count.** The 13:05 captures
+turned up two more resting shapes — an idle screen carrying a task list, and an idle
+screen with a drafted message — and the first of those exposed a real
+working/idle misclassification. The count of mcode's resting shapes is not three, and
+is probably not closed. See `Ctrl+T expand` below.
 
-Checked against all three real mcode snapshots:
+## Markers, and the three that were rejected on the evidence
 
-| Marker | fresh idle | after a turn | working | verdict |
-|---|---|---|---|---|
-| `Esc stop` | – | – | yes | working |
-| `Ctrl+O details` | – | – | yes | working |
-| `Ctrl+T expand` | – | – | yes | working |
-| `Start · @` | yes | – | – | idle |
-| `● Ready` | yes | – | – | idle |
-| `Completed in` | – | yes | – | idle |
-| `Message · Enter send` | – | yes | – | idle |
-| `tok/s` | – | **yes** | yes | **rejected** |
-| `Ask Mcode to do anything` | **yes** | **yes** | **yes** | **rejected** |
+Checked against all the real mcode snapshots:
+
+| Marker | fresh idle | after a turn | idle + task list | working | verdict |
+|---|---|---|---|---|---|
+| `Esc stop` | – | – | – | yes | working |
+| `Ctrl+O details` | – | – | – | yes | working |
+| `Ctrl+T expand` | – | – | **yes** | **yes** | **rejected** |
+| `Start · @` | yes | – | – | – | idle |
+| `● Ready` | yes | – | – | – | idle |
+| `Completed in` | – | yes | yes | – | idle |
+| `Message · Enter send` | – | yes | yes | – | idle |
+| `tok/s` | – | **yes** | **yes** | yes | **rejected** |
+| `Ask Mcode to do anything` | **yes** | **yes** | **yes** | **yes** | **rejected** |
 
 `tok/s` looked like a working signal and is not: it also appears inside
 `Completed in 3s · ⚡ 667 tok/s`, a turn that has **finished**. Using it would have
 reported every completed session as working — the exact stale-lie the watcher exists
 to prevent. `Ask Mcode to do anything` is the input placeholder and appears in every
 snapshot, so it discriminates nothing.
+
+`Ctrl+T expand` was rejected for a different reason, and it is the one marker here
+that **shipped as a working rule first**. See the section below.
 
 ## `stale-scrollback.txt` is constructed, and why
 
@@ -121,3 +158,72 @@ So `chip-is-not-a-working-marker` asserts the decision that is actually availabl
 to pin — the chip is absent from `RULES` — and `chip-bearing-screen-classifies-working`
 pins the captured shape. Neither pretends to be the chip-alone test the brief asked
 for, because that test cannot be written from real captures.
+
+## `Ctrl+T expand`: the rule that shipped and had to come back out
+
+This is the only marker in `RULES` that was **added as a working rule and later
+removed on evidence**. It is worth writing down, because the first three shapes
+captured on 2026-10-04 could not have found the bug, and the reason reads like the
+marker is genuinely a working signal.
+
+`Ctrl+T expand` is part of mcode's **task-list footer**:
+
+```
+    … +5 more · 7/8 done · 1 pending · Ctrl+T expand
+```
+
+The footer is a **resting** shape. The task list does not disappear when the turn
+ends — it stays on screen, above the input box, and it stays inside the 8-line tail
+`classify()` reads. So an idle prompt that still has a task list looks like this:
+
+```
+    … +5 more · 7/8 done · 1 pending · Ctrl+T expand     <- footer, still there
+    Message · Enter send · Shift+Enter newline           <- idle status line
+```
+
+Working rules are tested before idle, so the footer won the screen and the watcher
+reported `working` for a session sitting at an idle prompt. The four captures below
+were taken on **2026-10-05 ~13:05** from four panes in workspace `wT` precisely to
+show this, two of each shape.
+
+| capture | screen | classified before the fix | after |
+|---|---|---|---|
+| `idle-with-task-list-footer.txt` | `Message · Enter send`, task list | `working` ❌ | `idle` |
+| `idle-with-task-list-footer-2.txt` | same shape, second pane | `working` ❌ | `idle` |
+| `working-with-task-list-footer.txt` | spinner + `Esc stop`, task list | `working` ✅ | `working` |
+| `working-with-task-list-footer-2.txt` | same shape, second pane | `working` ✅ | `working` |
+
+All four are **tail-only** banked captures, under the rule at the top of this file:
+pane `wT:p7Y` and the three panes beside it belong to another team, so each file is the
+last 10 non-blank lines of a 40-line read, with that team's task titles and cwd
+withheld as `[redacted]`. Nothing else was changed — the footer, the Tasks chip, the
+live status line, the composer and the status strip are exactly as captured.
+
+**Nothing was lost by removing the rule.** Every captured *working* screen — all four
+of them here, plus `working.txt` — also carries `Esc stop` on the live status line, and
+that is what now detects working. The footer added no coverage that `Esc stop` did not
+already provide, and it was actively wrong on the idle side. Pinned by
+`ctrl-t-expand-is-not-a-working-marker`, which reads `RULES` rather than a
+classification, because the decision itself is the thing worth making deliberate.
+
+Note the shape of the mistake, since it is the same one the other two rejections
+record: the marker was read out of a *working* capture, where it appears, and never
+checked against an idle capture that has a task list. `Esc` and `tok/s` were caught
+before shipping. This one shipped, and only a fresh pair of idle captures found it.
+
+### The fifth capture in that batch, and why it is not banked
+
+The same 13:05 batch produced one more screen, from pane `wT:p70`. It is
+deliberately **not** in this directory, for two independent reasons.
+
+1. **It exposes a different, still-open defect.** It is an idle screen in a *third*
+   resting shape — the input box reads `Long draft · Ctrl+G edit · Enter send`
+   rather than `Message · Enter send`, and there is no `Completed in` line inside
+   the tail. No marker in `RULES` matches it, and running the watcher against it
+   reports `unknown`, not `idle`. That is a real miss, but it is an **idle-marker
+   gap**, not a working-marker defect, so it is not this issue's business. It is
+   filed separately under epic #88.
+2. **It is not this repo's content to publish.** It is a third team's private
+   correspondence, and tail-only truncation would not save it: the unsent draft
+   *is* the defect, so the tail-only rule and a usable fixture pull in opposite
+   directions here. The right answer is a capture from a pane the plugin owns.

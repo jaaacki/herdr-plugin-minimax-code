@@ -8,11 +8,26 @@
 #
 # Usage:  mcode-watch.sh <PANE_ID> [--interval SECONDS] [--lines N] [--once]
 #
-# The watcher is a FOREGROUND process. That is the whole leak story: it is the
-# foreground job of whichever pane ran it, so closing that pane or pressing
-# Ctrl-C ends it. Nothing is detached, nothing is spawned per mcode pane, and
-# there is no pidfile to go stale. See "Interface" in the PR body for why this
-# was chosen over launching from cmd_start.
+# HOW IT IS RUN, and how it stops.
+#
+# An earlier version of this header described the watcher as a plain job of
+# whichever pane ran it, ended by closing that pane or by Ctrl-C. That stopped
+# being true in 0.4.1 and the wording was left behind as a lie. The launcher now
+# starts one watcher per mcode pane with `nohup ... &` plus `disown`
+# (watcher_autostart in bin/mcode-plugin.sh, issue #75), so a watcher outlives
+# the shell that started it, and closing the pane you launched from does not end
+# it. A hand-run in the foreground still works, which is what the usage line
+# above describes and what the traps at the bottom of this file serve.
+#
+# SO NOTHING IS LEAKED, by a different mechanism than the one this file used to
+# claim. There is still no pidfile and still no supervisor, and lifetime is tied
+# to the thing being watched rather than to a process that could outlive it or
+# die silently: the watcher polls `pane get` every cycle, and when the watched
+# pane is gone it exits 0 - without reporting a state for a pane that no longer
+# exists, and without releasing anything. See the pane-gone path in the main
+# loop. That is why detaching it needed no PID bookkeeping, reaping or orphan
+# sweep. `detached-doc-matches-launcher` in tests/watch-run.sh fails if this
+# paragraph and the launcher disagree again.
 #
 # Deliberately NOT guessing: `blocked` is never reported. See BLOCKED below.
 #
@@ -95,7 +110,7 @@ esac
 # later without the classification being rewritten.
 #
 # Every marker was checked against every captured snapshot in
-# tests/fixtures/detection/, not just the one it was read from. Three candidates
+# tests/fixtures/detection/, not just the one it was read from. Four candidates
 # were REJECTED on that evidence:
 #
 #   tok/s   appears inside "Completed in 3s - 667 tok/s", a turn that has
@@ -107,17 +122,35 @@ esac
 #   Esc     on its own. mcode's own changelog prose contains "pressing Esc on an
 #           empty Composer", so a bare "Esc" matches a captured IDLE screen.
 #           Markers must be phrases.
+#   Ctrl+T expand
+#           REMOVED, and this one was shipped as a working marker first. It is
+#           part of mcode's task-list footer ("... +5 more - 7/8 done - 1
+#           pending - Ctrl+T expand"), which is a RESTING shape: the footer
+#           stays on screen after a turn finishes, so it sits inside the tail
+#           on an idle prompt that still has a task list. Working rules are
+#           tested before idle, so the footer won and an idle session was
+#           reported working - a live watcher lying about a finished turn.
+#           Every captured WORKING screen also carries "Esc stop" on the live
+#           status line, so the footer added no coverage and its removal costs
+#           nothing. Banked captures and provenance:
+#           tests/fixtures/detection/README.md.
 #
-# Order matters: working is tested before idle. mcode has THREE resting shapes,
-# not two - a fresh session ("Start - @"), a finished turn ("Completed in"), and
-# mid-flight. A finished turn is idle and is the common case; a watcher keyed only
-# on the fresh-session shape reports unknown for nearly every session.
+# Order matters: working is tested before idle. mcode has more than two resting
+# shapes - a fresh session ("Start - @"), a finished turn ("Completed in"), an
+# idle session still showing a task list, a drafted message, and mid-flight. A
+# finished turn is idle and is the common case; a watcher keyed only on the
+# fresh-session shape reports unknown for nearly every session.
+#
+# "More than two" is a floor, not a count. Each capture batch so far has added a
+# resting shape the one before it did not have, so the table below should be read
+# as covering the shapes that have been OBSERVED, not as an exhaustive list of
+# the states mcode can be in. A shape with no marker here classifies `unknown`,
+# which is the honest answer for an unread screen - see classify().
 #
 # These are never word-split on whitespace: each line is read whole and split on
 # '|' only. That is what caused the "Esc" bug documented in classify().
 RULES='working|Esc stop
 working|Ctrl+O details
-working|Ctrl+T expand
 working|⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠭⠫
 idle|Start · @
 idle|● Ready

@@ -1,0 +1,10 @@
+    ✓ [redacted]
+    ● [redacted]
+    ○ [redacted]
+    … +8 more · 8/11 done · 2 pending · Ctrl+T expand
+  ◐ Tasks · 1 background active · 1 result ready · /tasks details
+    ⠹ Running 24min48s · ⚡ 30586 tok/s · Option+Enter queue · Enter steer · Ctrl+O details · Esc stop
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ›  Ask Mcode to do anything
+    ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/[redacted] │ ◇ [redacted] │ ⎇ main │ Full access │ ✦ M3.1-Flash-Preview · Effort max │ Context 73% left
