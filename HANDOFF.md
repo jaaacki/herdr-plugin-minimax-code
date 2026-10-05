@@ -170,23 +170,64 @@ the default branch. A Cloudflare Worker indexes it every ~30 min. **No review, n
 
 ## 9. What to build next
 
-The obvious next piece is `cmd_start`. Reference shape:
+**This section was rewritten on 2026-10-05. The previous version was stale, not merely
+outdated:** it called `cmd_start` "the obvious next piece", and `cmd_start` shipped in v0.2.0.
+If you are working from a remembered copy of this file, discard that copy.
 
-```bash
-herdr agent start mcode --kind KIND --pane ID -- mcode
-```
+What the old question list asked, and where each answer landed:
 
-Open questions to settle before writing it:
+- *What `--kind` does a MiniMax Code agent report as?* There is no such kind and there cannot
+  be one from here — `--kind` is a closed enum in the herdr binary (24 values, per #73's
+  measurement on 0.9.3 and `CLAUDE.md`). A screen manifest now exists at
+  `agent-detection/minimax-code.toml` and ships **inert**: nothing installs it, so it cannot
+  change a user's detection. It exists so the upstream contribution is a tested file rather
+  than a description of one.
+- *Layer 4 plugin or Layer 1 integration?* Layer 4, permanently. A Layer 1 integration can
+  only ship inside the herdr binary (see §3), so parity is an upstream question, not a design
+  choice left open.
+- *Windows.* Still open, unchanged. See item 4.
 
-1. What `--kind` does a MiniMax Code agent report as? herdr detects agents by
-   screen-manifest heuristics (`distribution/agent-detection/`), and there is **no**
-   `mcode.toml` — 23 bundled manifests, none for MiniMax Code. So MiniMax Code is
-   currently invisible to herdr's detection. Adding a manifest is a separate, upstream
-   contribution to `herdrdev/herdr`.
-2. Should this be a Layer 4 plugin (what we have) or a Layer 1 integration? An integration
-   would make `mcode` a first-class detectable agent, but it has to live in the herdr repo,
-   not here.
-3. Windows support: bash entrypoint means `platforms` excludes it today.
+### 1. #37 — the upstream ask, and the ACP probe that was lost
+
+`mcode` is a full interactive coding agent that is invisible to `herdr agent list`, and the only
+way to make it visible today is a community plugin self-reporting by hand. The real fix is
+upstream. Two things are missing, and one of them was lost outright:
+
+- **The ACP characterisation is not on record anywhere.** `mcode acp` runs an Agent Client
+  Protocol server over stdio. Whether it carries session state and lifecycle transitions, or
+  only prompt submission, decides whether the ask is "herdr should speak ACP" or "herdr should
+  ship a bespoke integration target" — and a wrong answer sends a maintainer after the wrong
+  thing. Nothing in this repo, and nothing on any branch, characterises it.
+- **The proposal file is gone.** It was written to a path outside this repo, was never
+  committed, and the worktree that held it has since been deleted. Recover it from a member's
+  pane or session log before redoing the work, then commit it *here* so it is reviewable
+  before anything is posted. Posting to another project is the owner's decision, not ours.
+- Cross-reference `herdrdev/herdr#2382` if it covers MiniMax detection; if it does not, say
+  plainly that the two are related but distinct.
+
+### 2. #73 — the input ceiling, measured and permanent
+
+`agent prompt` and `agent send-keys` require an **active named agent**, and only
+`herdr agent start` mints one, whose `--kind` enum has no `minimax-code` member. Renaming
+harder does not help: the agent is registered and name-addressable — `get`, `read` and `wait`
+all work — it is simply never *active*. Because the fix is upstream, this rides with #37
+rather than being tracked twice. The working alternative is
+`bin/mcode-drive.sh <pane-id> "<prompt>"`, which drives mcode's own session surface instead of
+Herdr's.
+
+### 3. #99 — resume is accepted, not proven
+
+herdr accepts a `resume_argv`, exits 0, and roughly one e2e run in three leaves **no**
+`pane.report_agent*` request in its own session log. Next experiment: issue two identical
+reports by hand against a live isolated session and diff the server log. If a hand-issued
+report also leaves no trace, it goes upstream to `herdrdev/herdr`. Until then the resume case
+stays opt-in (`MCODE_E2E_RESUME=1`), and every sentence in `README.md` about restore carries
+"if it kept it" for a reason — do not upgrade that wording.
+
+### 4. Windows
+
+Not an upstream question, and unchanged since v0.2.0: the entrypoint is bash, so `platforms`
+excludes Windows.
 
 ## 10. Corrections made during this work
 
