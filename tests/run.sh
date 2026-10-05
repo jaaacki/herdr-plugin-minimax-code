@@ -69,7 +69,7 @@ cleanup() {
     printf 'tests/run.sh: KEEP_TMP=1, sandbox left at %s\n' "$WORK" >&2
     return
   fi
-  rm -rf "$WORK"
+  /bin/rm -rf "$WORK"
 }
 trap cleanup EXIT
 
