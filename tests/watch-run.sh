@@ -110,6 +110,61 @@ case_stale_scrollback_is_idle() {
   else bad "a stale spinner in scrollback must not read as working, got '$(reported_states)'"; fi
 }
 
+# --- the task-list footer: the Ctrl+T defect (issue #83) ---------------------
+#
+# `Ctrl+T expand` is part of mcode's task-list footer, and the footer is a
+# RESTING shape: it stays on screen after a turn ends. Both idle fixtures are
+# real captures (a live `Message · Enter send` prompt with a task list above it),
+# both carry `Ctrl+T expand` inside the 8-line tail classify() reads, and both
+# were classified `working` because the working rules are tested before the idle
+# ones. A live watcher therefore reported busy on a finished turn.
+#
+# These fixtures come from panes this plugin does not own, so they are banked
+# tail-only: the last 10 non-blank lines, with third-party task titles withheld
+# as `[redacted]`. That is why each is exactly 10 lines and carries no scrollback
+# - see the rule in tests/fixtures/detection/README.md. The footer and the live
+# status line both sit inside the retained window, which is what makes these
+# cases falsifiable.
+#
+# The two idle cases are the fix's falsification surface: put the rule back and
+# both go red.
+
+case_idle_task_list_footer_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Y --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "an idle screen whose tail carries the task-list footer must classify 'idle', got '$(reported_states)'"; fi
+}
+
+case_idle_task_list_footer_2_is_idle() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/idle-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p81 --once
+  if [ "$(reported_states)" = "idle" ]; then ok
+  else bad "second idle task-list-footer capture must classify 'idle', got '$(reported_states)'"; fi
+}
+
+# The other half, and the one that stops the fix from being a regression: the
+# footer must not be the thing that DETECTS working either. These two captures
+# carry the same footer AND a live `Esc stop` status line, and they must stay
+# `working` on the strength of that status line alone.
+case_working_task_list_footer_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p7Z --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "a working screen carrying the task-list footer must still classify 'working', got '$(reported_states)'"; fi
+}
+
+case_working_task_list_footer_2_is_working() {
+  setup
+  WATCH_SNAPSHOTS="$FIX/working-with-task-list-footer-2.txt"; export WATCH_SNAPSHOTS
+  run_watch wT:p82 --once
+  if [ "$(reported_states)" = "working" ]; then ok
+  else bad "second working task-list-footer capture must classify 'working', got '$(reported_states)'"; fi
+}
+
 # A pane that is not mcode at all matches no marker. The watcher must say
 # `unknown` and must NOT invent `blocked`. This case is the one that can actually
 # fail: feeding it only idle/working snapshots would pass whether or not the
@@ -234,6 +289,113 @@ case_chip_is_not_a_working_marker() {
   fi
 }
 
+# CTRL+T EXPAND MUST NOT BE A WORKING MARKER - the same discipline as the chip
+# case above, pointed at a marker that actually WAS in the table and shipped.
+#
+# Unlike the chip, this one is pinned twice: the four classification cases prove
+# the behaviour, and this case pins the decision. Both fail if the rule returns,
+# so this is not a test that passes against a fiction.
+case_ctrl_t_expand_is_not_a_working_marker() {
+  setup
+  # Scoped to the RULES assignment only, for the same reason as the chip case: a
+  # bare grep over the whole script would match the comment block above that
+  # explains why the marker was removed.
+  local rules
+  rules="$(sed -n "/^RULES='/,/'$/p" "$WATCH" 2>/dev/null || true)"
+  if [ -z "$rules" ]; then
+    bad "could not read the RULES table from $WATCH; this case cannot assert anything"
+    return
+  fi
+  if printf '%s\n' "$rules" | grep -qF 'Ctrl+T expand'; then
+    bad "Ctrl+T expand is back in the RULES table. It is part of the task-list" \
+        "footer, which is a RESTING shape that survives the end of a turn, so it" \
+        "reads as working on an idle prompt with a task list. Working rules are" \
+        "tested first, so the footer wins. Every captured working screen also" \
+        "carries 'Esc stop', which is what should be doing this work:"
+    printf '%s\n' "$rules" | sed 's/^/          /'
+  else
+    ok
+  fi
+}
+
+# THE HEADER MUST NOT CLAIM A LIFECYCLE THE LAUNCHER NO LONGER HAS.
+#
+# bin/mcode-watch.sh used to document itself as a FOREGROUND process: "the
+# foreground job of whichever pane ran it, so closing that pane or pressing
+# Ctrl-C ends it", "nothing is detached", "nothing is spawned per mcode pane".
+# All of that stopped being true in 0.4.1, when the launcher started one watcher
+# per mcode pane with `nohup ... &` + `disown` (issue #75), and the header was
+# left behind as a lie. A comment that misstates how a long-lived background
+# process is stopped is not cosmetic: it is the first thing a reader debugging a
+# watcher that outlived its pane would rely on.
+#
+# Both halves are falsifiable, which is the point: the first fails if the stale
+# wording comes back, the second fails if the launcher ever stops detaching.
+# Reading bin/mcode-plugin.sh from here is not an ownership claim on it - the
+# same cross-file read tests/source-run.sh already does across all three
+# reporters.
+case_detached_doc_matches_launcher() {
+  setup
+  local plugin="$root/bin/mcode-plugin.sh"
+  local header
+  # The header only: the word "detached" is legitimately used later in the file
+  # when explaining why detaching needed no supervisor, so a bare grep over the
+  # whole script would match the corrected text and pass for the wrong reason.
+  header="$(sed -n '2,30p' "$WATCH" 2>/dev/null || true)"
+  if [ -z "$header" ]; then
+    bad "could not read the header of $WATCH; this case cannot assert anything"
+    return
+  fi
+  local stale=""
+  case "$header" in *"FOREGROUND process"*) stale="FOREGROUND process" ;; esac
+  case "$header" in *"Nothing is detached"*) stale="${stale:+$stale, }Nothing is detached" ;; esac
+  case "$header" in *"nothing is spawned per mcode pane"*) stale="${stale:+$stale, }nothing is spawned per mcode pane" ;; esac
+  if [ -n "$stale" ]; then
+    bad "the header still claims: $stale. The launcher nohup-disowns one watcher" \
+        "per mcode pane since 0.4.1, so the watcher outlives the shell that started" \
+        "it. Lifetime is tied to the WATCHED PANE via the pane-gone path, not to the" \
+        "pane you launched from:"
+    printf '%s\n' "$header" | sed 's/^/          /'
+    return
+  fi
+  # The positive half. The banned strings above only catch a verbatim revert, so
+  # the header must also positively name how it is ACTUALLY started. A header
+  # that describes the lifecycle without naming `nohup` is describing something
+  # else, and that is the paraphrase this check exists to catch. This is why the
+  # corrected header explains itself in its own words rather than quoting the
+  # wording it replaced: a literal ban is only meaningful if the surrounding
+  # prose avoids those literals too.
+  case "$header" in
+    *nohup*) ;;
+    *)
+      bad "the header describes how this process is started and stopped but never" \
+          "names nohup, so it is describing a lifecycle this file no longer has. If" \
+          "the launcher genuinely stopped detaching, fix the header and this case" \
+          "together, deliberately:"
+      printf '%s\n' "$header" | sed 's/^/          /'
+      return
+      ;;
+  esac
+  if [ ! -f "$plugin" ]; then
+    bad "$plugin is missing, so the launcher half of this case cannot be checked"
+    return
+  fi
+  # The launcher's own spawn: nohup, the watcher path, backgrounded. Checked as
+  # separate greps rather than one pattern, because the two statements are on
+  # separate lines with a line continuation between them.
+  if ! grep -qF 'nohup "$watcher"' "$plugin"; then
+    bad "the launcher no longer nohups the watcher; if the watcher is no longer" \
+        "detached, the header must say so, and this case wants a human decision" \
+        "about which way it moved"
+    return
+  fi
+  if ! grep -qF 'disown' "$plugin"; then
+    bad "the launcher no longer disowns the watcher"
+    return
+  fi
+  ok
+}
+
 case_source_namespace_is_herdr_minimax_code() {
   setup
   WATCH_SNAPSHOTS="$FIX/idle.txt"; export WATCH_SNAPSHOTS
@@ -273,7 +435,11 @@ if [ ! -x "$WATCH" ]; then
 fi
 if [ ! -f "$FIX/idle.txt" ] || [ ! -f "$FIX/working.txt" ] ||
    [ ! -f "$FIX/idle-after-working.txt" ] || [ ! -f "$FIX/not-mcode.txt" ] ||
-   [ ! -f "$FIX/stale-scrollback.txt" ]; then
+   [ ! -f "$FIX/stale-scrollback.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/idle-with-task-list-footer-2.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer.txt" ] ||
+   [ ! -f "$FIX/working-with-task-list-footer-2.txt" ]; then
   printf 'FAIL  preflight: captured detection fixtures are missing\n' >&2
   exit 2
 fi
@@ -289,6 +455,12 @@ CASES=(
   classify-empty-is-unknown:case_classify_empty_is_unknown
   classify-post-turn-is-idle:case_classify_post_turn_is_idle
   stale-scrollback-is-idle:case_stale_scrollback_is_idle
+  idle-task-list-footer-is-idle:case_idle_task_list_footer_is_idle
+  idle-task-list-footer-2-is-idle:case_idle_task_list_footer_2_is_idle
+  working-task-list-footer-is-working:case_working_task_list_footer_is_working
+  working-task-list-footer-2-is-working:case_working_task_list_footer_2_is_working
+  ctrl-t-expand-is-not-a-working-marker:case_ctrl_t_expand_is_not_a_working_marker
+  detached-doc-matches-launcher:case_detached_doc_matches_launcher
   unmatched-is-unknown-not-blocked:case_unmatched_is_unknown_not_blocked
   no-traffic-no-report:case_no_traffic_no_report
   transition-reported:case_transition_reported
