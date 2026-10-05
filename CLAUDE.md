@@ -75,16 +75,21 @@ never had. It is what established that a launched pane appears in `herdr agent l
 that it is addressable both by pane id (`herdr agent get <pane-id>`) and by name
 (`herdr agent get mcode`, installed by `agent rename`).
 
-Resume is **proven**, with caveats. Herdr keeps no session id for us (no `agent_session`),
-but it does keep the **resume command**, and a restart re-runs it, so the pane comes back
-running `mcode --continue`. Measured end to end in an isolated named session (#85/#94). The
-caveat that bites: **a client must attach** — while the terminal area is `0x0` herdr has no
-pane to resume into, so panes come back as plain shells and nothing is logged. Two `mcode`
-panes in one cwd restore only one; herdr keys resume candidates on (source, agent, cwd, argv)
-and keeps the first. `mcode --continue` resolves by cwd, so a restore with no session prints
-"No saved Session exists in the current workspace", which is mcode answering, not a failed
-restore. The e2e case is **opt-in** (#99): it fails about one run in three and nobody has
-root-caused it, so do not read a green suite as proof either way.
+Resume works, and the docs must not claim more than that. Herdr keeps no session id for us (no
+`agent_session`), but it **accepts a resume command** and a restarted herdr **re-runs** it, so
+the pane comes back running `mcode --continue`. **Do not upgrade that to "works".** Herdr can
+accept the report and still not store it — that is the #99 failure mode, and the launch's
+`resume command recorded` line is herdr's *acceptance*, not a read-back. Proof is by hand in an
+isolated named session (#85/#94); the e2e case is **opt-in** (`MCODE_E2E_RESUME=1`) because it
+is intermittent, about one run in three, cause unknown. Never read a green suite as evidence
+for this feature.
+
+Three caveats, all measured: **a client must attach**, or while the terminal area is `0x0`
+herdr has no pane to resume into and panes come back as plain shells with nothing logged; two
+`mcode` panes in one cwd restore only one, because herdr keys resume candidates on (source,
+agent, cwd, argv) and keeps the first; and `mcode --continue` resolves by cwd, so a restore with
+no session printing "No saved Session exists in the current workspace" is mcode answering, not
+a failed restore.
 
 ### How the tests reach the real response shape
 
