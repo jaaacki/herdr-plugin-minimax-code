@@ -288,6 +288,29 @@ action_log_tail() {
        end' 2>/dev/null || echo "log unavailable or unparseable"
 }
 
+# The action is ASYNCHRONOUS, and its log record says so: `status` is "running" and
+# `exit_code` and `stderr` are null until the process finishes. Reading it early is
+# how a read-back assertion ends up asserting on an empty string and failing for
+# the wrong reason — the resume case did exactly that.
+#
+# "Finished" is taken as exit_code being non-null. Waiting for a NON-EMPTY stderr
+# instead would be wrong on its own: a successful launch of this plugin has stderr
+# (the launcher narrates and the read-back reports), but a plugin with nothing to
+# say would look like it never finished, and the wait would time out on correct
+# behaviour.
+await_action_log() { # await_action_log <seconds>
+  local deadline=$(( $(date +%s) + $1 ))
+  while :; do
+    if "$HERDR" --session "$SESSION" plugin log list --plugin "$PLUGIN_ID" 2>/dev/null \
+        | jq -e '[.result.logs[]? | select(.action_id == "minimax-code-start")]
+                  | last | (.exit_code != null)' >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$(date +%s)" -le "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
 # ── case 2: the real action launches a real pane ─────────────────────────────
 # The action is ASYNCHRONOUS. `plugin action invoke` returns a log record with
 # status "running" and no pane. Asserting immediately reads a false negative —
@@ -706,11 +729,12 @@ run_case_resume_restored() {
     return
   fi
 
-  # Taken FIRST, before anything this case does, because the action's log lives in
-  # the server's memory and this case is about to stop that server. Reading it
-  # after the restart is how I spent a debugging round trip staring at
-  # `{"logs":[]}` and concluding the action had never run, when the restart had
-  # simply thrown the log away.
+  # The action is asynchronous, so its log has to be WAITED for rather than read:
+  # a record for a still-running action carries a null exit code and an empty
+  # stderr, and every failure message below quotes it. Reading it early is how a
+  # real failure gets reported as "action log: status=running exit=- stderr=",
+  # which says nothing. Cheap either way — the action is long done by now.
+  await_action_log 25
   ACTION_LOG="$(action_log_tail)"
 
   # 1. STORED. The plugin reported the resume, and herdr kept it — in

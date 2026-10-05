@@ -47,21 +47,34 @@ Two things, and the second is the bug.
    so reported "nothing was stored" about a write that was stored — the whole of
    issue #85.
 
+### NOTHING READS THIS FILE, and that is deliberate
+
+It is here as the record of where that knowledge came from, not as a test input.
+An earlier version of this work seeded the read-back from it; that read-back was
+then removed, because herdr debounces session saves by five seconds and a check
+that reads the file while a launch is in flight reports the resume absent almost
+every time. A fixture that a test consults implies the test could fail; this one
+cannot, and pretending otherwise would be worse than not having it.
+
+If you want the persistence claim under test, it is proven against a live herdr
+instead: `resume: a restart re-runs the recorded resume command in the recreated
+pane` in `../run.sh` stops the server, starts it again, attaches a client, and
+asserts the command ran in the recreated pane. That is the only assertion which
+cannot be faked from a file, which is the reason the e2e suite exists and refuses
+to skip when herdr is missing.
+
 ### Why the `cwd` still reads `/private/tmp/flock85-cap3`
 
-It is where the capture was made, and it is left exactly as captured. The read-back
-matches on the reporter tuple — `source` + `agent` + `argv` — and never on `cwd`,
-so a capture whose `cwd` no longer exists is a faithful fixture rather than a
-mismatch waiting to be papered over. Keeping it also means the suite never has to
-claim it is reading a snapshot "from the sandbox".
+It is where the capture was made, and it is left exactly as captured. Do not
+"tidy" it into something that looks like the sandbox: the read-back matched on the
+reporter tuple — `source` + `agent` + `argv` — and never on `cwd`, precisely
+because herdr stores a *resolved* path while `pwd` in a pane is the shell's
+*logical* one, and on macOS `/tmp` is a symlink to `/private/tmp`.
 
 ### What this file cannot prove
 
 That herdr *runs* the command after a restart. A snapshot proves the write landed.
-Only a real `server stop` → `server` → client attach can prove the restore, which
-is `resume: a restart re-runs the recorded resume command in the recreated pane` in
-`run.sh` — and it cannot be faked from a fixture, which is the entire reason that
-suite exists and refuses to skip when herdr is missing.
+Only a real `server stop` → `server` → client attach can prove the restore.
 
 ### If you need to re-capture
 
