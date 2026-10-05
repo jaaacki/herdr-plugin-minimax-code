@@ -220,9 +220,10 @@ decisions there are locked and must not be relitigated in an issue or PR.
 
 ## Git flow
 
-Follow the repo's issue → worktree → PR → `dev` → `main` flow (see global CLAUDE.md). Epic #1
-tracks the v0.2.0 work; `dev` is the integration branch and `main` is released from it. PRs must
-be green on both CI legs before merge.
+Follow the repo's issue → worktree → PR → `dev` → `main` flow (see global CLAUDE.md). `dev` is
+the integration branch and `main` is released from it by a `dev` → `main` merge commit (never a
+squash, or the next release conflicts on the version line), then a `v*` tag that runs
+`release.yml`. PRs must be green on both CI legs before merge. Recent epics: #88 (v0.5.0).
 
 Worktrees are plain `git worktree add <path> -b <branch> origin/dev` — always off
 `origin/dev`, never `main`. (Flock v2 has no worktree verb; the old
