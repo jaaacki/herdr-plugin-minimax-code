@@ -66,6 +66,31 @@ PRIOR_LINK=""
 LINKED_BY_US=""
 THROWAWAY_PANE=""
 FOREIGN_PANE=""
+# Every pane this suite creates, so cleanup can tear down all of them. The launch
+# action auto-starts a DETACHED watcher per pane (MCODE_WATCH_AUTOSTART), and a
+# watcher outlives the pane only if nothing stops it — it polls herdr forever. A
+# watcher left running from a test run is a real process doing real work against
+# whichever server it inherited, and tests/run.sh case-22 has a probe whose entire
+# job is to catch exactly that. It caught one of mine.
+#
+# Recording panes in one list rather than one variable per case is what makes it
+# exhaustive: the first version cleaned up only the two #84 cases' panes, and the
+# launch pane's watcher was left to luck.
+CREATED_PANES=""
+
+note_created_pane() { # note_created_pane <pane-id>
+  local p="$1"
+  [ -n "$p" ] || return 0
+  case "
+$CREATED_PANES
+" in
+    *"
+$p
+"*) : ;;
+    *) CREATED_PANES="${CREATED_PANES}${CREATED_PANES:+
+}$p" ;;
+  esac
+}
 
 # ── reporting ────────────────────────────────────────────────────────────────
 pass() { CASES_RUN=$((CASES_RUN + 1)); printf 'ok    %s\n' "$1"; }
@@ -93,17 +118,23 @@ cleanup() {
   local rc=$?
   set +e
 
-  # The panes the #84 cases split, and the watchers that were started for them.
-  # Scoped to those two pane ids on purpose: a blanket `pkill -f mcode-watch.sh`
-  # also kills the watchers belonging to the developer's real minimax-code
-  # panes, which is damage this suite must not do to the machine it verifies.
-  for tp in "$THROWAWAY_PANE" "$FOREIGN_PANE"; do
+  # Every pane this suite created, and the detached watcher each one started.
+  #
+  # Scoped to THOSE pane ids on purpose, and the scoping is the whole point: a
+  # blanket `pkill -f mcode-watch.sh` also kills the watchers belonging to the
+  # developer's real minimax-code panes, which is damage this suite must not do to
+  # the machine it verifies. Matching on "<script> <pane-id>" is also what keeps
+  # an unrelated watcher from being mistaken for ours.
+  local tp
+  while IFS= read -r tp; do
     [ -n "$tp" ] || continue
     [ -n "$SESSION" ] && "$HERDR" --session "$SESSION" pane close "$tp" >/dev/null 2>&1
     for wp in $(pgrep -f "mcode-watch.sh $tp" 2>/dev/null); do
       kill "$wp" 2>/dev/null
     done
-  done
+  done <<EOF
+$CREATED_PANES
+EOF
 
   # BEFORE the server is killed, and that ordering is the whole point of the
   # escape hatch: the plugin's command log lives in the server's memory, so a
@@ -116,6 +147,7 @@ cleanup() {
       "$SESSION" "$PLUGIN_ID" >&2
     printf 'e2e:   server log:  %s\n' "$HERDR_CONFIG_DIR/sessions/$SESSION/herdr-server.log" >&2
     printf 'e2e:   workdir:     %s\n' "$WORKDIR" >&2
+    printf 'e2e:   config root: %s  (isolated; delete it too)\n' "$E2E_XDG_ROOT" >&2
     printf 'e2e:   stop it:     herdr --session %s server stop; herdr session delete %s\n' \
       "$SESSION" "$SESSION" >&2
     return $rc
@@ -136,14 +168,18 @@ cleanup() {
     fi
   fi
 
-  # Restore the plugin registry to exactly what it was. Linking is global to the
-  # user, not per-session, so this suite mutates the developer's registry and
-  # must put it back even on failure.
+  # Restore the plugin registry to exactly what it was.
   #
-  # Guarded on LINKED_BY_US. Unconditionally unlinking here would delete a
-  # developer's own registration if the suite died between installing this trap
-  # and taking the snapshot below — a failure that would damage the machine it
-  # is meant to be testing. Only undo what this suite actually did.
+  # Now BELT AND BRACES rather than a repair. The registry is config_dir()/
+  # plugins.json, so with the isolation above it is a file this run created, and
+  # the whole block is about a throwaway directory. It is kept anyway: the day
+  # someone runs this suite with the isolation bypassed, this is the line that
+  # stops it taking the developer's installed plugin with it — and unlike the
+  # refusal guard, which has its own tests, this has none.
+  #
+  # Guarded on LINKED_BY_US. Unconditionally unlinking here would delete a real
+  # registration if the suite ever ran against a real registry and died between
+  # installing this trap and taking the snapshot below. Only undo what was done.
   if [ -n "$LINKED_BY_US" ]; then
     "$HERDR" plugin unlink "$PLUGIN_ID" >/dev/null 2>&1
     if [ -n "$PRIOR_LINK" ]; then
@@ -151,6 +187,12 @@ cleanup() {
     fi
   fi
 
+  # Both temp roots go LAST, after the server has stopped. Removing the config root
+  # first — which is what the first draft of the isolation block did — leaves an
+  # empty directory behind, because the running server still holds and recreates
+  # files under it. A suite whose whole selling point is "does not touch your
+  # machine" must not leave anything in /tmp either.
+  [ -n "$E2E_XDG_ROOT" ] && [ -d "$E2E_XDG_ROOT" ] && rm -rf "$E2E_XDG_ROOT" 2>/dev/null
   [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR" 2>/dev/null
   return $rc
 }
@@ -182,6 +224,54 @@ fi
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/mcode-e2e.XXXXXX")"
 trap cleanup EXIT INT TERM
+
+# ── ISOLATION: the whole point of the block below ────────────────────────────
+# This suite runs a REAL herdr and it LINKS A PLUGIN. The plugin registry is not
+# per-session: it is one file at config_dir()/plugins.json
+# (src/persist/plugin_registry.rs:11), shared by every session on the machine.
+# So running this suite against the developer's own herdr REPLACES whatever they
+# had installed, and the unlink in cleanup then leaves them with nothing.
+#
+# That is not hypothetical. It is what happened on 2026-10-05: running this file
+# locally replaced the owner's GitHub-installed jaaacki.minimax-code 0.4.1 with a
+# link to a throwaway worktree, and the restore left the registry empty.
+#
+# The fix is XDG_CONFIG_HOME, which herdr honours for config_dir()
+# (src/config/io.rs:31) and therefore for the socket, the state dir, the session
+# directories AND the plugin registry. Pointing it at a directory inside this run's
+# own workdir isolates all of them, and costs nothing: a fresh config dir simply
+# means no user config.toml, so herdr's defaults apply, which is what a CI runner
+# has anyway.
+#
+# Note this also fixes a quieter version of the same problem that predated it:
+# HERDR_SOCKET_PATH is inherited from the developer's own pane when the suite is
+# run from inside herdr, and every `$HERDR` call in here would then have talked to
+# the developer's LIVE server rather than this run's.
+# A SEPARATE, SHORT root, and the shortness is not cosmetic. herdr's socket lives at
+# <config_dir>/sessions/<name>/herdr.sock, and a unix socket path is capped at
+# sun_path — 104 bytes on macOS. Nesting that under the long per-user TMPDIR the
+# workdir comes from overruns it, and every herdr call then fails with "local
+# socket name length exceeds capacity of sun_path of sockaddr_un". Which is what
+# happened when this was first written with the root inside WORKDIR: the whole
+# suite failed, and the isolation fix was blamed for a path-length bug.
+#
+# So: /tmp explicitly, a short template, and a session name short enough to leave
+# room. Everything else — logs, the stub launcher, the sandbox — stays in the long
+# workdir, where length does not matter.
+E2E_XDG_ROOT="$(mktemp -d "/tmp/mcode-e2e-cfg.XXXXXX")"
+# What the DEVELOPER's config dir is, before this suite replaces the variable.
+# The refusal guard needs it to name the place it is protecting; nothing else
+# reads it.
+XDG_CONFIG_HOME_BEFORE_ISOLATION="${XDG_CONFIG_HOME:-}"
+export XDG_CONFIG_HOME_BEFORE_ISOLATION
+export XDG_CONFIG_HOME="$E2E_XDG_ROOT"
+# The socket the developer is sitting in must not leak in either. Cleared rather
+# than trusted, because inheriting it is exactly the bug.
+unset HERDR_SOCKET_PATH
+# ...and HERDR_SESSION, for the same reason: it would silently retarget every
+# `herdr --session` call at a different server than the one this suite starts.
+unset HERDR_SESSION
+HERDR_CONFIG_DIR="$E2E_XDG_ROOT/herdr"
 
 # ── case 1: a real server starts and a real session bootstraps ───────────────
 # A fresh session has zero panes, and a bare `pane split` answers
@@ -353,6 +443,7 @@ run_case_launch() {
   # makes the test assert about the pane it actually created.
   pane_ids | sort > "$WORKDIR/panes.after"
   NEW_PANE="$(comm -13 "$WORKDIR/panes.before" "$WORKDIR/panes.after" | head -1)"
+  note_created_pane "$NEW_PANE"
   if [ -z "$NEW_PANE" ]; then
     fail "$name" "pane count grew but no new pane id could be identified" \
       "before: $(tr '\n' ' ' < "$WORKDIR/panes.before")" \
@@ -552,6 +643,7 @@ run_case_event_watcher() {
     return
   fi
   THROWAWAY_PANE="$pane"
+  note_created_pane "$pane"
   # A live process, or herdr's detection pass re-reads the pane and resets the
   # self-reported state to `unknown` — measured on 0.9.3 — and the pane never
   # reaches agent list at all, which would make the case fail for a reason that
@@ -633,6 +725,7 @@ run_case_foreign_pane_untouched() {
     return
   fi
   FOREIGN_PANE="$pane"
+  note_created_pane "$pane"
   "$HERDR" --session "$SESSION" pane run "$pane" "exec sleep 300" >/dev/null 2>&1
   sleep 1
   "$HERDR" --session "$SESSION" pane report-agent "$pane" \
@@ -811,11 +904,134 @@ run_case_resume_restored() {
   fi
 }
 
+# ── refusal guard ────────────────────────────────────────────────────────────
+# Isolation is set up unconditionally above, so the guard below is the second
+# lock on the same door: if something in the environment redirects herdr back at
+# the developer's own config after the fact, this stops the run BEFORE anything is
+# linked, started or deleted.
+#
+# It checks the two ways herdr can be pointed at a real config dir: the resolved
+# XDG location, and an explicit socket override. Checking only one is how a guard
+# gives false comfort — HERDR_SOCKET_PATH alone is enough to make every call in
+# this file land on the wrong server while config_dir still looks correct.
+#
+# The rule is deliberately narrow: the config dir must live inside E2E_XDG_ROOT,
+# the directory this run created for it. Not "somewhere plausible", not "a temp
+# dir" — inside THIS root, which is removed on exit. Anything else is refused,
+# including a developer's deliberate XDG_CONFIG_HOME, because this suite has no
+# business writing to a location it did not create.
+refuse_unless_isolated() { # refuse_unless_isolated <config-dir> <socket-path-or-empty>; 0 = safe
+  local cfg="$1" sock="$2" real="${REAL_USER_CONFIG_DIR:-}"
+
+  if [ -n "$sock" ] && [ -n "$real" ] && [ "${sock%/*}" = "$real" ]; then
+    printf 'e2e: REFUSING TO RUN — the socket override points into your real herdr config.\n' >&2
+    printf '  socket:      %s\n' "$sock" >&2
+    printf '  real config: %s\n' "$real" >&2
+    printf '  This suite links a plugin into a registry that is shared by every\n' >&2
+    printf '  session, and would replace what you have installed. Unset\n' >&2
+    printf '  HERDR_SOCKET_PATH and re-run.\n' >&2
+    return 1
+  fi
+
+  case "$cfg" in
+    "$E2E_XDG_ROOT"/*) : ;;
+    *)
+      printf 'e2e: REFUSING TO RUN — the herdr config dir is not inside this run own root.\n' >&2
+      printf '  config dir:  %s\n' "$cfg" >&2
+      printf '  own root:    %s\n' "$E2E_XDG_ROOT" >&2
+      printf '  This suite starts a real server and links a real plugin. It must do\n' >&2
+      printf '  that in a directory it created, not in yours. Unset XDG_CONFIG_HOME\n' >&2
+      printf '  and re-run, or point it at a throwaway directory.\n' >&2
+      return 1
+      ;;
+  esac
+
+  # Belt and braces, and the reason the two checks above are not redundant: name
+  # the user's real directory explicitly, in case it is somewhere unusual.
+  if [ -n "$real" ] && [ "$cfg" = "$real" ]; then
+    printf 'e2e: REFUSING TO RUN — the config dir is your real %s.\n' "$real" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Self-test for the guard above, run as part of the suite so the guard is not
+# merely present but exercised. A refusal path that has never run is a guess.
+#
+#   ./tests/e2e/run.sh --self-test-isolation
+#
+# It checks the three ways the guard must fire — a real config dir, a real socket
+# override, and the case that matters most, a path that LOOKS isolated but is not
+# (a workdir-prefixed string that is really someone's home) — and the one way it
+# must not. It runs no herdr and touches no registry, so it is safe anywhere.
+self_test_isolation() {
+  local failures=0 total=5
+
+  check() { # check <expect-0-or-1> <label> <config-dir> <socket>
+    local want="$1" label="$2" got
+    if refuse_unless_isolated "$3" "$4" >/dev/null 2>&1; then got=0; else got=1; fi
+    if [ "$got" = "$want" ]; then
+      printf 'ok    isolation: %s\n' "$label"
+    else
+      printf 'FAIL  isolation: %s (wanted %s, got %s)\n' "$label" "$want" "$got" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  check 1 "refuses the user's real config dir" \
+    "$HOME/.config/herdr" ""
+  check 1 "refuses a socket pointing into the user's real config" \
+    "$WORKDIR/xdg/herdr" "$HOME/.config/herdr/herdr.sock"
+  check 1 "refuses a config dir outside this run own root" \
+    "/tmp/somewhere-else/herdr" ""
+  # The near-miss: a path that starts with the root string but is not under it.
+  # A prefix test without a separator would wave this through, so it is checked.
+  check 1 "refuses a root-prefixed path that is not under the root" \
+    "${E2E_XDG_ROOT}-lookalike/herdr" ""
+  check 0 "accepts this run own isolated root" \
+    "$E2E_XDG_ROOT/herdr" "$E2E_XDG_ROOT/herdr/herdr.sock"
+
+  if [ "$failures" -eq 0 ]; then
+    printf -- '---\n'
+    printf '5 case(s), all passed\n'
+    return 0
+  fi
+  printf -- '---\n'
+  printf '%d case(s), %d failed\n' "$total" "$failures" >&2
+  return 1
+}
+
+# Where the developer's REAL config lives, computed once. Used only by the
+# refusal guard — never as a path anything else in this file reads or writes.
+# Resolved by asking herdr nothing and looking at the environment the way herdr
+# itself does, so the check is about what herdr WOULD use, not about what this
+# script happens to have exported.
+REAL_USER_CONFIG_DIR="$HOME/.config/herdr"
+if [ -n "${XDG_CONFIG_HOME_BEFORE_ISOLATION:-}" ]; then
+  REAL_USER_CONFIG_DIR="$XDG_CONFIG_HOME_BEFORE_ISOLATION/herdr"
+fi
+
+# The guard runs BEFORE anything is linked, started or deleted. Exit 2 rather than
+# 1 so a refusal is distinguishable from a test failure in CI.
+if ! refuse_unless_isolated "$HERDR_CONFIG_DIR" "${HERDR_SOCKET_PATH:-}"; then
+  exit 2
+fi
+
+# The self-test needs the guard but not a server, so it short-circuits here. It
+# still ran the guard above, so a broken guard cannot reach the point of
+# reporting itself healthy.
+case "${1:-}" in
+  --self-test-isolation)
+    self_test_isolation
+    exit $?
+    ;;
+esac
+
 # ── main ─────────────────────────────────────────────────────────────────────
-printf 'e2e: driving a REAL herdr (%s)\n' "$HERDR"
+printf 'e2e: driving a REAL herdr (%s), config isolated under %s\n' "$HERDR" "$HERDR_CONFIG_DIR"
 
 # Snapshot the registry BEFORE linking, so cleanup can put it back exactly.
-HERDR_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr"
+# Within THIS run's isolated registry, set above — never the developer's.
 PRIOR_LINK="$("$HERDR" plugin list --json 2>/dev/null \
   | jq -r --arg id "$PLUGIN_ID" '.result.plugins[]? | select(.plugin_id == $id) | .plugin_root // empty' 2>/dev/null)"
 
