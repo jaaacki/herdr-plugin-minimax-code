@@ -117,6 +117,7 @@ jobs:
             README.md \
             LICENSE \
             CLAUDE.md \
+            CHANGELOG.md \
             tests/
 
           sha256sum "herdr-plugin-minimax-code-${VERSION}.tar.gz" > sha256.txt
@@ -153,6 +154,7 @@ jobs:
           for f in herdr-plugin.toml bin/mcode-plugin.sh bin/mcode-watch.sh \
                    bin/mcode-session.sh bin/mcode-drive.sh README.md LICENSE \
                    CLAUDE.md \
+                   CHANGELOG.md \
                    agent-detection/minimax-code.toml \
                    mcode-plugin/.claude-plugin/plugin.json \
                    mcode-plugin/hooks/herdr-bootstrap.sh \
