@@ -84,6 +84,39 @@ broke=0
 # abort: a case reports every problem it finds, not just the first.
 note() { broke=1; printf '        %s\n' "$*"; }
 
+# How long a detached watcher gets to be scheduled and write its marker.
+#
+# THE BUDGET IS NOT A PROPERTY OF THE WATCHER, IT IS A PROPERTY OF THE MACHINE.
+# The stub itself takes 0.02-0.28s to fork, run and write. What the budget has to
+# cover is the gap before the OS schedules it, and that gap is unbounded in
+# principle: m4 measured cases 27/28/29 failing this poll at load average ~10
+# (four agents working) with no watcher actually broken. So the failure being
+# fixed is a FALSE NEGATIVE — a launch that worked perfectly reported as one that
+# never started its watcher.
+#
+# Reproduced here at load average 18-21, with a full suite running in parallel:
+# at 1000ms cases 22 and 26 fail on this poll with nothing actually broken; at
+# 10000ms the same five cases pass. It is a race, not a threshold, which is why
+# it was reported against 27/28/29 and shows up as 22/26 here.
+#
+# WHY 10s AND NOT "RETRY TWICE". Both convert a false negative into a true
+# failure, but this also leaves the failure legible: with a retry, a broken
+# watcher reports as a timeout anyway, and the two cases are indistinguishable in
+# the log. A single generous bound says the same thing with one number.
+#
+# WHY A CONSTANT AND NOT 22 LITERALS. Every wait in this file is on the same
+# marker from the same detached process, so there is one budget to reason about.
+# Twenty-two copies is how they drift apart: when this was written, two of them
+# already read 1500 while their twenty neighbours read 1000, with no reason
+# anyone could find. The next site gets the budget by naming the budget.
+#
+# THIS DOES NOT MASK AN ABSENCE. The bound is a ceiling on how long a case waits
+# for a marker that never comes, and the marker is written by a process that has
+# already been spawned. A watcher that is not spawned still produces no marker at
+# any budget; it just costs 10s to say so instead of 1s. That the cases still go
+# red with no spawn is a mutation, not an argument - see the PR.
+WATCHER_SPAWN_WAIT_MS=10000
+
 # wait_for_file PATH [max_ms] - bounded poll for a DETACHED process to act.
 #
 # Added because the obvious probe is a deterministic false negative. cmd_start
@@ -99,10 +132,12 @@ note() { broke=1; printf '        %s\n' "$*"; }
 # either, so a regression to leaking would stay silent behind a green assertion.
 #
 # Bounded on purpose. An unbounded wait turns a missing marker into a hang
-# instead of a failure, and the bound is short enough to keep the suite quick
-# while being long enough for a shell and one file write.
+# instead of a failure. The bound is a polling ceiling, not a delay: the poll
+# checks first and sleeps second, so a watcher that is already running costs
+# nothing, and a generous ceiling only lengthens the wait on a run that is
+# already going to fail.
 wait_for_file() { # wait_for_file <path> [max-ms]
-  local path="$1" max_ms="${2:-1000}" waited=0
+  local path="$1" max_ms="${2:-$WATCHER_SPAWN_WAIT_MS}" waited=0
   while [ "$waited" -lt "$max_ms" ]; do
     [ -e "$path" ] && return 0
     sleep 0.05
@@ -119,7 +154,7 @@ wait_for_file() { # wait_for_file <path> [max-ms]
 # counted as the first's. That is how case-23 reported "two launches started the
 # watcher 1 time(s)" - the second watcher had not been scheduled yet.
 wait_for_count() { # wait_for_count <path> <min> [max-ms]
-  local path="$1" want="$2" max_ms="${3:-1000}" waited=0 got
+  local path="$1" want="$2" max_ms="${3:-$WATCHER_SPAWN_WAIT_MS}" waited=0 got
   while [ "$waited" -lt "$max_ms" ]; do
     got="$(grep -c . "$path" 2>/dev/null || printf 0)"
     [ "${got:-0}" -ge "$want" ] && return 0
@@ -140,7 +175,7 @@ wait_for_count() { # wait_for_count <path> <min> [max-ms]
 # it — which is what the /dev/null defect looked like from the outside: a
 # watcher that ran, and no record of what it said.
 wait_for_file_content() { # wait_for_file_content <path> <needle> [max-ms]
-  local path="$1" needle="$2" max_ms="${3:-1000}" waited=0
+  local path="$1" needle="$2" max_ms="${3:-$WATCHER_SPAWN_WAIT_MS}" waited=0
   while [ "$waited" -lt "$max_ms" ]; do
     if [ -f "$path" ] && grep -qF -- "$needle" "$path" 2>/dev/null; then
       return 0
@@ -170,7 +205,7 @@ wait_for_file_content() { # wait_for_file_content <path> <needle> [max-ms]
 # inside it.
 assert_one_watcher() { # assert_one_watcher <file> <label>
   local file="$1" label="$2" total
-  wait_for_count "$file" 2 1000 || true
+  wait_for_count "$file" 2 "$WATCHER_SPAWN_WAIT_MS" || true
   total="$(grep -c . "$file" 2>/dev/null || printf 0)"
   if [ "${total:-0}" -ne 1 ]; then
     note "$label: expected exactly 1 watcher, found ${total:-0}"
@@ -1252,7 +1287,7 @@ case_22() {
   # now asserts the watcher IS started, and the poll is what makes the assertion
   # real: an immediate check would report "never started" on a build that works
   # perfectly, 0 times out of 20.
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "cmd_start did not start the state watcher; the marker never appeared" \
          "within the bounded poll, so the launch promised state it never began"
     return
@@ -1294,7 +1329,7 @@ case_23() {
   : >"$FAKE_HERDR_LOG"
   # The first launch's watcher may still be mid-write; wait for it before
   # counting, or the second launch's line is indistinguishable from the first's.
-  wait_for_file "$root/watcher-ran" 1000 || true
+  wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS" || true
   local after_first
   after_first="$(grep -c . "$root/watcher-ran" 2>/dev/null || printf 0)"
   : >"$FAKE_HERDR_LOG"
@@ -1447,7 +1482,7 @@ case_26() { # #75: the watcher is started for the new pane
   assert_rc_zero "$RC"
   # Polled: the watcher is backgrounded, so an immediate check is a deterministic
   # false negative rather than a flake.
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the watcher was never started; a launched pane reports no state" \
          "until somebody runs it by hand"
     return
@@ -1476,7 +1511,7 @@ case_27() { # #75: MCODE_WATCH_AUTOSTART=0 opts out entirely
   # while measuring nothing. The control proves the watcher really does start, so
   # the assertion with the switch present is about the SWITCH.
   run_entrypoint_at "$copy"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "control: the watcher did not run even with autostart enabled, so" \
          "'MCODE_WATCH_AUTOSTART=0 did not run it' would be vacuous"
     return
@@ -1513,7 +1548,7 @@ case_28() { # #75: a watcher that fails to start is a warning, not a failure
 
   run_entrypoint_at "$copy"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the failing watcher was never invoked; this case would pass" \
          "vacuously against an entrypoint that never starts one"
     return
@@ -1563,7 +1598,7 @@ case_29() { # #75: the watcher inherits the label the launch chose, not a litera
 
   run_entrypoint_at "$copy"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the watcher was never started; nothing to assert a label on"
     return
   fi
@@ -1755,7 +1790,7 @@ case_30() { # #84: an adopted pane gets a watcher even though we never launched 
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the event handler did not start a watcher for an adopted minimax-code" \
          "pane. This is issue #84 itself: without a watcher, ${ADOPTED_PANE} shows" \
          "whatever state herdr last saw and never moves again."
@@ -1782,7 +1817,7 @@ case_31() { # #84: a second trigger for a pane that IS watched starts nothing
   export MCODE_WATCH_AUTOSTART=1
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the first event did not start a watcher, so this case would pass" \
          "vacuously against an implementation that never starts one"
     return
@@ -1869,7 +1904,7 @@ case_33() { # #84: the watcher's output goes to a per-pane log, not /dev/null
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "no watcher ran, so there is no output to have been logged"
     return
   fi
@@ -1877,12 +1912,12 @@ case_33() { # #84: the watcher's output goes to a per-pane log, not /dev/null
   # The defect in the issue: output went to /dev/null, so a watcher that died
   # left no trace. The marker is written by the stub's own redirect and would
   # appear even with stdout discarded, so the log has to be checked directly.
-  if ! wait_for_file "$logf" 1000; then
+  if ! wait_for_file "$logf" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the watcher ran but ${logf} does not exist; its output went nowhere" \
          "discoverable, which is the /dev/null defect #84 was filed about"
     return
   fi
-  if ! wait_for_file_content "$logf" "mcode-watch: watching" 1000; then
+  if ! wait_for_file_content "$logf" "mcode-watch: watching" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the per-pane log exists but does not contain what the WATCHER printed;" \
          "a log file the watcher never writes to is no better than /dev/null." \
          "The needle is the stub's own line, not the word 'watching' — the" \
@@ -1921,7 +1956,7 @@ case_34() { # #84: a watcher that has EXITED does not block a new one
   # lock could only answer by keeping a pid file, and the reason a stale pid
   # file used to be able to freeze a pane forever.
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the first event started no watcher, so this case would pass vacuously"
     return
   fi
@@ -1943,7 +1978,7 @@ case_34() { # #84: a watcher that has EXITED does not block a new one
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_count "$root/watcher-ran" 2 1500; then
+  if ! wait_for_count "$root/watcher-ran" 2 "$WATCHER_SPAWN_WAIT_MS"; then
     note "an exited watcher still blocked a new one for ${ADOPTED_PANE};" \
          "a pane whose watcher died stays frozen forever with no error anywhere"
   fi
@@ -1960,7 +1995,7 @@ case_35() { # #84: the launch path and the event path together start ONE watcher
   # The launch path first, exactly as the action does it.
   run_entrypoint_at "$copy"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the launch path started no watcher, so the cross-path assertion below" \
          "would pass vacuously"
     return
@@ -2054,7 +2089,7 @@ case_38() { # #84: a watcher on ONE pane does not suppress another pane
   # rebuilt inside the fix for it. So: one pane watched, a DIFFERENT pane
   # triggered, and the second must still get its own watcher.
   run_event_handler_at "$copy" "wZ:p42" "minimax-code"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the first pane got no watcher, so the per-pane assertion below would" \
          "pass vacuously"
     return
@@ -2066,7 +2101,7 @@ case_38() { # #84: a watcher on ONE pane does not suppress another pane
   fi
 
   run_event_handler_at "$copy" "$SECOND_PANE" "mcode"
-  if ! wait_for_count "$root/watcher-ran" 2 1500; then
+  if ! wait_for_count "$root/watcher-ran" 2 "$WATCHER_SPAWN_WAIT_MS"; then
     note "${ADOPTED_PANE} has a watcher and ${SECOND_PANE} got none; the check is session-wide," \
          "so every pane after the first stays frozen with no error anywhere"
     sed 's/^/          /' "$root/watcher-ran"
@@ -2112,7 +2147,7 @@ case_39() { # #84: a watcher started OUTSIDE ensure_watcher is respected
   # pane_is_watched in bin/mcode-plugin.sh.
   "$root/bin/mcode-watch.sh" "$ADOPTED_PANE" --interval 1 >/dev/null 2>&1 &
   local outsider=$!
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "the hand-started watcher never recorded itself, so this case would" \
          "pass vacuously"
     kill "$outsider" 2>/dev/null
@@ -2163,7 +2198,7 @@ case_40() { # #84: the event path reports under the pane's NAME when it has one
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "no watcher was started, so there is no label to assert on"
     return
   fi
@@ -2195,7 +2230,7 @@ case_40() { # #84: the event path reports under the pane's NAME when it has one
   # is exactly what happened the first time this was written.
   unset FAKE_HERDR_AGENT_NAME
   run_event_handler_at "$copy" "$SECOND_PANE" "minimax-code"
-  if ! wait_for_file_content "$root/watcher-ran" "$SECOND_PANE" 1000; then
+  if ! wait_for_file_content "$root/watcher-ran" "$SECOND_PANE" "$WATCHER_SPAWN_WAIT_MS"; then
     note "an unnamed pane got no watcher; the label is enough to watch a pane," \
          "so the fallback must still start one"
     return
@@ -2244,7 +2279,7 @@ STUB
 
   run_event_handler_at "$copy" "$ADOPTED_PANE" "minimax-code"
   assert_rc_zero "$RC"
-  if ! wait_for_file "$root/watcher-ran" 1000; then
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
     note "a process merely NAMED notmcode-watch.sh suppressed the real watcher" \
          "for ${ADOPTED_PANE}; the check is satisfied by any command line that" \
          "CONTAINS the name, so the pane is never watched at all"
