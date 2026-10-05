@@ -696,13 +696,27 @@ cmd_start() {
   #
   #    --state is `unknown`, and that is the point of the change. An earlier
   #    revision claimed `idle` here, on the reasoning that the pane was just
-  #    created and mcode was still starting. But nothing in the plugin ever
-  #    updates that claim, so it was not a cautious placeholder - it was a
-  #    permanent false one. Measured on 0.9.3: a pane registered `idle` here
-  #    still read `idle` twenty-five seconds later with the MiniMax Code TUI up
-  #    and visibly working, and `herdr agent list` would have shown the lie for
-  #    as long as the pane lived. `unknown` is the only state this process can
-  #    keep true, and it is what Herdr shows for a pane nobody has registered.
+  #    created and mcode was still starting. Measured on 0.9.3, that claim does
+  #    not age well: a pane registered `idle` here still read `idle`
+  #    twenty-five seconds later with the MiniMax Code TUI up and visibly
+  #    working, and `herdr agent list` would have shown the lie for as long as
+  #    the pane lived.
+  #
+  #    What makes `unknown` the right claim is NOT that nothing ever updates it.
+  #    It is that the watcher now does, within seconds: step 10 below
+  #    (watcher_autostart) starts one for every pane we launch, and its first
+  #    act is to classify the screen and report. So this value is a placeholder
+  #    that is corrected almost immediately - and `unknown` is the only claim
+  #    that is true for the short window this process actually owns, where
+  #    `idle` would be a specific, unearned assertion. It is also what Herdr
+  #    shows for a pane nobody has registered.
+  #
+  #    So `unknown` here followed by an accurate state moments later is the
+  #    INTENDED sequence, not an unfinished one. If you ever read a stale state
+  #    on a launched pane, suspect the watcher before the claim: a dead watcher
+  #    freezes whatever was last reported, with no supervisor to notice. Check
+  #    `pgrep -f "mcode-watch.sh <PANE_ID>"`, and re-sync with
+  #    `bin/mcode-watch.sh <PANE_ID>`.
   #
   #    The fix is deliberately NOT "start the watcher so that `idle` becomes
   #    true" (issue #47). bin/mcode-watch.sh called `pane release-agent` from its
