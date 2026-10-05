@@ -864,8 +864,12 @@ FAKEEOF
   export M4_FAKE_JSON=1
   : >"$M4_FAKE_LOG"
 
+  # Run it the way a user and the herdr action do - by its shebang - not through
+  # /bin/sh. The script is bash (`set -o pipefail`), and /bin/sh is dash on Linux,
+  # so the first version of this case died on ubuntu with "Illegal option
+  # -o pipefail" while passing on macOS, where /bin/sh is bash.
   PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
-    /bin/sh "$repo/bin/mcode-plugin.sh" install-hook >"$out" 2>&1
+    "$repo/bin/mcode-plugin.sh" install-hook >"$out" 2>&1
 
   if ! grep -q '^plugin enable herdr-bootstrap@local$' "$M4_FAKE_LOG" 2>/dev/null; then
     note "install-hook never ran 'mcode plugin enable herdr-bootstrap@local'"
@@ -888,7 +892,7 @@ FAKEEOF
   : >"$M4_FAKE_LOG"
   local out2="$WORK/install2.out"
   PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" \
-    /bin/sh "$repo/bin/mcode-plugin.sh" install-hook >"$out2" 2>&1
+    "$repo/bin/mcode-plugin.sh" install-hook >"$out2" 2>&1
   if ! grep -q 'NOT enabled' "$out2" 2>/dev/null; then
     note "mcode reported the plugin disabled and install-hook did not say so"
     note "output: $(head -4 "$out2" | tr '\n' '|')"
