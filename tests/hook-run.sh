@@ -73,12 +73,38 @@ else
   # a comment is a command substitution and bash will try to run it.)
   # M4_PAYLOAD_CWD unset means "payload carries no cwd", which is itself a case
   # worth having: the hook must then fall back to its own working directory.
-  if [ -n "\${M4_PAYLOAD_CWD:-}" ]; then
-    printf '{"session_id":"m4-test","cwd":"%s"}' "\$M4_PAYLOAD_CWD" \
-      | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+  #
+  # THE SESSION ID IS A PARAMETER, NOT A LITERAL, and that only became obvious
+  # once the hook grew a once-guard. A literal would hand every case in this suite
+  # the SAME session id, so the first case to register would leave a marker that
+  # suppressed every case after it — a suite that silently stops testing anything.
+  # And the guard's own case needs two fires of ONE id, which a literal cannot
+  # express at all. The id is derived from the tag, so it is unique per pane,
+  # which is what distinct mcode sessions actually look like.
+  fire_hook() { # fire_hook <session-id>
+    if [ -n "\${M4_PAYLOAD_CWD:-}" ]; then
+      printf '{"session_id":"%s","cwd":"%s"}' "\$1" "\${M4_PAYLOAD_CWD}" \\
+        | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+    else
+      printf '{"session_id":"%s"}' "\$1" \\
+        | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+    fi
+  }
+  if [ "\${3:-}" = "twice" ]; then
+    # ONE session, two SessionStart events. Measured, not hypothetical: the
+    # authorised run registered pane wT:p8J twice, 5m25s apart, both hook
+    # processes parented by the same mcode process. This is the shape the
+    # once-guard exists for, and the suite has to be able to produce it.
+    fire_hook "m4-twice"
+    fire_hook "m4-twice"
+  elif [ "\${3:-}" = "two-sessions" ]; then
+    # TWO sessions in ONE pane. The control for the case above: a guard keyed on
+    # the session must not suppress this, and neither must a guard keyed on the
+    # pane or on "have we reported at all".
+    fire_hook "m4-session-a"
+    fire_hook "m4-session-b"
   else
-    printf '{"session_id":"m4-test"}' \
-      | HERDR_BIN_PATH="$STUB" /usr/bin/env bash "$HOOK" SessionStart
+    fire_hook "m4-\$1"
   fi
 fi
 EOF
@@ -93,6 +119,33 @@ note() { broke=1; printf '        %s\n' "$*"; }
 export FAKE_HOOK_LOG="$WORK/calls.log"
 export FAKE_HOOK_FIXTURE="$WORK/fixture.json"
 : >"$FAKE_HOOK_LOG"
+
+# Isolate the hook's DURABLE LOG, and do it once, for the whole suite.
+#
+# The hook writes to "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap".
+# Six places here run the hook. Two are the durable-log cases, which pass their own
+# MINIMAX_DATA_DIR through `env -i`. The other FOUR inherited the developer's real
+# $HOME: the stand-in pane shell's heredoc below — which is how most cases reach the
+# hook, so it is the largest contributor — and the direct call sites at 352, 428 and
+# 432. That was measured, not assumed: on a machine where this suite had been run
+# three times, 48 of the 54 fires in that developer's REAL
+# ~/.minimax/state/herdr-bootstrap/hook.log were this suite — fake panes w1:p1,
+# w1:real, w3:real — and all 21 refusals in the file belonged to it too.
+#
+# That file is the only record of what a real session's hook did (issue #126
+# turns on reading it), so a suite that writes into it destroys the evidence it
+# exists to produce. It is the same state-isolation rule this file already
+# applies to HERDR_SOCKET_PATH above, for the same reason.
+#
+# Exported rather than passed per call site, so a case added later inherits the
+# isolation instead of having to remember it. tests/e2e/run.sh had the same gap.
+#
+# No `mkdir -p` here, and deliberately so: the hook's own dlog does it. A guard that
+# dereferenced this variable would abort the whole suite under `set -u` the moment
+# anyone removed the export — taking the case that exists to catch that removal with
+# it. Verified by mutation: with the export removed, this suite now fails on
+# suite-env-isolates-the-durable-log instead of dying before it gets there.
+export MINIMAX_DATA_DIR="$WORK/minimax-data"
 
 # Simulate the environment mcode actually gives a hook. This is not cosmetic: run
 # from inside a herdr pane, the suite would otherwise hand the hook a live
@@ -181,6 +234,26 @@ run_case() { # run_case <name> <function>
   CURRENT_CASE="$1"
   CASES_RUN=$((CASES_RUN + 1))
   broke=0
+  # Each case starts as if no session had ever reported.
+  #
+  # The hook's once-guard persists one marker per session id, and several cases
+  # reuse the same pane tag — so the session id, and therefore the marker, is the
+  # same across them. Without this reset the first case to use a tag would suppress
+  # every later case reusing it. That failure mode is the dangerous one: the suite
+  # goes quietly blind on the cases after the first rather than red, and a guard
+  # whose own test harness can be silently defeated by it is not much of a guard.
+  #
+  # NO-OP WHEN MINIMAX_DATA_DIR IS UNSET, and that is load-bearing rather than tidiness.
+  # This line is an `rm -rf`, and the export above is exactly what #130 and #131 exist
+  # to catch being removed. Written with the usual ${VAR:-$HOME/...} fallback it would
+  # resolve to the REAL ~/.minimax, so the very mutation those PRs guard against would
+  # delete a maintainer's once-guard marker store. Found by m7 in review, and it is the
+  # worst defect in this PR precisely because it can only fire while testing the fix:
+  # a green run never reaches it, and the mutation run reaches it exactly when the
+  # export is gone.
+  if [ -n "${MINIMAX_DATA_DIR:-}" ]; then
+    /bin/rm -rf "$MINIMAX_DATA_DIR/state/herdr-bootstrap/reported" 2>/dev/null
+  fi
   "$2"
   if [ "$broke" -eq 0 ]; then
     printf 'ok    %s\n' "$CURRENT_CASE"
@@ -414,6 +487,95 @@ case_reports_once_with_the_shared_source() {
   fi
   if ! grep -q -- '--state idle' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the bootstrap report should be --state idle; a session has just started"
+  fi
+}
+
+# ONE fire, ONE report — which is what case_reports_once_with_the_shared_source
+# already proves, and it is a DIFFERENT claim from this one. That case asserts
+# one fire yields one report. This asserts that a SECOND fire of the SAME session
+# yields no report at all, which is the claim the hook's own header makes and,
+# before the once-guard, the hook did not keep.
+#
+# The input is measured, not invented. In the authorised run, pane wT:p8J was
+# registered twice — 16:30:52 by hook pid 18615 and 16:36:17 by hook pid 84070 —
+# and both hook processes were parented by the same mcode process (the chains end
+# ... 27434 14173 710 in both cases). One session, one mcode process, two
+# SessionStart events, two registrations of one pane. That is the two-writers-on-
+# one-field situation the header says the design prevents, happening anyway.
+case_one_report_per_session_across_repeated_sessionstart() {
+  local pid n
+  spawn_pane alpha twice
+  pid="$(pane_pid alpha)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+  write_fixture "$(jq -nc --arg sa "$WORK/alpha.sock" --argjson pid "$pid" \
+    '{sessions:[{name:"alpha",socket:$sa,running:true,panes:[{pane_id:"w1:p1",shell_pid:$pid,fg_pgid:0,fg_pids:[]}]}]}')"
+  reset_log
+  release_pane alpha
+
+  n="$(report_calls)"
+  if [ "$n" != "1" ]; then
+    note "two SessionStart events for ONE session produced $n reports, expected 1"
+    note "the hook re-reported a pane the watcher already owns; that is the fight"
+    note "the absence of a Stop handler exists to prevent"
+    note "log: $(calls_digest)"
+  fi
+}
+
+# THE CONTROL for the case above, and the one that keeps the guard honest.
+#
+# A guard that suppressed on "this pane has been reported" or on "we have reported
+# at all" would pass the case above while being wrong: it would swallow the
+# registration of a genuinely different session, and the pane would sit unregistered
+# with nothing to show for it. Two sessions in one pane must both report.
+case_two_sessions_in_one_pane_both_report() {
+  local pid n
+  spawn_pane alpha two-sessions
+  pid="$(pane_pid alpha)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+  write_fixture "$(jq -nc --arg sa "$WORK/alpha.sock" --argjson pid "$pid" \
+    '{sessions:[{name:"alpha",socket:$sa,running:true,panes:[{pane_id:"w1:p1",shell_pid:$pid,fg_pgid:0,fg_pids:[]}]}]}')"
+  reset_log
+  release_pane alpha
+
+  n="$(report_calls)"
+  if [ "$n" != "2" ]; then
+    note "two DIFFERENT sessions in one pane produced $n reports, expected 2"
+    note "the once-guard must be keyed on the session; keyed on the pane or on"
+    note "'have we reported', it would swallow a real session's registration"
+    note "log: $(calls_digest)"
+  fi
+}
+
+# THE FAIL-OPEN ARM, and the one that matters most, because it is the difference
+# between a guard and a way of losing sessions.
+#
+# A refused registration MUST release the claim. If it did not, one transient
+# herdr refusal would mark the session as reported-forever, every later fire would
+# log "already reported once", and the pane would sit unregistered with a log that
+# actively explains the wrong thing. Reporting twice is recoverable; never
+# reporting and saying why you did not is not.
+#
+# So: two fires of ONE session against a herdr that refuses every report. Both
+# attempts must reach herdr. The stub models the refusal deliberately — every
+# other report it answers succeeds, which would leave this untestable.
+case_a_refused_registration_is_retried_not_suppressed() {
+  local pid n
+  export FAKE_HOOK_FAIL="report-agent"
+  spawn_pane alpha twice
+  pid="$(pane_pid alpha)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; unset FAKE_HOOK_FAIL; return; fi
+  write_fixture "$(jq -nc --arg sa "$WORK/alpha.sock" --argjson pid "$pid" \
+    '{sessions:[{name:"alpha",socket:$sa,running:true,panes:[{pane_id:"w1:p1",shell_pid:$pid,fg_pgid:0,fg_pids:[]}]}]}')"
+  reset_log
+  release_pane alpha
+  unset FAKE_HOOK_FAIL
+
+  n="$(report_calls)"
+  if [ "$n" != "2" ]; then
+    note "two fires of one session against a REFUSING herdr made $n report attempts, expected 2"
+    note "a refused attempt must release its claim, or one transient refusal hides"
+    note "the session permanently while the log claims it was already reported"
+    note "log: $(calls_digest)"
   fi
 }
 
@@ -1162,10 +1324,53 @@ FAKEEOF
   fi
 }
 
+# The suite must not write into the DEVELOPER's real durable log.
+#
+# The hook writes to "${MINIMAX_DATA_DIR:-$HOME/.minimax}/state/herdr-bootstrap". Any case
+# that runs the hook without its own MINIMAX_DATA_DIR therefore writes into the machine
+# owner's real ~/.minimax. That was measured rather than assumed: on this repo's own
+# machine, 48 of the 54 fires in the real hook.log belonged to THIS SUITE — fake panes
+# w1:p1, w1:real, w3:real — along with all 21 refusals in the file.
+#
+# It matters because that file is the only record of what a real session's hook did;
+# issue #126 is decided by reading it. A suite that fills it with fixtures destroys the
+# evidence it exists to produce.
+#
+# This asserts the AMBIENT environment rather than passing its own, on purpose. The two
+# durable-log cases above already prove the hook writes where it is told; what can rot is
+# a call site added later that forgets. Ambient isolation is inherited, per-call-site
+# isolation has to be remembered, and what has to be remembered is what gets forgotten.
+case_suite_env_isolates_the_durable_log() {
+  local logf
+  if [ -z "${MINIMAX_DATA_DIR:-}" ]; then
+    note "MINIMAX_DATA_DIR is unset; every hook run here writes to the real \$HOME/.minimax"
+    return
+  fi
+  logf="$MINIMAX_DATA_DIR/state/herdr-bootstrap/hook.log"
+  /bin/rm -f "$logf" 2>/dev/null
+
+  # A fixture with no panes at all, so the hook refuses and registers nothing. The
+  # assertion is only that it got as far as writing its log.
+  write_fixture '{"sessions":[{"name":"ambient","socket":"'"$WORK"'/ambient.sock","running":true,"panes":[]}]}'
+  reset_log
+  (
+    cd "$WORK" || exit 1
+    printf '%s' "{\"session_id\":\"ambient\",\"cwd\":\"$WORK\"}" |
+      HERDR_BIN_PATH="$STUB" /bin/bash "$HOOK" SessionStart
+  ) >/dev/null 2>&1 || true
+  reset_log
+
+  if [ ! -f "$logf" ]; then
+    note "a hook run with the suite's own environment wrote no log to $logf"
+    note "the hook resolved its log path somewhere else — most likely the real \$HOME"
+  fi
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
   hook-writes-a-durable-log-when-it-registers-nothing:case_hook_writes_a_durable_log_even_when_it_registers_nothing
+  suite-env-isolates-the-durable-log:case_suite_env_isolates_the_durable_log
   manifest-command-uses-braced-plugin-root:case_manifest_command_uses_the_braced_plugin_root
   manifest-command-actually-executes:case_manifest_command_actually_executes
   pane-is-found-by-ancestry-not-cwd:case_pane_is_found_by_ancestry_not_cwd
@@ -1174,6 +1379,9 @@ CASES=(
   unproven-pane-refuses-and-reports-nothing:case_unproven_pane_refuses_and_reports_nothing
   never-releases-a-registration:case_never_releases_a_registration
   reports-once-with-the-shared-source:case_reports_once_with_the_shared_source
+  one-report-per-session-across-repeated-sessionstart:case_one_report_per_session_across_repeated_sessionstart
+  two-sessions-in-one-pane-both-report:case_two_sessions_in_one_pane_both_report
+  a-refused-registration-is-retried-not-suppressed:case_a_refused_registration_is_retried_not_suppressed
   survives-a-missing-herdr-and-bad-json:case_survives_a_missing_herdr_and_bad_json
   foreground-process-is-an-anchor:case_foreground_process_is_an_anchor
   scan-stops-at-a-definitive-match:case_scan_stops_at_a_definitive_match

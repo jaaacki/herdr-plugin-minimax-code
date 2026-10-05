@@ -388,6 +388,14 @@ unset HERDR_SOCKET_PATH
 # ...and HERDR_SESSION, for the same reason: it would silently retarget every
 # `herdr --session` call at a different server than the one this suite starts.
 unset HERDR_SESSION
+# The hook's durable log lives under ${MINIMAX_DATA_DIR:-$HOME/.minimax}. Isolated here
+# for the same reason XDG_CONFIG_HOME is above: this suite runs the hook for real, and a
+# runner's $HOME is not a place to write. On a developer's machine it is worse than
+# untidy — that file is the only record of what a REAL session's hook did, and issue #126
+# is decided by reading it. Measured on this repo's own machine: 48 of the 54 fires in
+# the real hook.log were test runs, not sessions. Exported once, so the call site below
+# inherits the isolation rather than having to remember it.
+export MINIMAX_DATA_DIR="$WORKDIR/minimax-data"
 HERDR_CONFIG_DIR="$E2E_XDG_ROOT/herdr"
 # XDG_CONFIG_HOME does not move herdr's plugin state dir, which stays under the
 # developer's real ~/.local/state, so watcher logs from this run landed there
@@ -1671,6 +1679,37 @@ STANDIN
   # with an anchored `pgrep` and then spawns, which is check-then-act; two
   # registrations landing together can both pass the check. Filed separately with
   # the evidence rather than absorbed here.
+
+  # THE MINIMAX_DATA_DIR EXPORT IS ASSERTED HERE, NOT ASSUMED.
+  #
+  # This suite runs the hook for real — the call above is the only place in the whole
+  # repo that drives it against a real herdr. So if the export near the top of this
+  # file were deleted, the hook would resolve its durable log through
+  # ${MINIMAX_DATA_DIR:-$HOME/.minimax}, write it into the developer's real ~/.minimax,
+  # and this suite would stay GREEN: nothing here reads that file, and everything this
+  # case asserts is about the pane.
+  #
+  # That is not hypothetical. On this repo's own machine, 48 of the 54 fires in a real
+  # user's hook.log were test runs, along with all 21 refusals in it — and the export
+  # that prevents it was, for a while, an unprotected-correct line. Correct and
+  # unwatched is the one state where "inherited isolation cannot rot" does not hold:
+  # nothing here would notice it rotting, so nothing here has to notice it rotting.
+  # tests/hook-run.sh carries a case for its own copy of the export; this is the one
+  # for this file's.
+  if [ -z "${MINIMAX_DATA_DIR:-}" ]; then
+    fail "$name" "MINIMAX_DATA_DIR is unset, so the hook above wrote into the real \$HOME/.minimax" \
+      "this suite must export it before any case runs the hook; without it the run" \
+      "this suite just performed is the thing that pollutes a maintainer's log"
+    return
+  fi
+  local dlogf="$MINIMAX_DATA_DIR/state/herdr-bootstrap/hook.log"
+  if [ ! -f "$dlogf" ]; then
+    fail "$name" "the hook wrote no durable log to $dlogf" \
+      "the hook logs unconditionally on every fire, and this case has already proved" \
+      "the hook ran by watching the pane register, so an absent log means the write" \
+      "went somewhere other than where this suite pointed it"
+    return
+  fi
   pass "$name"
 }
 
