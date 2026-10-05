@@ -224,9 +224,14 @@ case_handler_is_our_command_script() {
   if [ "$(jq -r '.hooks.SessionStart[0].hooks[0].type' "$MANIFEST" 2>/dev/null)" != "command" ]; then
     note "handler type is not \"command\"; mcode rejects other handler kinds outside CLAUDE format"
   fi
+  # Anchored on the plugin root, in the BRACED form mcode actually substitutes.
+  # This assertion used to require the literal substring CLAUDE_PLUGIN_ROOT, which
+  # both pinned the bug (unbraced, and Claude's name rather than mcode's) and would
+  # have rejected the fix. Intent is "resolves the hook through the plugin root";
+  # the spelling that satisfies it is the one mcode honours.
   case "$cmd" in
-    *CLAUDE_PLUGIN_ROOT*) : ;;
-    *) note "command is not anchored on \$CLAUDE_PLUGIN_ROOT; measured cwd is the project dir" ;;
+    *'${PLUGIN_ROOT}'*|*'${CLAUDE_PLUGIN_ROOT}'*) : ;;
+    *) note "command is not anchored on a braced \${PLUGIN_ROOT}; measured cwd is the project dir" ;;
   esac
 }
 
@@ -507,7 +512,125 @@ case_install_never_uses_a_bare_rm() {
   fi
 }
 
-# 12. The manifest's command ACTUALLY RUNS. Not "looks right" — executed.
+# 12. The manifest's command uses the BRACED plugin-root reference, not a bare $VAR.
+#
+#     This is the case that would have caught the real-machine failure, and it exists
+#     because the case BELOW could not. That one runs the manifest's command for real,
+#     which sounds strictly stronger — and it passed the whole time the shipped hook
+#     never fired once. The reason is in its own second line: it exports
+#     CLAUDE_PLUGIN_ROOT="$repo/mcode-plugin" into the environment before running the
+#     command. So it supplies, by hand, the one variable whose absence is the bug.
+#
+#     What mcode actually does (measured by m3, and confirmed against mcode's bundle):
+#     the hook environment carries PLUGIN_ROOT, and mcode text-substitutes the BRACED
+#     literals ${PLUGIN_ROOT} / ${CLAUDE_PLUGIN_ROOT} in manifest strings. A bare
+#     $CLAUDE_PLUGIN_ROOT is not substituted and is not in the environment, so it
+#     expands to the empty string with no error, and the command degenerates to
+#     `bash "/hooks/herdr-bootstrap.sh"` -> exit 127, stderr swallowed by the TUI.
+#     That is the whole failure: an enabled, loaded, correct plugin that never ran.
+#
+#     So this case grades the STRING, because the string is the contract. It cannot be
+#     checked by running the command, since running the command requires supplying the
+#     variable and thereby hiding the defect.
+case_manifest_command_uses_the_braced_plugin_root() {
+  local cmd bare
+  cmd="$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$MANIFEST" 2>/dev/null)"
+  if [ -z "$cmd" ] || [ "$cmd" = "null" ]; then
+    note "no SessionStart command in the manifest"
+    return
+  fi
+
+  # Strip every properly braced reference first, so what remains is only the BARE
+  # ones. Checking for `$PLUGIN_ROOT` with a plain substring test would flag the
+  # correct `${PLUGIN_ROOT}` too, and a test that fails on the right answer is worse
+  # than no test.
+  bare="$(printf '%s' "$cmd" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\}//g')"
+  if printf '%s' "$bare" | grep -qE '\$(CLAUDE_)?PLUGIN_ROOT'; then
+    note "the manifest command uses an UNBRACED plugin root; mcode substitutes only the"
+    note "braced literal, so this expands to the empty string and the hook never runs"
+    note "offending: $(printf '%s' "$cmd" | grep -oE '\$(CLAUDE_)?PLUGIN_ROOT[^ "]*' | head -2 | tr '\n' ' ')"
+    note "use \${PLUGIN_ROOT}/... — that is the form mcode text-substitutes"
+  fi
+
+  # And the positive half, so the check above cannot pass by having no reference at
+  # all. A manifest that stopped pointing at the plugin root would also run nothing.
+  if ! printf '%s' "$cmd" | grep -qE '\$\{(CLAUDE_)?PLUGIN_ROOT\}'; then
+    note "the manifest command has no braced \${PLUGIN_ROOT}; it must reference the"
+    note "plugin root explicitly, or the hook path cannot resolve"
+  fi
+}
+
+# 14. A run that registers NOTHING still leaves evidence behind.
+#
+#     This is the case the whole durable log exists for. The 2026-10-05 real-machine
+#     run registered nothing and produced no evidence anywhere: the TUI swallowed the
+#     hook's stderr, so "the hook never ran" and "the hook ran and failed" were the
+#     same observation. A diagnostic that only appears on success is not a diagnostic.
+#
+#     So this drives a run that REFUSES — no pane can be proven — and requires that
+#     the refusal and the exit code are both on disk afterwards.
+case_hook_writes_a_durable_log_even_when_it_registers_nothing() {
+  local dlog_dir="$WORK/dlog" logf rc
+  mkdir -p "$dlog_dir" 2>/dev/null
+  logf="$dlog_dir/state/herdr-bootstrap/hook.log"
+
+  rc=0
+  (
+    cd "$WORK" || exit 1
+    printf '%s' "{\"session_id\":\"dlog\",\"cwd\":\"$WORK\"}" |
+      env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+        MINIMAX_DATA_DIR="$dlog_dir" HERDR_BIN_PATH="$STUB" \
+        /bin/bash "$HOOK" SessionStart
+  ) >/dev/null 2>&1 || rc=$?
+
+  if [ ! -f "$logf" ]; then
+    note "no durable log at $logf"
+    note "a run that registers nothing must still be diagnosable after the fact"
+    return
+  fi
+  if ! grep -q 'hook fired' "$logf" 2>/dev/null; then
+    note "the durable log has no 'hook fired' line: $(head -2 "$logf" | tr '\n' '|')"
+  fi
+  # The exit code is the line that separates "ran and refused" from "was killed"
+  # from "never started". Without it the file cannot answer the question it exists
+  # to answer.
+  if ! grep -q 'exit=' "$logf" 2>/dev/null; then
+    note "the durable log has no exit-code line; exit=$rc should be recorded"
+  fi
+
+  # BOUNDED. Pre-fill past the cap and require the next run to trim rather than grow
+  # without limit. A diagnostic that can fill someone's disk is a leak, and a leak on
+  # a machine that runs this hook on every session is a slow one.
+  local cap
+  cap="$(sed -n 's/^DLOG_MAX_BYTES=\([0-9]*\).*/\1/p' "$HOOK" | head -1)"
+  case "$cap" in '' | *[!0-9]*) cap=65536 ;; esac
+  if [ "$cap" -gt 0 ]; then
+    local i line
+    : > "$logf"
+    i=0
+    while [ "$i" -lt "$cap" ]; do
+      line="padding line $i ----------------------------------------------------------------"
+      printf '%s\n' "$line" >> "$logf"
+      i=$((i + 1))
+    done
+    (
+      cd "$WORK" || exit 1
+      printf '%s' "{\"session_id\":\"dlog\",\"cwd\":\"$WORK\"}" |
+        env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+          MINIMAX_DATA_DIR="$dlog_dir" HERDR_BIN_PATH="$STUB" \
+          /bin/bash "$HOOK" SessionStart
+    ) >/dev/null 2>&1 || true
+
+    local sz
+    sz="$(wc -c < "$logf" 2>/dev/null || echo 0)"
+    case "$sz" in '' | *[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "$cap" ]; then
+      note "the durable log is $sz bytes against a $cap cap; it must be trimmed, not grown"
+    fi
+  fi
+}
+
+# 15. The manifest's command ACTUALLY RUNS. Not "looks right" — executed.
 #
 #     This case exists because a manifest that parses is not a working hook, which
 #     is the Epic 1 defect this repo exists to end, and because it caught a real
@@ -532,12 +655,30 @@ case_manifest_command_actually_executes() {
     '{sessions:[{name:"alpha",socket:$sa,running:true,panes:[{pane_id:"w1:p1",shell_pid:999999,fg_pgid:0,fg_pids:[]}]}]}')"
   reset_log
 
+  # Emulate what mcode does to the command string, rather than guessing at it.
+  #
+  # mcode text-substitutes the BRACED literal ${PLUGIN_ROOT} with the content-addressed
+  # cache directory, and hands the hook an environment carrying PLUGIN_ROOT. This test
+  # used to do neither: it exported CLAUDE_PLUGIN_ROOT by hand and ran the string as
+  # written. That is why it stayed green through an entire release in which the hook
+  # never fired once — it supplied, from the test harness, the exact variable whose
+  # absence was the bug. Running the command for real is worth nothing if the harness
+  # repairs the command before it runs.
+  local resolved
+  resolved="$(printf '%s' "$cmd" | sed -e "s#\${PLUGIN_ROOT}#$repo/mcode-plugin#g" \
+                                      -e "s#\${CLAUDE_PLUGIN_ROOT}#$repo/mcode-plugin#g")"
+
   rc=0
   (
     cd "$WORK" || exit 1
-    CLAUDE_PLUGIN_ROOT="$repo/mcode-plugin" \
+    # PLUGIN_ROOT only — that is what m3 measured in a live hook's environment.
+    # CLAUDE_PLUGIN_ROOT is deliberately NOT exported: it is Claude's name, mcode
+    # does not set it, and exporting it here is precisely what let this case pass
+    # green against a manifest that never fires. With it absent, the unbraced form
+    # reproduces the real exit 127 and this case fails, which is the point.
+    PLUGIN_ROOT="$repo/mcode-plugin" \
       HERDR_BIN_PATH="$STUB" \
-      /usr/bin/env bash -c "$cmd"
+      /usr/bin/env bash -c "$resolved"
   ) >/dev/null 2>"$WORK/cmd-stderr" || rc=$?
 
   if [ "$rc" != "0" ]; then
@@ -1024,6 +1165,8 @@ FAKEEOF
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
+  hook-writes-a-durable-log-when-it-registers-nothing:case_hook_writes_a_durable_log_even_when_it_registers_nothing
+  manifest-command-uses-braced-plugin-root:case_manifest_command_uses_the_braced_plugin_root
   manifest-command-actually-executes:case_manifest_command_actually_executes
   pane-is-found-by-ancestry-not-cwd:case_pane_is_found_by_ancestry_not_cwd
   nearest-ancestor-wins:case_nearest_ancestor_wins

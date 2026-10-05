@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/env bash \"$CLAUDE_PLUGIN_ROOT/hooks/herdr-bootstrap.sh\" SessionStart",
+            "command": "/usr/bin/env bash \"${PLUGIN_ROOT}/hooks/herdr-bootstrap.sh\" SessionStart",
             "timeout": 10
           }
         ]
