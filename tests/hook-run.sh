@@ -929,7 +929,11 @@ FAKEEOF
   if ! grep -q 'mcode plugin enable herdr-bootstrap@local' "$out2" 2>/dev/null; then
     note "install-hook did not name the command that would fix it"
   fi
-  unset M4_FAKE_ENABLED
+  # Every variable this case exported is cleared, not just the one it happened to
+  # be using last. The cases share one process, so a var left set here is a var
+  # the NEXT case inherits - and it fails then, for a reason nobody can see from
+  # the case that broke. m3 caught M4_FAKE_JSON surviving exactly this way.
+  unset M4_FAKE_LOG M4_FAKE_JSON M4_FAKE_ENABLED
 }
 
 # 20. uninstall-hook takes the plugin back OFF this machine.
@@ -983,6 +987,26 @@ FAKEEOF
     note "uninstall-hook removed a NEIGHBOURING plugin; it must touch only its own"
   fi
   unset M4_FAKE_LOG
+
+  # The guard has to be one that CAN fail. uninstall-hook used to check the path
+  # string, which is built from the expected string two lines earlier, so the check
+  # could never fire and everyone - including me - read it as the thing preventing
+  # a wrong removal. What can be wrong is the CONTENT. A directory at our path that
+  # is non-empty and holds no manifest is not ours, and removing it is the accident
+  # that would matter. So: seed exactly that, and require a refusal.
+  local foreign="$WORK/foreigndata"
+  mkdir -p "$foreign/plugins/herdr-bootstrap" 2>/dev/null
+  printf 'someone elses files\n' >"$foreign/plugins/herdr-bootstrap/important.txt" 2>/dev/null
+  local out3="$WORK/uninstall3.out" rc3=0
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$foreign" \
+    "$repo/bin/mcode-plugin.sh" uninstall-hook >"$out3" 2>&1 || rc3=$?
+  if [ "$rc3" -eq 0 ]; then
+    note "uninstall-hook removed a non-empty directory that is not this plugin's"
+    note "and exited 0; the content guard is not doing anything"
+  fi
+  if [ ! -e "$foreign/plugins/herdr-bootstrap/important.txt" ]; then
+    note "uninstall-hook deleted a directory it did not own; the guard must refuse"
+  fi
 }
 
 CASES=(

@@ -155,6 +155,12 @@ So the installer **fails** if the plugin does not end up enabled, and prints the
 `mcode plugin list` line as the evidence. That is deliberate: a half-install that
 reports success moves the failure from install time — one clear line and a fixable
 command — to session time, where it is indistinguishable from `mcode` being broken.
+
+It also fails when `mcode` is **not on `PATH`** at all, for the same reason: the
+plugin exists to serve `mcode`, and reporting success for a hook nothing can run is
+the same lie one level up. This is a contract change for headless boxes and build
+agents that install first and run `mcode` later — on such a box, install now exits
+non-zero and the plugin must be enabled by hand before use.
 If you want it gone again:
 
 ```bash

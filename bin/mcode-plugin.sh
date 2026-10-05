@@ -1056,14 +1056,22 @@ cmd_uninstall_hook() {
   fi
 
   # mcode normally removes the directory itself. If it is still there — mcode
-  # absent, or the remove failed — take it down here, under the same exact-path
-  # guard as the installer. The path is a fixed literal under a fixed root, and
-  # /bin/rm is required: never a bare `rm`, never a trash can (issue #109).
+  # absent, or the remove failed — take it down here, using /bin/rm: never a bare
+  # `rm` and never a trash can (issue #109).
+  #
+  # The guard is on CONTENT, not on the path string, and that is deliberate. A
+  # `case "$dest" in "$dest_root"/herdr-bootstrap)` guard here CANNOT fail: dest is
+  # built from that exact string two lines up, so the arm is unreachable, and every
+  # reader — including me — would go on believing the safety lives in the check. A
+  # check that cannot fail is the same disease as a test that cannot fail, and this
+  # repo has spent the week enforcing the second one. What can actually be wrong is
+  # what is IN the directory: a non-empty directory at our path that does not carry
+  # this plugin's manifest is somebody else's, and deleting it is the accident that
+  # would matter. An empty directory is removed without ceremony.
   if [ -e "$dest" ]; then
-    case "$dest" in
-      "$dest_root"/herdr-bootstrap) : ;;
-      *) die "refusing to remove $dest: it is not the expected install path." ;;
-    esac
+    if [ -n "$(ls -A "$dest" 2>/dev/null)" ] && [ ! -f "$dest/.claude-plugin/plugin.json" ]; then
+      die "refusing to remove $dest: it is not empty and holds no .claude-plugin/plugin.json, so it is not this plugin's directory."
+    fi
     /bin/rm -rf "$dest" || die "cannot remove $dest."
     log "minimax-code: removed the leftover plugin directory at $dest."
   fi
