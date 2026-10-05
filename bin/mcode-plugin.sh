@@ -243,15 +243,12 @@ ere_escape() { # ere_escape <string>
 #   * Requiring the separator to be whitespace or `/` also stops a watcher on
 #     `wZ:p80` from being counted as a watcher on `wZ:p8`.
 #
-# # ponytail: two hooks arriving in the same instant can BOTH pass this check
-# and both start a watcher, because there is nothing atomic about it. The old
-# lock was atomic and blind; this is accurate and racy. The race is accepted:
-# transitions on a pane are sparse (measured: three identical re-reports of one
-# state produce zero events), and a duplicate watcher only re-reports states the
-# original is already reporting, because mcode-watch.sh is transition-only. The
-# cost of closing the race properly - an atomic claim - is a lock file again,
-# which is the thing that was blind. One watcher per start path, no state file
-# to go stale, and a narrow duplicate window, is the trade.
+# Two calls in the same instant both pass this check. The launch path and the
+# event hook, or two hooks, can each observe "no watcher" and each spawn.
+# Measured on this function as it stood: forty paired ensure-watcher calls on
+# one pane started two watchers forty times (issue #120). pgrep stays the
+# source of truth for a watcher that is already running, including one started
+# by hand. The spawn itself is closed by acquire_watcher_claim below.
 pane_is_watched() { # pane_is_watched <pane-id>
   local pane pattern
   pane="$(ere_escape "$1")"
@@ -267,6 +264,106 @@ pane_is_watched() { # pane_is_watched <pane-id>
   # reason it is worth spelling out.
   pattern="(^|[[:space:]/])mcode-watch\\.sh[[:space:]]+${pane}([[:space:]]|\$)"
   pgrep -f "$pattern" >/dev/null 2>&1
+}
+
+# A spawn-window claim. mkdir is the atomic primitive: two callers cannot both
+# create the same directory. The directory holds this process's pid and nothing
+# else, and it is removed once the child is visible to pgrep or has already
+# exited. It is not a lifetime lock.
+#
+# A lifetime lock was tried and removed. It recorded only the watchers this
+# code started, so it was blind to a 0.4.1 watcher and to the hand-run
+# `mcode-watch.sh <pane> --interval 1` the README tells a user to start, and a
+# stale pid froze the pane after the watcher died. pgrep still answers "is a
+# watcher running". This directory answers only "is someone in the middle of
+# starting one", which is the gap pgrep cannot see.
+#
+# The pid is written so a claimer that died between mkdir and release can be
+# told from one that is still spawning. A live pid is left alone. A dead pid is
+# reclaimed by renaming the directory aside — mv of one directory on one
+# filesystem is atomic — and mkdir'ing it again. The winner re-reads the pid
+# and spawns only if it still says this process, so two reclaimers cannot both
+# spawn.
+
+claim_pid_alive() { # claim_pid_alive <pid>
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$1" 2>/dev/null || return 1
+  return 0
+}
+
+watcher_claim_owned() { # watcher_claim_owned <dir>
+  local owner
+  owner="$(cat "$1/pid" 2>/dev/null || true)"
+  owner="${owner%%$'\n'*}"
+  if [ "$owner" = "$$" ]; then
+    return 0
+  fi
+  return 1
+}
+
+release_watcher_claim() { # release_watcher_claim <dir>
+  local dir="${1:-}"
+  [ -n "$dir" ] || return 0
+  [ -d "$dir" ] || return 0
+  # Only the pid file this code wrote. rmdir then refuses a directory that
+  # holds anything else, which is the behaviour we want.
+  /bin/rm -f -- "$dir/pid" 2>/dev/null || true
+  rmdir -- "$dir" 2>/dev/null || true
+}
+
+acquire_watcher_claim() { # acquire_watcher_claim <dir> — 0 when this process owns it
+  local dir="$1" i=0 owner="" stale=""
+  if mkdir -- "$dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$dir/pid" 2>/dev/null || true
+    if watcher_claim_owned "$dir"; then
+      return 0
+    fi
+  fi
+  # The winner writes its pid immediately. An empty claim is either that write
+  # still in flight, or a claimer that died before it. Wait before stealing.
+  #
+  # If the directory disappears during the wait, the winner finished and
+  # released the claim. Taking it now and spawning is how the second caller
+  # starts a second watcher: it lost the mkdir, then the winner's child became
+  # visible and the claim was removed before this loop read the pid. A missing
+  # claim is not a stale one. Leave it, and let pgrep answer the next event.
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if [ ! -d "$dir" ]; then
+      return 1
+    fi
+    owner="$(cat "$dir/pid" 2>/dev/null || true)"
+    owner="${owner%%$'\n'*}"
+    if [ -n "$owner" ]; then
+      break
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if [ ! -d "$dir" ]; then
+    return 1
+  fi
+  if [ "$owner" = "$$" ]; then
+    return 0
+  fi
+  if claim_pid_alive "$owner"; then
+    return 1
+  fi
+  stale="${dir}.stale.$$"
+  if ! mv -- "$dir" "$stale" 2>/dev/null; then
+    return 1
+  fi
+  /bin/rm -f -- "$stale/pid" 2>/dev/null || true
+  rmdir -- "$stale" 2>/dev/null || true
+  if mkdir -- "$dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$dir/pid" 2>/dev/null || true
+    if watcher_claim_owned "$dir"; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
 # ensure_watcher - THE spawn path. Starts bin/mcode-watch.sh for a pane, at
@@ -286,7 +383,7 @@ pane_is_watched() { # pane_is_watched <pane-id>
 # name is the literal `mcode` and both spellings produce the same string.
 ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
   local pane="$1" agent_name="$2" launch_line="${3:-}"
-  local dir watcher logdir log lock
+  local dir watcher logdir log claim="" claim_root="" child="" i=0
 
   if ! valid_pane_id "$pane"; then
     [ -n "$launch_line" ] && log "minimax-code: refused to start a watcher for $(printf '%q' "$pane"): not a pane id."
@@ -358,6 +455,35 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
     return 0
   fi
 
+  # Close the gap between the check above and the spawn. A second caller that
+  # also saw "not watched" loses the mkdir and returns. The claim is dropped
+  # once pgrep can see the child, or once the child has already exited, so a
+  # later event can replace a dead watcher.
+  claim_root="$logdir"
+  if [ -z "$claim_root" ]; then
+    claim_root="${TMPDIR:-/tmp}/minimax-code-state/watch"
+    if ! mkdir -p "$claim_root" 2>/dev/null; then
+      claim_root=""
+    fi
+  fi
+  if [ -n "$claim_root" ]; then
+    claim="${claim_root}/claim-${pane}"
+    if ! acquire_watcher_claim "$claim"; then
+      [ -n "$launch_line" ] && log "minimax-code: pane ${pane} already has a state watcher starting, so none was started."
+      return 0
+    fi
+    # A hand-started watcher can appear between the first pgrep and the claim.
+    # Drop the claim and leave that process alone.
+    if command -v pgrep >/dev/null 2>&1 && pane_is_watched "$pane"; then
+      release_watcher_claim "$claim"
+      [ -n "$launch_line" ] && log "minimax-code: pane ${pane} already has a state watcher, so none was started."
+      return 0
+    fi
+    if ! watcher_claim_owned "$claim"; then
+      return 0
+    fi
+  fi
+
   if [ -n "$logdir" ]; then
     trim_log "$log"
     printf -- '--- %s watching pane %s as agent %s (source %s) ---\n' \
@@ -379,12 +505,33 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
   # does not signal it. Harmless if it fails: nohup already ignores SIGHUP.
   MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
     nohup "$watcher" "$pane" >>"$log" 2>&1 &
+  child=$!
   disown 2>/dev/null || true
 
-  # No pid is recorded anywhere, and that is the point of this revision: the next
-  # trigger reads the process table rather than a file this code wrote, so it
-  # also sees a watcher that a 0.4.1 launcher or a person started. A record only
-  # of our own spawns was the reason the previous version could not see them.
+  # The claim pid is not a record of the watcher. It exists only so a dead
+  # claimer can be told from one that is still inside this function. Once the
+  # child is visible, pgrep is the record again, which is what lets a watcher
+  # started by hand or by a 0.4.1 launcher count. Releasing here is also what
+  # lets the next event replace a watcher that has already exited.
+  if [ -n "$claim" ]; then
+    if command -v pgrep >/dev/null 2>&1; then
+      i=0
+      while [ "$i" -lt 40 ]; do
+        if pane_is_watched "$pane"; then
+          break
+        fi
+        kill -0 "$child" 2>/dev/null || break
+        sleep 0.05
+        i=$((i + 1))
+      done
+      # Release as soon as pgrep can see the child. A peer that is still between
+      # its own pgrep miss and its mkdir either loses the claim, or wins it and
+      # then hits the pgrep re-check above and spawns nothing. Holding the claim
+      # longer keeps this hook alive after the child exists; measured, that is
+      # when the child then exits and the pane is left with no watcher.
+    fi
+    release_watcher_claim "$claim"
+  fi
 
   if [ -n "$launch_line" ]; then
     log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. Its log is ${log}. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
