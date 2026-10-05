@@ -4,11 +4,16 @@ A [Herdr](https://herdr.dev) plugin for [MiniMax Code](https://github.com/MiniMa
 
 ## Status
 
-v0.2.0. The manifest is valid, the entrypoint runs, and `cmd_start` launches
+v0.6.0. The manifest is valid, the entrypoint runs, and `cmd_start` launches
 `mcode` in a new pane beside the active one.
 
-Herdr does not detect MiniMax Code, so there is no way to list the agents this
-plugin has started. It launches them; that is the whole surface.
+Since v0.6.0 Herdr can also see `mcode` sessions you start **yourself**: run the
+`install-hook` action and a hand-started `mcode` registers its own pane at
+session start, so it appears in Herdr's agent listing and gets a state watcher
+like any other agent. Sessions started by this plugin were always visible;
+this release is about the ones that were not. See the caveats below — an
+already-running session will not register, and one launch path is still
+unproven.
 
 ## Requirements
 
@@ -183,6 +188,30 @@ the session and registers it, once, as `idle`. That single registration fires
 `pane.agent_status_changed`, which is what starts the watcher described above — and the
 watcher owns every state change from then on. The hook never reports state again and
 never releases the registration, so there is exactly one writer per pane.
+
+**What is proven, and what is not.** On a real machine (mcode 0.6.2, Herdr 0.9.3,
+macOS arm64) six sessions fired the hook and six panes registered correctly — each
+proved by process ancestry, each reported with `--source herdr:minimax-code`, each
+exiting 0. Those were sessions started by typing `mcode` into an existing shell,
+which is what you do.
+
+A pane created with `herdr pane run mcode`, with no interactive shell, is **not yet
+proven**. In one real run a session started that way did not fire the hook while six
+others in the same window did, and the cause is still open. Do not assume that path
+works; check.
+
+**Already-running sessions do not register.** `mcode` resolves plugin hooks per
+session and `SessionStart` is **one-shot** — it is not replayed. A `mcode` that was
+already running when you ran `install-hook` will not run the hook. Restart it, or
+register it by hand with `herdr pane report-agent`. This is mcode's behaviour, not a
+setting you can change.
+
+**If a session registers nothing, there is now a log.** mcode keeps the hook's stderr
+in its own diagnostics, which an interactive TUI does not surface — so before this
+release a run that registered nothing left no evidence at all. The hook now also
+appends to `~/.minimax/state/herdr-bootstrap/hook.log`: one line per step plus the
+exit code, trimmed to its tail at 64 KiB. The exit-code line is what separates *ran
+and refused* from *was killed* from *never started*.
 
 **How it finds the pane.** Not from the environment: `mcode` hands hooks a sanitized
 environment with **no `HERDR_*` variables at all**, even when the shell that launched
