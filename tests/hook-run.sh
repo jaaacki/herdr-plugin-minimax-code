@@ -478,8 +478,20 @@ case_install_never_uses_a_bare_rm() {
   # narrowed back to a single function finds one and fails here. Without it, the
   # gap m3 pointed at could be reintroduced silently and this case would still
   # pass - a test that cannot tell whether it is looking at the whole rule.
+  #
+  # The count is anchored to COMMAND POSITION (`^[[:space:]]*/bin/rm[[:space:]]`)
+  # and that anchoring is load-bearing, not tidiness. A plain `grep -c '/bin/rm'`
+  # counts MENTIONS, and each function mentions /bin/rm twice - once in the
+  # command and once in the comment explaining why the command is absolute. So
+  # the unanchored count reads 2 for install alone, 2 for uninstall alone and 4
+  # for both, and `covered < 2` was satisfied by every one of those: a scan
+  # narrowed to a single function passed. I reported that this check was proven
+  # by narrowing it, and that was false - the narrowed run failed on the
+  # `grep -q cmd_uninstall_hook` name check above, not on the count. Counting
+  # command positions instead gives 1, 1 and 2, so the threshold now fails for
+  # the reason it claims to.
   local covered
-  covered="$(printf '%s' "$deleting" | grep -c '/bin/rm' 2>/dev/null || echo 0)"
+  covered="$(printf '%s' "$deleting" | grep -cE '^[[:space:]]*/bin/rm[[:space:]]' 2>/dev/null || echo 0)"
   case "$covered" in '' | *[!0-9]*) covered=0 ;; esac
   if [ "$covered" -lt 2 ]; then
     note "the scan found $covered absolute-path removals; it is no longer covering"
