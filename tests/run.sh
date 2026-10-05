@@ -110,12 +110,23 @@ note() { broke=1; printf '        %s\n' "$*"; }
 # already read 1500 while their twenty neighbours read 1000, with no reason
 # anyone could find. The next site gets the budget by naming the budget.
 #
-# THIS DOES NOT MASK AN ABSENCE. The bound is a ceiling on how long a case waits
-# for a marker that never comes, and the marker is written by a process that has
-# already been spawned. A watcher that is not spawned still produces no marker at
-# any budget; it just costs 10s to say so instead of 1s. That the cases still go
-# red with no spawn is a mutation, not an argument - see the PR.
+# THIS IS FOR SPAWN WAITS ONLY - A POLL THAT EXPECTS A MARKER. Not for every
+# bounded poll in this file. An absence assertion (see DUPLICATE_GRACE_MS) is
+# spent in full on every passing run, so a spawn-sized bound there is pure
+# overhead on green. The bound here is a ceiling on how long a case waits for a
+# marker that should arrive; a watcher that is not spawned still produces no
+# marker at any budget - it just costs 10s to say so instead of 1s. That the cases
+# still go red with no spawn is a mutation, not an argument - see the PR.
 WATCHER_SPAWN_WAIT_MS=10000
+
+# How long an ABSENCE assertion waits for the thing it says must not happen.
+#
+# THE ONE-LINE WHY. assert_one_watcher polls for a second line that must never
+# arrive, so on a passing run this bound is spent in full every time - unlike a
+# spawn wait, which returns the moment the marker appears. It only has to outlast
+# the spawn delay of a duplicate that WOULD be a failure, so it stays at the 1500
+# that was there before, while genuine spawn waits get the long budget.
+DUPLICATE_GRACE_MS=1500
 
 # wait_for_file PATH [max_ms] - bounded poll for a DETACHED process to act.
 #
@@ -133,9 +144,9 @@ WATCHER_SPAWN_WAIT_MS=10000
 #
 # Bounded on purpose. An unbounded wait turns a missing marker into a hang
 # instead of a failure. The bound is a polling ceiling, not a delay: the poll
-# checks first and sleeps second, so a watcher that is already running costs
-# nothing, and a generous ceiling only lengthens the wait on a run that is
-# already going to fail.
+# checks first and sleeps second, so a marker that is already there costs
+# nothing. The default is the spawn budget, which is right for the polls that
+# expect a marker - see DUPLICATE_GRACE_MS for the ones that do not.
 wait_for_file() { # wait_for_file <path> [max-ms]
   local path="$1" max_ms="${2:-$WATCHER_SPAWN_WAIT_MS}" waited=0
   while [ "$waited" -lt "$max_ms" ]; do
@@ -200,12 +211,14 @@ wait_for_file_content() { # wait_for_file_content <path> <needle> [max-ms]
 #   * a fixed sleep is a coin flip on a loaded CI runner.
 #
 # So: poll for the SECOND line up to the bound, and fail if it ever lands. The
-# bound is the same one the rest of the suite uses; the stub writes its line as
-# its first act, so a watcher that is going to start at all has started well
-# inside it.
+# bound is DUPLICATE_GRACE_MS, NOT the spawn budget: on a pass the second line
+# never arrives, so this wait is always spent in full and a spawn-sized bound
+# would add its whole length to every run that passes. The stub writes its line as
+# its first act, so a duplicate that is going to appear at all has appeared well
+# inside 1500ms.
 assert_one_watcher() { # assert_one_watcher <file> <label>
   local file="$1" label="$2" total
-  wait_for_count "$file" 2 "$WATCHER_SPAWN_WAIT_MS" || true
+  wait_for_count "$file" 2 "$DUPLICATE_GRACE_MS" || true
   total="$(grep -c . "$file" 2>/dev/null || printf 0)"
   if [ "${total:-0}" -ne 1 ]; then
     note "$label: expected exactly 1 watcher, found ${total:-0}"
