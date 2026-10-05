@@ -1790,6 +1790,9 @@ RUN_TAG=$(( $$ % 100000 ))
 ADOPTED_PANE="wZ:p${RUN_TAG}"
 SECOND_PANE="wZ:p$(( RUN_TAG + 1 ))"
 FOREIGN_PANE="wZ:p$(( RUN_TAG + 2 ))"
+# case_43's pane. Same uniqueness rule as the three above: a leftover stub
+# from another run must not already be watching the id this case races on.
+RACE_PANE="wZ:p$(( RUN_TAG + 3 ))"
 
 case_30() { # #84: an adopted pane gets a watcher even though we never launched it
   setup_case
@@ -2306,7 +2309,45 @@ STUB
   kill "$decoy_pid" 2>/dev/null
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42)
+case_43() { # #120: two ensure-watcher calls at the same instant start one watcher
+  setup_case
+  local copy root json p1 p2 n
+  copy="$(stage_plugin hook)"
+  root="$CASE_DIR/plugin"
+  export MCODE_WATCH_AUTOSTART=1
+
+  # case_31 runs the second call after the first watcher is already visible to
+  # pgrep, so it cannot see the window this case exists for. Both invocations
+  # are started before either returns. Against the check-then-act spawn this
+  # was 40 doubles in 40 trials; the assertion below is the one that goes red
+  # if the claim is removed.
+  json="$(jq -cn --arg p "$RACE_PANE" \
+    '{event:"pane_agent_status_changed",
+      data:{type:"pane_agent_status_changed",pane_id:$p,workspace_id:"wZ",
+            agent_status:"working",agent:"minimax-code"}}')"
+  HERDR_PLUGIN_EVENT_JSON="$json" HERDR_PLUGIN_EVENT="pane.agent_status_changed" \
+    "$copy" ensure-watcher >"$CASE_DIR/out1" 2>"$CASE_DIR/err1" &
+  p1=$!
+  HERDR_PLUGIN_EVENT_JSON="$json" HERDR_PLUGIN_EVENT="pane.agent_status_changed" \
+    "$copy" ensure-watcher >"$CASE_DIR/out2" 2>"$CASE_DIR/err2" &
+  p2=$!
+  wait "$p1" || note "the first concurrent ensure-watcher exited non-zero"
+  wait "$p2" || note "the second concurrent ensure-watcher exited non-zero"
+
+  if ! wait_for_file "$root/watcher-ran" "$WATCHER_SPAWN_WAIT_MS"; then
+    note "neither concurrent ensure-watcher started a watcher for ${RACE_PANE}," \
+         "so a count of zero would pass against a spawn that never happens"
+    return
+  fi
+  assert_one_watcher "$root/watcher-ran" \
+    "two concurrent ensure-watcher calls for ${RACE_PANE}"
+  n="$(pgrep -f "bin/mcode-watch.sh $RACE_PANE" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -ne 1 ]; then
+    note "two concurrent ensure-watcher calls left ${n:-0} live watchers for ${RACE_PANE}"
+  fi
+}
+
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42 case-43)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -2355,7 +2396,7 @@ foreign_watcher_preflight() { # foreign_watcher_preflight
   # The fixture's wZ:p8 plus this run's three derived ids, so the check covers
   # exactly the panes the cases below can be suppressed on.
   local pane
-  for pane in wZ:p8 "$ADOPTED_PANE" "$SECOND_PANE" "$FOREIGN_PANE"; do
+  for pane in wZ:p8 "$ADOPTED_PANE" "$SECOND_PANE" "$FOREIGN_PANE" "$RACE_PANE"; do
     pattern="(^|[[:space:]/])mcode-watch\\.sh[[:space:]]+${pane}([[:space:]]|\$)"
     for p in $(pgrep -f "$pattern" 2>/dev/null); do
       cmd="$(ps -o command= -p "$p" 2>/dev/null)"
@@ -2436,6 +2477,7 @@ for name in "${SELECTED[@]}"; do
     case-39) run_case case-39 case_39 ;;
     case-40) run_case case-40 case_40 ;;
     case-41) run_case case-41 case_41 ;;
+    case-43) run_case case-43 case_43 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

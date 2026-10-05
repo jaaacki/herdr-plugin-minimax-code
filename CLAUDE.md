@@ -203,9 +203,13 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
 - **Any `minimax-code` pane gets a watcher, not just the ones the action launched** (#84). Herdr
   fires the `pane.agent_status_changed` hook, `bin/mcode-plugin.sh ensure-watcher` starts a
   watcher for the pane if none is running, and a flock-adopted pane is included because
-  adoption registers the same label. One watcher per pane, decided by an anchored
-  `pgrep -f "mcode-watch.sh <PANE_ID>"` rather than a lock file — a lock cannot see a watcher
-  that was started by hand or by an older build, which would leave two watchers on one pane.
+  adoption registers the same label. Whether a watcher is already running is still an anchored
+  `pgrep -f "mcode-watch.sh <PANE_ID>"`: a lifetime lock cannot see a watcher started by hand
+  or by an older build, and would leave two watchers on one pane. The spawn itself is a
+  separate question. Two hooks can both observe "no watcher" and both spawn (#120). That
+  window is an atomic `mkdir` of `claim-<pane>` under the watch-log directory, held only
+  until pgrep can see the child or the child has exited, then removed. pgrep stays the
+  record after that.
 - **An `agent_session` on one of our panes may not be ours.** Where `codex` ran in a pane
   earlier, Herdr keeps the *codex* session, inherited from whatever ran there rather than stored
   by this plugin — a plugin-launched pane is a fresh split and carries none, so **read
