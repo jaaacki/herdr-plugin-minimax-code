@@ -953,6 +953,58 @@ cmd_ensure_watcher() {
   ensure_watcher "$pane" "$(resolve_agent_name "$pane" "$agent")"
 }
 
+# The mcode-side plugin, installed into mcode's own plugin directory so that every
+# mcode session — however it was started — fires a SessionStart hook that registers
+# its pane with herdr. This is the whole of issue #118's mechanism; the rest of the
+# lifecycle is the watcher, which this registration starts.
+#
+# WHY AN INSTALL STEP AND NOT A SHIPPED DIRECTORY. mcode loads plugins from
+# `~/.minimax/plugins/<name>` and nowhere else: a directory inside this checkout is
+# inert, exactly as `agent-detection/minimax-code.toml` ships inert. Shipping the
+# files and activating them are separate acts, and only the user should choose the
+# second one — this action is that choice, made explicit and repeatable.
+cmd_install_hook() {
+  local dir dest_root dest
+  dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
+  [ -n "$dir" ] || die "cannot resolve the plugin root from this script's own location."
+  [ -f "$dir/mcode-plugin/.claude-plugin/plugin.json" ] ||
+    die "no mcode plugin at $dir/mcode-plugin — is this the plugin checkout?"
+
+  # MINIMAX_DATA_DIR is mcode's data dir and the only supported way to relocate it.
+  # Defaulting to ~/.minimax matches what mcode itself uses on this platform.
+  local data_dir="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
+  dest_root="$data_dir/plugins"
+  dest="$dest_root/herdr-bootstrap"
+
+  mkdir -p "$dest_root" || die "cannot create $dest_root"
+
+  if [ -e "$dest" ]; then
+    # Replace our OWN directory only, and only after the source is known good.
+    # `/bin/rm`, never a bare `rm` and never a trash can: issue #109 forbids both,
+    # and a bare `rm` here would be one keystroke away from a typo that deletes a
+    # neighbouring plugin. The path is a fixed literal under a fixed root, and the
+    # guard below refuses to continue if it is not exactly that.
+    case "$dest" in
+      "$dest_root"/herdr-bootstrap) : ;;
+      *) die "refusing to remove $dest: it is not the expected install path." ;;
+    esac
+    /bin/rm -rf "$dest" || die "cannot remove the previous install at $dest"
+    log "minimax-code: replaced the previous mcode plugin at $dest"
+  fi
+
+  mkdir -p "$dest" || die "cannot create $dest"
+  cp -R "$dir/mcode-plugin/." "$dest/" || die "cannot copy the mcode plugin into $dest"
+  chmod +x "$dest/hooks/herdr-bootstrap.sh" 2>/dev/null || true
+
+  [ -f "$dest/.claude-plugin/plugin.json" ] || die "install finished but the manifest is missing at $dest."
+
+  log "minimax-code: installed the mcode SessionStart hook into $dest"
+  log "minimax-code: it registers a pane ONCE per session and never reports state;"
+  log "minimax-code: bin/mcode-watch.sh, which that registration starts, owns state from then on."
+  log "minimax-code: mcode may need a restart to pick the plugin up: mcode plugin list"
+  return 0
+}
+
 main() {
   case "${1:-}" in
     start)
@@ -961,8 +1013,11 @@ main() {
     ensure-watcher)
       cmd_ensure_watcher
       ;;
+    install-hook)
+      cmd_install_hook
+      ;;
     *)
-      log "usage: mcode-plugin.sh start | ensure-watcher"
+      log "usage: mcode-plugin.sh start | ensure-watcher | install-hook"
       exit 2
       ;;
   esac

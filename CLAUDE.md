@@ -17,6 +17,9 @@ three:
 - `bin/mcode-plugin.sh` — the launcher, dispatching on `$1`. Invoked by the manifest action.
 - `bin/mcode-watch.sh` — the state watcher. The README tells users to run this by hand.
 - `bin/mcode-session.sh` — the session registrar, named in the release notes.
+- `mcode-plugin/` — the **mcode-side** plugin (issue #118): a `SessionStart` hook that
+  registers a pane so a hand-started `mcode` becomes visible at all. Shipped inert; the
+  `install-hook` action is the separate act that copies it into `~/.minimax/plugins/`.
 
 `agent-detection/minimax-code.toml` ships in the tarball too, and ships **inert**: nothing
 installs it into herdr's agent-detection directory, so it cannot change a user's detection.
@@ -50,11 +53,14 @@ things, and only the second is ours to do.
 ./tests/run.sh case-4                # one case
 ./tests/run.sh --list                # case names
 ./tests/watch-run.sh                 # the state-watcher's suite
+./tests/hook-run.sh                  # the mcode SessionStart hook's suite
 bash -n bin/mcode-plugin.sh          # syntax check
 bash -n bin/mcode-watch.sh           # syntax check for the watcher
+bash -n mcode-plugin/hooks/herdr-bootstrap.sh   # syntax check for the hook
 herdr plugin link .                  # load this checkout into herdr (mutates the registry)
 herdr plugin log list --plugin jaaacki.minimax-code
 herdr plugin action invoke jaaacki.minimax-code.minimax-code-start
+bin/mcode-plugin.sh install-hook     # install the mcode-side hook into ~/.minimax/plugins
 ```
 
 No test framework and no `bats` — plain bash. `HERDR_BIN_PATH` is pointed at `tests/fake-herdr`,
@@ -211,6 +217,47 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
   `osc_title`) — and `explain` refuses outright for a self-reported agent. So there is nothing
   to copy from it for state parity, and no expectation that a registered agent can reach
   Claude's state accuracy without a screen manifest.
+
+### mcode plugin hooks (issue #118) — measured on 0.6.2, and every item cost a cycle
+
+`mcode` runs Claude-Code-style plugin hooks, which is what makes a hand-started session
+registerable. Five traps, all measured, none of them guessable:
+
+- **A hook gets a SANITIZED environment: no `HERDR_*` at all.** 57 variables, captured in
+  full, while the launching shell had `HERDR_PANE_ID` set. `HERDR_SOCKET_PATH`,
+  `XDG_CONFIG_HOME` and everything else are stripped too. Consequence: **a bare `herdr`
+  call from a hook reaches the DEFAULT session and nothing else**, and so does every
+  variable *you* export — a probe that logs to `$MY_LOG` writes to `/dev/null` and looks
+  exactly like "the plugin is enabled but no event fires". That symptom cost two runs and
+  nearly put a false "matcher is mandatory" gotcha in this file.
+- **The hook has no controlling terminal** — `tty_stdin`/`stdout`/`stderr` are all false,
+  in `mcode exec` *and* in the interactive TUI. So the terminal device cannot identify a
+  pane either. The hook walks its **process ancestry** and matches `shell_pid` /
+  foreground pids, nearest first, which is `discoverPane` from pc-tools
+  `fleet/flock/identity.ts`. Measured: pane `w1:p1` reported `shell_pid 90385` and the
+  hook's chain was `hook → 93121 (minimax-code) → 90385 (pane shell) → server`.
+- **Target the SOCKET, never a session name.** `herdr session list --json` returns each
+  session's `socket_path`; set `HERDR_SOCKET_PATH` **for the herdr child the hook spawns**
+  (stripping applies to the hook's inherited env, not to a child it launches). A wrong
+  socket fails loudly with `server_not_running` naming that path — it does not fall back.
+  Note `--session <name>` does *not* silently create a session on a typo, contrary to the
+  "or create" help wording; a name is still rejected because it is not a proof.
+- **The hook's cwd is the PROJECT directory and the plugin is a read-only snapshot.**
+  `PLUGIN_ROOT=~/.minimax/v2/plugin-hook-cache/sha256-tree-v1-<content-digest>`. So a hook
+  command must be anchored on `$CLAUDE_PLUGIN_ROOT` (which does expand), and nothing may be
+  written next to the hook. The digest changes whenever the content does.
+- **Invoke the hook with `bash`, not `/bin/sh`.** `/bin/sh` is bash in POSIX mode on macOS
+  and `dash` on Linux, and the hook uses process substitution — a syntax error in both. The
+  manifest loaded cleanly and mcode reported no warning, so the hook would have failed on
+  every single session. `tests/hook-run.sh` now *executes* the manifest's own command for
+  exactly this reason: a manifest that parses is not a working hook.
+
+Two more measured facts worth not re-deriving: **`SessionEnd` never fires** (not on a clean
+TUI exit, where the pane's foreground process verifiably went back to `-zsh`), so there is
+no teardown hook and deregistration stays with herdr's pane scope; and the **`matcher` key
+is optional**. A MINIMAX-format manifest did not produce a hook package at all — absent
+from `mcode plugin list` *and* from the hook cache — so the CLAUDE-format manifest is the
+form that works here, not a preference.
 
 ## Ownership
 

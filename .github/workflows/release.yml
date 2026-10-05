@@ -113,6 +113,7 @@ jobs:
             bin/mcode-session.sh \
             bin/mcode-drive.sh \
             agent-detection/ \
+            mcode-plugin/ \
             README.md \
             LICENSE \
             CLAUDE.md \
@@ -153,7 +154,10 @@ jobs:
                    bin/mcode-session.sh bin/mcode-drive.sh README.md LICENSE \
                    CLAUDE.md \
                    agent-detection/minimax-code.toml \
+                   mcode-plugin/.claude-plugin/plugin.json \
+                   mcode-plugin/hooks/herdr-bootstrap.sh \
                    tests/run.sh tests/fake-herdr \
+                   tests/hook-run.sh tests/fake-herdr-hook \
                    tests/agent-detection-run.sh tests/agent-detection-check.py \
                    tests/fixtures/agent-detection/reference-claude.toml \
                    tests/drive-run.sh tests/fake-mcode tests/fake-sqlite3; do

@@ -112,7 +112,10 @@ Things worth knowing:
   `mcode` 0.6.2 runs at `Full access` where no prompt appears. That gap is
   deliberate: a `blocked` rule that never fires would be a lie in the code. Switch a
   session's permission mode with `/permission` and a prompt becomes reachable, at
-  which point the rule can be written from real evidence.
+  which point the rule can be written from real evidence. The session hook below
+  changes *where* a `blocked` report could come from, but has not changed this: its
+  `PermissionRequest` handler is **not** installed, because that event was never
+  observed firing, and shipping a handler for it would be the same lie in a new place.
 - **It deliberately does not call `release-agent`**, and never did once that call
   was understood: it **deletes** the agent entry rather than handing authority back,
   so an earlier version of this watcher made your pane vanish from
@@ -125,6 +128,49 @@ Things worth knowing:
   would have to come from the session store, which is not implemented.
 - Rules live in one table at the top of `bin/mcode-watch.sh`. Each was derived from
   a real captured screen; the comments record which candidates were rejected and why.
+
+## Pane registration for `mcode` you started yourself
+
+Everything above needs the plugin to have opened the pane. A `mcode` you ran by hand in
+some other pane is invisible to Herdr, and no screen watcher can fix that: a watcher has
+to be started *for a pane*, and nothing knew the pane existed.
+
+`mcode` runs plugin lifecycle hooks, so this plugin can now register the pane from
+inside the session itself. Install it once:
+
+```bash
+herdr plugin action invoke jaaacki.minimax-code.minimax-code-install-hook
+# or, from a checkout:
+bin/mcode-plugin.sh install-hook
+```
+
+It copies `mcode-plugin/` into `~/.minimax/plugins/herdr-bootstrap/`, which is where
+`mcode` looks — it ships inert until you run that, the same way
+`agent-detection/minimax-code.toml` ships inert. `mcode` may need a restart to notice.
+
+**What it does, and just that:** on `SessionStart` the hook finds the Herdr pane that owns
+the session and registers it, once, as `idle`. That single registration fires
+`pane.agent_status_changed`, which is what starts the watcher described above — and the
+watcher owns every state change from then on. The hook never reports state again and
+never releases the registration, so there is exactly one writer per pane.
+
+**How it finds the pane.** Not from the environment: `mcode` hands hooks a sanitized
+environment with **no `HERDR_*` variables at all**, even when the shell that launched
+`mcode` had `HERDR_PANE_ID` set, and the hook has no controlling terminal to fall back
+on. It walks its own **process ancestry** instead and matches it against each pane's
+`shell_pid`, nearest first — so a nested `mcode` binds to the inner pane, and `cwd` is
+never used to guess. If no pane can be proven, the hook reports nothing and says so; it
+never falls back to the default session, because a registration on the wrong pane is
+worse than no registration.
+
+Two things it deliberately does **not** do:
+
+- **It does not deregister on exit.** `mcode` never fired `SessionEnd` for us, on a
+  clean TUI exit or otherwise, so there is no teardown event to hang it on — and
+  `release-agent` deletes rather than releases. Registration is pane-scoped and Herdr
+  drops it with the pane, which is the same answer the watcher reached on its own.
+- **It does not report `blocked`.** See the watcher section above: the event exists in
+  `mcode` but was never observed firing, so it is not registered.
 
 ## What Herdr can see about a launched pane
 
@@ -151,7 +197,7 @@ What a launched pane gets, and what it does not:
 | `idle` / `working` state | ✅ reported, and it follows the pane while the watcher runs |
 | Session identity (`agent_session`) | ⚠️ **attempted at launch, then discarded by Herdr** — see below |
 | Resume after a Herdr restart | ⚠️ herdr accepts the resume command, and re-runs it after a restart if it kept it — proven by hand, CI case gated (#99) |
-| `blocked` state | ❌ `mcode` 0.6.2 exposes no hook a plugin can read |
+| `blocked` state | ❌ still unreported. `mcode` *does* expose lifecycle hooks, but `PermissionRequest` was never observed firing, and the session hook below does not register it |
 
 ### The session id is discarded; the resume command is accepted
 

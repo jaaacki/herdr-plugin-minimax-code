@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# tests/fake-herdr-hook — a herdr stub for tests/hook-run.sh ONLY.
+#
+# WHY A SEPARATE STUB. The hook under test is the only caller in this repo of
+# `herdr session list --json` and of `pane process-info`, and it is also the only
+# caller that must address a session by SOCKET rather than by name. tests/fake-herdr
+# has no case for either, and it is shared by ~2400 lines of existing assertions.
+# Extending it would mean touching a fixture that many cases depend on for no
+# benefit; tests/fake-herdr-watch set the precedent of a per-suite stub.
+#
+# WHAT IT MODELS, and nothing else:
+#   session list --json                  -> the fixture's sessions
+#   pane list                            -> the fixture's panes for the socket in
+#                                          $HERDR_SOCKET_PATH
+#   pane process-info --pane <ID>        -> that pane's anchors
+#   pane report-agent <PANE> ...         -> recorded, answered ok
+#
+# EVERY call is appended to $FAKE_HOOK_LOG as
+#   <socket>\t<argv...>
+# with the socket field being the literal string "(unset)" when the caller did not
+# set HERDR_SOCKET_PATH. That is the whole point of the stub: a suite can assert
+# that the hook qualified every call with the socket it proved, and that it never
+# used `--session`.
+#
+# FIXTURE: $FAKE_HOOK_FIXTURE, a JSON document:
+#   {"sessions":[{"name":..,"socket":..,"running":true|false,
+#                 "panes":[{"pane_id":..,"shell_pid":N,"fg_pgid":N,
+#                           "fg_pids":[N],"cwd":".."}]}]}
+
+set -uo pipefail
+
+LOG="${FAKE_HOOK_LOG:-/dev/null}"
+FIXTURE="${FAKE_HOOK_FIXTURE:-}"
+
+# Record first, always. A stub that records only the calls it understands would
+# hide the very call this suite exists to catch.
+{
+  if [ -n "${HERDR_SOCKET_PATH:-}" ]; then printf '%s' "$HERDR_SOCKET_PATH"; else printf '(unset)'; fi
+  printf '\t%s\n' "$*"
+} >>"$LOG" 2>/dev/null
+
+if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
+  printf '{"error":{"code":"no_fixture","message":"FAKE_HOOK_FIXTURE unset or missing"}}\n'
+  exit 1
+fi
+
+emit() { printf '%s\n' "$1"; }
+
+# The session whose socket_path is $1, as JSON, or empty when there is none.
+session_for_socket() {
+  jq -c --arg s "$1" '.sessions[] | select(.socket == $s)' "$FIXTURE" 2>/dev/null | head -1
+}
+
+case "${1:-} ${2:-}" in
+  "session list")
+    emit "$(jq -c '{sessions:[.sessions[]|{name,default:(.name=="default"),running,session_dir:"/nonexistent",socket_path:.socket}]}' "$FIXTURE")"
+    exit 0
+    ;;
+esac
+
+if [ "${1:-}" != "pane" ]; then
+  emit '{"error":{"code":"unexpected_verb","message":"fake-herdr-hook does not model this"}}'
+  exit 1
+fi
+
+sock="${HERDR_SOCKET_PATH:-}"
+session="$(session_for_socket "$sock")"
+if [ -z "$session" ]; then
+  # Mirrors real herdr, which names the socket it looked for rather than falling
+  # back to the default. A test asserting fail-closed behaviour depends on this.
+  emit "$(jq -nc --arg s "${sock:-}" '{error:{code:"server_not_running",message:("no herdr server is running at " + $s)}}')"
+  exit 1
+fi
+
+case "${2:-}" in
+  list)
+    emit "$(printf '%s' "$session" | jq -c '{id:"cli:pane:list",result:{type:"pane_list",panes:[.panes[]|{pane_id,cwd}]}}')"
+    exit 0
+    ;;
+  process-info)
+    pane=""
+    prev=""
+    for a in "$@"; do
+      [ "$prev" = "--pane" ] && pane="$a"
+      prev="$a"
+    done
+    if [ -z "$pane" ]; then
+      # Real herdr requires --pane or --current here. Refusing keeps the suite
+      # honest about the flag form the hook must use.
+      emit '{"error":{"code":"bad_args","message":"pane process-info needs --pane <ID>"}}'
+      exit 1
+    fi
+    body="$(printf '%s' "$session" | jq -c --arg p "$pane" '.panes[] | select(.pane_id == $p)')"
+    if [ -z "$body" ]; then
+      emit '{"error":{"code":"pane_not_found"}}'
+      exit 1
+    fi
+    emit "$(printf '%s' "$body" | jq -c '{id:"cli:pane:process_info",result:{type:"pane_process_info",process_info:{pane_id:.pane_id,shell_pid:.shell_pid,foreground_process_group_id:.fg_pgid,foreground_processes:[.fg_pids[]|{pid:.}]}}}')"
+    exit 0
+    ;;
+  report-agent)
+    emit '{"id":"cli:pane:report_agent","result":{"ok":true}}'
+    exit 0
+    ;;
+  release-agent)
+    # Modelled ONLY so a suite can prove the hook never calls it. It answers
+    # successfully, so a hook that did call it would look like it worked.
+    emit '{"id":"cli:pane:release_agent","result":{"ok":true}}'
+    exit 0
+    ;;
+esac
+
+emit '{"error":{"code":"unexpected_subcommand"}}'
+exit 1
