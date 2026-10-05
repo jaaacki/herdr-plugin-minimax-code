@@ -312,31 +312,16 @@ run_drive() { # run_drive <args...>
   RC=$?
 }
 
-# Mirrors every executable on PATH into a fresh directory, skipping $1. Same
-# helper, same reason, as tests/run.sh's: a shim earlier on PATH would still
-# satisfy `command -v jq`, so the "jq absent" case would pass without jq ever
-# being missing. Mirroring rather than replacing PATH also keeps `bash` itself
-# reachable — the script under test starts with `#!/usr/bin/env bash`, so a PATH
-# narrowed to just the sandbox makes env fail to find an interpreter and the
-# script never runs at all. That failure looks like a pass for the right
-# assertion (non-zero exit) and is nothing of the kind.
-path_without() { # path_without <basename>
-  local drop="$1"
-  local mirror="$CASE_DIR/no-$drop"
-  local dir f base
-  mkdir -p "$mirror"
-  local IFS=:
-  for dir in $PATH; do
-    [ -d "$dir" ] || continue
-    for f in "$dir"/*; do
-      [ -e "$f" ] || continue
-      base="${f##*/}"
-      [ "$base" = "$drop" ] && continue
-      ln -sf -- "$f" "$mirror/$base" 2>/dev/null || true
-    done
-  done
-  printf '%s' "$mirror"
-}
+
+# path_without() is shared with tests/run.sh - one definition, and PATH semantics
+# rather than this suite's old `ln -sf` last-wins, which disagreed with it.
+#
+# Mirroring rather than replacing PATH is also what keeps `bash` itself reachable:
+# the script under test starts with `#!/usr/bin/env bash`, so a PATH narrowed to
+# just the sandbox makes env fail to find an interpreter and the script never runs
+# at all. That failure looks like a pass for the right assertion (non-zero exit)
+# and is nothing of the kind.
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib/path-without.sh"
 
 # --- cases -------------------------------------------------------------------
 # 1. The happy path, and the case every other case is a variation of. A NAME

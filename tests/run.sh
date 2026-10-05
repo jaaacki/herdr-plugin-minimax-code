@@ -629,27 +629,11 @@ expected_sequence_via_current() { # expected_sequence_via_current <mcode-abs|"">
   printf 'pane\tcurrent\n%s' "$rest"
 }
 
-# Mirrors every executable on PATH into a fresh directory, skipping $1. Case 6
-# uses it to make `jq` genuinely absent rather than shadowed: a shim earlier on
-# PATH would still satisfy `command -v jq`, so the case would pass vacuously.
-path_without() { # path_without <basename>
-  local drop="$1"
-  local mirror="$CASE_DIR/no-$drop"
-  local dir f base
-  mkdir -p "$mirror"
-  local IFS=:
-  for dir in $PATH; do
-    [ -d "$dir" ] || continue
-    for f in "$dir"/*; do
-      [ -e "$f" ] || continue
-      base="${f##*/}"
-      [ "$base" = "$drop" ] && continue
-      [ -e "$mirror/$base" ] && continue
-      ln -s "$f" "$mirror/$base" 2>/dev/null || true
-    done
-  done
-  printf '%s' "$mirror"
-}
+
+# path_without() lives in one place, shared with tests/drive-run.sh. They used to
+# carry byte-different copies that disagreed about which of two same-named
+# executables wins; see the file for why PATH semantics are the ones to keep.
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib/path-without.sh"
 
 # --- precondition: the stub's canned responses must be usable ----------------
 # A stub emitting malformed JSON, or an envelope missing `.result.pane`, makes
@@ -857,6 +841,83 @@ case_8() {
   assert_stderr_nonempty
   assert_stderr_mentions "mcode"
   assert_log_empty
+}
+
+# --- case 42 -----------------------------------------------------------------
+# path_without() must mirror ONLY the directories that hold the tool.
+#
+# WHY THIS CASE EXISTS. The helper used to symlink every executable on PATH into
+# a fresh directory on every call and return that directory as the whole PATH -
+# 1,710 files on the maintainer's machine, three calls per full suite run. Every
+# reachability assertion still passed, because the tool WAS still absent. So a
+# regression back to mirroring everything would be invisible to cases 6 and 8, and
+# only the file count would notice. The maintainer's churn was the symptom; this
+# is the test that would have caught it.
+#
+# WHAT FAILS ON THE OLD IMPLEMENTATION. It returned the mirror directory and
+# nothing else, so the returned PATH had exactly one entry and contained no
+# original directory at all. Both of the first two assertions below are false for
+# it, and the third is false by a factor of two.
+case_42() {
+  setup_case
+  local tool=mcode
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    note "$tool is not installed; this case cannot run here"
+    return
+  fi
+
+  local p
+  p="$(path_without "$tool")" || { note "path_without failed"; return; }
+
+  # 1. The tool is genuinely unreachable. The property every other case rests on.
+  if PATH="$p" command -v "$tool" >/dev/null 2>&1; then
+    note "$tool is still reachable after path_without; the mirror is not hiding it"
+    return
+  fi
+
+  # 2. The result is a PATH, not a single directory: a directory that does NOT
+  #    hold the tool is still there, verbatim, so its tools resolve unchanged.
+  #    A subshell rather than `local IFS=:` + `unset IFS`: unsetting after a
+  #    `local` drops the local binding and exposes the global IFS for the rest
+  #    of the function, which is the leak tests/lib/path-without.sh warns about.
+  local keep=""
+  keep="$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    if [ -d "$dir" ] && [ ! -e "$dir/$tool" ]; then printf '%s' "$dir"; break; fi
+  done)"
+  if [ -z "$keep" ]; then
+    note "no PATH directory on this machine lacks $tool; nothing to assert"
+    return
+  fi
+  case ":$p:" in
+    *":$keep:"*) : ;;
+    *)
+      note "$keep does not hold $tool and was dropped from the returned PATH."
+      note "Only the directories that HOLD the tool may be replaced; the rest"
+      note "stay as plain entries, or unrelated tools stop resolving."
+      return
+      ;;
+  esac
+
+  # 3. The mirror is bounded by what the containing directories hold. The old
+  #    implementation linked every distinct basename on PATH, so it blew this by
+  #    roughly 2x even for the tool in the smallest containing directory.
+  local holders=0 entries=0 n d
+  for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+    [ -d "$d" ] || continue
+    [ -e "$d/$tool" ] || continue
+    holders=$(( holders + 1 ))
+    n=$(find "$d" -maxdepth 1 -mindepth 1 2>/dev/null | grep -c . || true)
+    entries=$(( entries + n ))
+  done
+  local mirrored
+  mirrored="$(path_without_mirror_files "$tool")"
+  if [ "$mirrored" -gt $(( entries - 1 )) ]; then
+    note "path_without mirrored $mirrored files, but only $entries live in the"
+    note "$holders directory/directories that hold $tool. It is mirroring more"
+    note "than it needs to, which is the churn this case exists to prevent."
+    return
+  fi
 }
 
 # --- case 9 ------------------------------------------------------------------
@@ -2197,7 +2258,7 @@ STUB
   kill "$decoy_pid" 2>/dev/null
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41)
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -2294,6 +2355,7 @@ for name in "${SELECTED[@]}"; do
     case-7) run_case case-7 case_7 ;;
     case-8) run_case case-8 case_8 ;;
     case-9) run_case case-9 case_9 ;;
+    case-42) run_case case-42 case_42 ;;
     case-10) run_case case-10 case_10 ;;
     case-11) run_case case-11 case_11 ;;
     case-12) run_case case-12 case_12 ;;
