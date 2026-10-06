@@ -55,6 +55,43 @@ description = "Stop mcode sessions from self-registering; removes the shared plu
 contexts = ["workspace", "global"]
 command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" uninstall-hook"]
 
+# The flock member Stop hook, which ships inert for the same reason and was,
+# until this issue, INSTALLABLE BY NOBODY.
+#
+# #136 merged `flock-stop-plugin/` AND the `install-flock-stop` /
+# `uninstall-flock-stop` / `install-all` dispatch arms in `bin/mcode-plugin.sh`,
+# and `tests/flock-stop-run.sh` proved every one of them works. What it could not
+# do is REACH them: this manifest had no action that invoked any of the three, so
+# the only way to put the hook on a machine was to type the script by hand with
+# a path to it in hand. A member running mcode therefore had no Stop hook at all,
+# could end a turn with unread mail, and had no way to tell — which is exactly
+# what sparkfn/pc-tools#1811 measured on a real machine.
+#
+# The test suite could not catch this, and that is the more useful half of the
+# finding: every arm it exercised was correct. The gap was between the dispatcher
+# and the manifest, and nothing on either side referenced the other.
+#
+# Two actions rather than a change to `install-hook`. Folding flock-stop into the
+# existing action would make `uninstall-hook` take a stranger's plugin off a
+# machine that only ever asked for the session hook, and would change the meaning
+# of an action users have already run. Explicit and reversible beats convenient.
+[[actions]]
+id = "minimax-code-install-flock-stop"
+title = "Install the flock member Stop hook"
+description = "Block a member from ending a turn with unread flock mail (sparkfn/pc-tools#1811)"
+contexts = ["workspace", "global"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" install-flock-stop"]
+
+# The counterpart, for the same machine-global reason as the session hook above:
+# ~/.minimax/plugins is shared by every mcode on the box, and an install nobody
+# can take back is a plugin nobody will install.
+[[actions]]
+id = "minimax-code-uninstall-flock-stop"
+title = "Uninstall the flock member Stop hook"
+description = "Stop blocking turn-end for unread flock mail; removes only what was installed"
+contexts = ["workspace", "global"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" uninstall-flock-stop"]
+
 # ---------------------------------------------------------------------------
 # Lifecycle, NOT notification. Read this before adding a second event or
 # repurposing this one.

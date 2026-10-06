@@ -417,7 +417,156 @@ case_uninstall_refuses_a_directory_that_is_not_ours() {
   fi
 }
 
+# ---- the INSTALLED artifact -------------------------------------------------
+#
+# Every case above runs $HOOK: the copy in this checkout. The file mcode
+# actually executes is a DIFFERENT file on disk — cp -R'd into
+# ~/.minimax/plugins/flock-stop/ and chmod +x'd by the installer — and until
+# these cases nothing touched it.
+#
+# That is not a nicety. It is the exact shape of the bug this issue closed: the
+# script was correct, the dispatcher arms were correct, and every case above
+# passed, while the artifact mcode runs was never installed on a single machine.
+# A property proven of the checkout is not a property proven of the install.
+#
+# The argv stub records its arguments instead of validating them. The shared
+# `fake-pc-tool` exits 64 on the wrong words, which the hook reads as "pc-tool
+# failed" and fails OPEN on — so a wrong-words regression there shows up only as
+# a missing block, and the assertion would be reading a symptom. This one writes
+# each argument to a log, so a failure can say WHICH word moved.
+recording_pc_tool() { # recording_pc_tool <dir>
+  local d="$1"
+  mkdir -p "$d" 2>/dev/null || return 1
+  cat > "$d/pc-tool" <<'REC'
+#!/usr/bin/env bash
+for a in "$@"; do printf '%s\n' "$a" >>"$PCTOOL_ARGV_LOG"; done
+printf '%s' "${FAKED_PC_TOOL_OUT:-}"
+exit 0
+REC
+  chmod +x "$d/pc-tool"
+}
+
+# Install into a fresh fake home and point INSTALLED_HOOK at what landed.
+install_flock_stop_once() { # install_flock_stop_once <name>
+  local log="$1"
+  fire_install install-flock-stop true "$log" || { note "harness setup failed"; return 1; }
+  if [ "$INST_RC" -ne 0 ]; then
+    note "install-flock-stop exited $INST_RC: $(head -3 "$INST_OUT" | tr '\n' '|')"
+    return 1
+  fi
+  INSTALLED_HOOK="$INST_DATA/plugins/flock-stop/flock-stop.sh"
+  if [ ! -x "$INSTALLED_HOOK" ]; then
+    note "no executable hook was installed at $INSTALLED_HOOK"
+    return 1
+  fi
+  return 0
+}
+
+# `flock hook stop` is THREE WORDS, and getting that wrong is silent rather than
+# loud: pc-client resolves the verb by first token, so a one-word lookup is
+# refused as an unknown verb, `hook stop` exits without a verdict, and the hook
+# fails open. The member then ends its turn with unread mail and nothing says
+# why. Asserted on the installed copy, naming each word.
+case_installed_hook_runs_the_verb_as_three_words() {
+  install_flock_stop_once argv3 || return
+  local fake="$WORK/fake-argv3" log="$WORK/argv3.log"
+  recording_pc_tool "$fake" || { note "stub setup failed"; return; }
+  : > "$log"
+  printf '%s' "$STOP_PAYLOAD" | PCTOOL_ARGV_LOG="$log" FAKED_PC_TOOL_OUT="$BLOCK_ENVELOPE" \
+    PATH="$fake:$PATH" /usr/bin/env bash "$INSTALLED_HOOK" >/dev/null 2>&1
+  local a b c n
+  a="$(sed -n 1p "$log" 2>/dev/null)"
+  b="$(sed -n 2p "$log" 2>/dev/null)"
+  c="$(sed -n 3p "$log" 2>/dev/null)"
+  n="$(grep -c '' "$log" 2>/dev/null || echo 0)"
+  if [ "$a" != "flock" ] || [ "$b" != "hook" ] || [ "$c" != "stop" ]; then
+    note "the installed hook did not invoke pc-tool as 'flock hook stop'; argv was: '${a:-} ${b:-} ${c:-}'"
+  fi
+  if [ "$n" -ne 3 ]; then
+    note "pc-tool was called with $n argument(s), not 3; a verb with extra words is a different verb"
+  fi
+}
+
+# The other half of the same claim, and the one that says the feature works at
+# all ON A REAL MACHINE: the installed copy turns unread mail into the decision
+# mcode honours. Every other block case proves this of the checkout.
+case_installed_hook_blocks_with_unread_mail() {
+  install_flock_stop_once block || return
+  local fake="$WORK/fake-block" out
+  recording_pc_tool "$fake" || { note "stub setup failed"; return; }
+  out="$(printf '%s' "$STOP_PAYLOAD" | PCTOOL_ARGV_LOG="$WORK/block.log" \
+    FAKED_PC_TOOL_OUT="$BLOCK_ENVELOPE" PATH="$fake:$PATH" \
+    /usr/bin/env bash "$INSTALLED_HOOK" 2>/dev/null)"
+  if ! printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
+    note "the INSTALLED hook did not emit decision:block with unread mail; got: ${out:-<nothing>}"
+  fi
+  if ! printf '%s' "$out" | jq -e '.reason | test("unread row")' >/dev/null 2>&1; then
+    note "the installed block lost pc-tool's reason; got: ${out:-<nothing>}"
+  fi
+}
+
+# Install is a menu item a user may press twice, and an update path may re-run
+# it. The second run goes over an existing directory, which is the only place the
+# replace-instead-of-merge branch in cmd_install_hook can fire.
+case_install_flock_stop_is_idempotent() {
+  local log="twice"
+  fire_install install-flock-stop true "$log" || { note "harness setup failed"; return; }
+  if [ "$INST_RC" -ne 0 ]; then
+    note "the first install exited $INST_RC: $(head -2 "$INST_OUT" | tr '\n' '|')"
+    return
+  fi
+  fire_install install-flock-stop true "$log" || { note "harness setup failed"; return; }
+  if [ "$INST_RC" -ne 0 ]; then
+    note "installing over an existing install failed on the second run: $(head -3 "$INST_OUT" | tr '\n' '|')"
+    return
+  fi
+  if [ ! -f "$INST_DATA/plugins/flock-stop/.claude-plugin/plugin.json" ]; then
+    note "the second install left no manifest at plugins/flock-stop/"
+  fi
+  if [ ! -x "$INST_DATA/plugins/flock-stop/flock-stop.sh" ]; then
+    note "the second install lost the executable bit on flock-stop.sh"
+  fi
+  if [ -e "$INST_DATA/plugins/herdr-bootstrap" ]; then
+    note "the second install created a herdr-bootstrap directory; it must touch only its own"
+  fi
+}
+
 # ---- wiring -----------------------------------------------------------------
+
+# THE red-first leg for this issue, and the one that was missing from the repo
+# in the first place. Every other case in this file exercises the dispatcher, the
+# script, or an install into a fake home — and all of them were green while the
+# hook was unreachable from any action menu. Nothing referenced
+# herdr-plugin.toml's half of the contract, so the manifest could be empty of
+# these actions and the suite would say nothing.
+#
+# If you delete the two actions from herdr-plugin.toml, this goes red and the
+# rest of the file stays green. That asymmetry is the bug: the suite proved the
+# parts and never the join.
+case_manifest_exposes_the_flock_stop_actions() {
+  local toml="$repo/herdr-plugin.toml" cmd
+  if [ ! -f "$toml" ]; then note "no herdr-plugin.toml at $toml"; return; fi
+
+  if ! grep -q 'id = "minimax-code-install-flock-stop"' "$toml"; then
+    note "herdr-plugin.toml declares no minimax-code-install-flock-stop action, so bin/mcode-plugin.sh install-flock-stop cannot be reached"
+  else
+    cmd="$(grep -A6 'id = "minimax-code-install-flock-stop"' "$toml" | grep '^command' | head -1)"
+    case "$cmd" in
+      *install-flock-stop*) : ;;
+      *) note "the install action does not invoke install-flock-stop: ${cmd:-<none>}" ;;
+    esac
+  fi
+
+  if ! grep -q 'id = "minimax-code-uninstall-flock-stop"' "$toml"; then
+    note "herdr-plugin.toml declares no minimax-code-uninstall-flock-stop action; an install nobody can take back is one nobody will make"
+  else
+    cmd="$(grep -A6 'id = "minimax-code-uninstall-flock-stop"' "$toml" | grep '^command' | head -1)"
+    case "$cmd" in
+      *uninstall-flock-stop*) : ;;
+      *) note "the uninstall action does not invoke uninstall-flock-stop: ${cmd:-<none>}" ;;
+    esac
+  fi
+}
 
 case_manifest_declares_the_stop_hook() {
   if ! jq -e '.hooks.Stop' "$MANIFEST" >/dev/null 2>&1; then
@@ -483,6 +632,10 @@ CASES=(
   install-flock-stop-fails-when-mcode-says-disabled:case_install_flock_stop_fails_when_mcode_says_disabled
   uninstall-flock-stop-removes-only-its-own:case_uninstall_flock_stop_removes_only_its_own
   uninstall-refuses-a-directory-that-is-not-ours:case_uninstall_refuses_a_directory_that_is_not_ours
+  installed-hook-runs-the-verb-as-three-words:case_installed_hook_runs_the_verb_as_three_words
+  installed-hook-blocks-with-unread-mail:case_installed_hook_blocks_with_unread_mail
+  install-flock-stop-is-idempotent:case_install_flock_stop_is_idempotent
+  manifest-exposes-the-flock-stop-actions:case_manifest_exposes_the_flock_stop_actions
   manifest-declares-the-stop-hook:case_manifest_declares_the_stop_hook
   manifest-command-uses-braced-plugin-root:case_manifest_command_uses_braced_plugin_root
   manifest-command-actually-executes:case_manifest_command_actually_executes
