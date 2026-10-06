@@ -146,6 +146,35 @@ newline'
 
 # mcode's validator DISCARDS a block with no reason. Emitting one is a silent
 # no-op that looks like a wired hook and blocks nothing.
+# The flat shape sparkfn/pc-tools#1710 is moving to. If the hook only understood
+# the envelope, the day that change lands every member would silently stop
+# blocking — and nothing would fail, because "do not block" is this hook's
+# default behaviour.
+case_emits_a_block_from_the_flat_shape() {
+  local out
+  out="$(FAKED_PC_TOOL_OUT='{"decision":"block","reason":"2 unread rows for m6"}' fire "$STOP_PAYLOAD")"
+  if ! printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1; then
+    note "the flat shape produced no block; got: ${out:-<nothing>}"
+    return
+  fi
+  if [ "$(printf '%s' "$out" | jq -r '.reason')" != "2 unread rows for m6" ]; then
+    note "the flat shape lost its reason: ${out}"
+  fi
+}
+
+# A shape NEITHER side documents — here a future #1710 emitting one. Standing the
+# hook down is the requirement: a new release must not be able to wedge every
+# member by changing what it prints.
+case_stands_down_on_an_unrecognised_shape() {
+  FAKED_PC_TOOL_OUT='{"verdict":"halt","detail":"something new"}' fire "$STOP_PAYLOAD" >/dev/null
+  if ! out_is_empty; then
+    note "emitted a decision for an unrecognised shape: $(cat "$WORK/out")"
+  fi
+  if ! grep -q 'does not recognise' "$WORK/err" 2>/dev/null; then
+    note "stood down silently on an unrecognised shape; it should say why on stderr"
+  fi
+}
+
 case_does_not_emit_a_reasonless_block() {
   FAKED_PC_TOOL_OUT='{"hook":"stop","blocked":true,"decision":{"decision":"block"}}' \
     fire "$STOP_PAYLOAD" >/dev/null
@@ -296,6 +325,8 @@ CASES=(
   emits-a-block-decision-when-pctool-blocks:case_emits_a_block_decision_when_pctool_blocks
   passes-the-stop-payload-on-stdin:case_passes_the_stop_payload_on_stdin
   escapes-a-reason-that-contains-json-metacharacters:case_escapes_a_reason_that_contains_json_metacharacters
+  emits-a-block-from-the-flat-shape:case_emits_a_block_from_the_flat_shape
+  stands-down-on-an-unrecognised-shape:case_stands_down_on_an_unrecognised_shape
   does-not-emit-a-reasonless-block:case_does_not_emit_a_reasonless_block
   stays-silent-when-pctool-ends-the-turn:case_stays_silent_when_pctool_ends_the_turn
   stays-silent-with-no-payload:case_stays_silent_with_no_payload

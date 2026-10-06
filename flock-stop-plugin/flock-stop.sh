@@ -70,6 +70,22 @@ fi
 
 [ -n "$out" ] || exit 0
 
+# Which shape is this? `.decision` being a string is the flat shape; an object is
+# the envelope. Anything unparseable leaves both unset, which stands down.
+shape=""
+decision_a=""; reason_a=""; decision_b=""; reason_b=""
+if printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+  decision_a="$(printf '%s' "$out" | jq -r 'if (.decision|type)=="string" then .decision else empty end' 2>/dev/null || true)"
+  reason_a="$(printf '%s' "$out" | jq -r 'if (.decision|type)=="string" then (.reason // empty) else empty end' 2>/dev/null || true)"
+  decision_b="$(printf '%s' "$out" | jq -r '.decision.decision // empty' 2>/dev/null || true)"
+  reason_b="$(printf '%s' "$out" | jq -r '.decision.reason // empty' 2>/dev/null || true)"
+  if [ -n "$decision_a" ]; then shape=flat
+  elif [ -n "$decision_b" ]; then shape=envelope
+  else
+    log "pc-tool printed JSON in a shape this hook does not recognise; standing down"
+  fi
+fi
+
 # pc-tool prints a JSON ENVELOPE whose `decision` is a nested object:
 #   {"hook":"stop","blocked":true,"reason":"...","decision":{"decision":"block",...}}
 # mcode requires `decision` to be the string "block", so the envelope has to be
@@ -81,10 +97,27 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-decision="$(printf '%s' "$out" | jq -r '.decision.decision // empty' 2>/dev/null || true)"
+# BOTH shapes are accepted, deliberately.
+#
+#   flat     {"decision":"block","reason":"..."}          — sparkfn/pc-tools#1710
+#                                                           after its flat-shape change
+#   envelope {"hook":"stop","decision":{"decision":...}}  — #1710 today
+#
+# Accepting only the flat shape would make this hook a hard dependency on a
+# merge: between #1710 changing and this hook shipping there is a window where
+# machines run a hook that no longer understands its output and silently stop
+# blocking, which is the exact failure this hook exists to prevent. Accepting
+# both means it is correct on either side of that merge.
+#
+# Anything else — a shape neither side documents — STANDS THE HOOK DOWN. A
+# future #1710 must not be able to wedge every member by changing its output.
+decision=""
+reason=""
+case "$shape" in
+  flat)     decision="$decision_a"; reason="$reason_a" ;;
+  envelope) decision="$decision_b"; reason="$reason_b" ;;
+esac
 [ "$decision" = "block" ] || exit 0
-
-reason="$(printf '%s' "$out" | jq -r '.decision.reason // empty' 2>/dev/null || true)"
 
 # mcode discards a block with no reason (its validator requires one), so a
 # reason-less block is not a block. Standing down is better than emitting a
