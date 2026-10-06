@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# tests/fake-pc-tool — a stand-in for `pc-tool flock hook stop`.
+#
+# The envelope it prints is controlled by FAKED_PC_TOOL_OUT. If that is unset it
+# prints nothing, which is the "verb missing / crashed" case.
+#
+# The real verb does not exist on this machine yet: sparkfn/pc-tools#1710 is
+# open. So every case here runs against the CONTRACT documented in that PR, and
+# none of them can pass by accident against a real pc-tool.
+
+set -uo pipefail
+
+[ "${1:-}" = "flock" ] && [ "${2:-}" = "hook" ] && [ "${3:-}" = "stop" ] || exit 64
+
+# Read the payload off stdin, the way the real verb does. Recorded so a case can
+# assert the hook actually PASSED IT THROUGH rather than testing a fallback.
+if [ -n "${FAKED_PC_TOOL_PAYLOAD_LOG:-}" ]; then
+  cat > "$FAKED_PC_TOOL_PAYLOAD_LOG"
+fi
+
+printf '%s' "${FAKED_PC_TOOL_OUT:-}"
+exit 0
