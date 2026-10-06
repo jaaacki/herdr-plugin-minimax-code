@@ -1,0 +1,18 @@
+{
+  "name": "flock-stop",
+  "version": "0.1.0",
+  "description": "Block a flock member's turn from ending silently, by asking `pc-tool flock hook stop`. Inert unless installed, and a no-op until sparkfn/pc-tools#1710 merges.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env bash \"${PLUGIN_ROOT}/flock-stop.sh\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
