@@ -1131,17 +1131,23 @@ cmd_ensure_watcher() {
 # about a follow-up step, not a failed install. Pretending it succeeded — or
 # telling the user to go and look — is what produced the original defect.
 enable_mcode_plugin() {
-  local mcode_bin state
+  local mcode_bin state id
+  # One function for both plugins, parameterised rather than copied: the
+  # "installed is not enabled" check below is the part that must not drift, and
+  # a guard that exists once per plugin is a guard that gets fixed once per
+  # plugin. `$1` is the plugin NAME; the id is built here, so every line that
+  # prints advice to a human still reads `mcode plugin enable <id>`.
+  id="${1:-herdr-bootstrap}@local"
   mcode_bin="$(command -v mcode 2>/dev/null || true)"
   if [ -z "$mcode_bin" ]; then
     log "minimax-code: mcode is not on PATH, so the plugin cannot be enabled from here."
     log "minimax-code: the files are installed but INERT. Before starting mcode, run:"
-    log "minimax-code:   mcode plugin enable herdr-bootstrap@local"
+    log "minimax-code:   mcode plugin enable $id"
     return 1
   fi
 
-  if ! "$mcode_bin" plugin enable herdr-bootstrap@local >/dev/null 2>&1; then
-    log "minimax-code: 'mcode plugin enable herdr-bootstrap@local' failed."
+  if ! "$mcode_bin" plugin enable $id >/dev/null 2>&1; then
+    log "minimax-code: 'mcode plugin enable $id' failed."
     log "minimax-code: the files are installed but may be INERT; check 'mcode plugin list'."
     return 1
   fi
@@ -1150,11 +1156,11 @@ enable_mcode_plugin() {
   # hard-depend on it: fall back to the human-readable list, where the two states
   # are `[*] ... enabled` and `[-] ... disabled`.
   if command -v jq >/dev/null 2>&1; then
-    state="$("$mcode_bin" plugin list --json 2>/dev/null | jq -r --arg id "herdr-bootstrap@local" \
+    state="$("$mcode_bin" plugin list --json 2>/dev/null | jq -r --arg id "$id" \
       '[.installed[]? | select(.pluginId == $id) | .enabled] | first // "absent"' 2>/dev/null)"
   else
     state="$("$mcode_bin" plugin list 2>/dev/null \
-      | grep 'herdr-bootstrap@local' | grep -q 'enabled' && echo true || echo unknown)"
+      | grep "$id" | grep -q 'enabled' && echo true || echo unknown)"
   fi
 
   # The list line, printed as an ASSERTION. A hint ("you may want to check
@@ -1162,7 +1168,7 @@ enable_mcode_plugin() {
   # exactly how a disabled plugin came to be reported as an upstream mcode bug.
   # The line is the evidence; print it while it is still true.
   local listed=""
-  listed="$("$mcode_bin" plugin list 2>/dev/null | grep 'herdr-bootstrap@local' | head -1)"
+  listed="$("$mcode_bin" plugin list 2>/dev/null | grep "$id" | head -1)"
   [ -n "$listed" ] && log "minimax-code: mcode plugin list reports: $listed"
 
   if [ "$state" = "true" ]; then
@@ -1173,7 +1179,7 @@ enable_mcode_plugin() {
   log "minimax-code: the plugin is installed but NOT enabled (state: ${state:-unknown})."
   log "minimax-code: a disabled plugin never fires its hooks, so mcode would start and"
   log "minimax-code: register nothing. Run this, then start mcode:"
-  log "minimax-code:   mcode plugin enable herdr-bootstrap@local"
+  log "minimax-code:   mcode plugin enable $id"
   return 1
 }
 
@@ -1186,15 +1192,18 @@ enable_mcode_plugin() {
 # tonight. Uninstalling is therefore a first-class operation, not the manual
 # `mcode plugin remove` a user would otherwise have to know to run.
 cmd_uninstall_hook() {
-  local data_dir dest_root dest mcode_bin remaining
+  local data_dir dest_root dest mcode_bin remaining plugin
+  # `$1` is the plugin NAME. Defaults keep every existing caller and test on
+  # exactly the behaviour it had before flock-stop existed.
+  plugin="${1:-herdr-bootstrap}"
   data_dir="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
   dest_root="$data_dir/plugins"
-  dest="$dest_root/herdr-bootstrap"
+  dest="$dest_root/$plugin"
   mcode_bin="$(command -v mcode 2>/dev/null || true)"
 
   if [ -n "$mcode_bin" ]; then
-    if "$mcode_bin" plugin remove herdr-bootstrap@local >/dev/null 2>&1; then
-      log "minimax-code: removed herdr-bootstrap@local via mcode."
+    if "$mcode_bin" plugin remove $plugin@local >/dev/null 2>&1; then
+      log "minimax-code: removed $plugin@local via mcode."
     else
       log "minimax-code: 'mcode plugin remove' did not report success; checking the directory anyway."
     fi
@@ -1207,7 +1216,7 @@ cmd_uninstall_hook() {
   # `rm` and never a trash can (issue #109).
   #
   # The guard is on CONTENT, not on the path string, and that is deliberate. A
-  # `case "$dest" in "$dest_root"/herdr-bootstrap)` guard here CANNOT fail: dest is
+  # `case "$dest" in "$dest_root"/"$plugin")` guard here CANNOT fail: dest is
   # built from that exact string two lines up, so the arm is unreachable, and every
   # reader — including me — would go on believing the safety lives in the check. A
   # check that cannot fail is the same disease as a test that cannot fail, and this
@@ -1226,22 +1235,32 @@ cmd_uninstall_hook() {
   if [ -e "$dest" ]; then
     die "the plugin is still installed at $dest; mcode would keep loading it."
   fi
-  log "minimax-code: herdr-bootstrap is gone; mcode sessions will no longer self-register."
+  log "minimax-code: $plugin is gone."
   return 0
 }
 
+# cmd_install_hook [plugin-name] [source-dir] [script-to-chmod]
+#
+# Defaults are herdr-bootstrap's, so every existing caller and test keeps the
+# exact behaviour it had. flock-stop differs in the two things that matter to
+# this function — its source directory and the script that needs +x — so those
+# are parameters rather than a second copy of a function whose safety guards
+# must not be free to drift apart.
 cmd_install_hook() {
-  local dir dest_root dest
+  local dir dest_root dest plugin src exec_rel
+  plugin="${1:-herdr-bootstrap}"
+  src="${2:-mcode-plugin}"
+  exec_rel="${3:-hooks/herdr-bootstrap.sh}"
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
   [ -n "$dir" ] || die "cannot resolve the plugin root from this script's own location."
-  [ -f "$dir/mcode-plugin/.claude-plugin/plugin.json" ] ||
-    die "no mcode plugin at $dir/mcode-plugin — is this the plugin checkout?"
+  [ -f "$dir/$src/.claude-plugin/plugin.json" ] ||
+    die "no mcode plugin at $dir/$src — is this the plugin checkout?"
 
   # MINIMAX_DATA_DIR is mcode's data dir and the only supported way to relocate it.
   # Defaulting to ~/.minimax matches what mcode itself uses on this platform.
   local data_dir="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
   dest_root="$data_dir/plugins"
-  dest="$dest_root/herdr-bootstrap"
+  dest="$dest_root/$plugin"
 
   mkdir -p "$dest_root" || die "cannot create $dest_root"
 
@@ -1252,7 +1271,7 @@ cmd_install_hook() {
     # neighbouring plugin. The path is a fixed literal under a fixed root, and the
     # guard below refuses to continue if it is not exactly that.
     case "$dest" in
-      "$dest_root"/herdr-bootstrap) : ;;
+      "$dest_root"/"$plugin") : ;;
       *) die "refusing to remove $dest: it is not the expected install path." ;;
     esac
     /bin/rm -rf "$dest" || die "cannot remove the previous install at $dest"
@@ -1260,14 +1279,12 @@ cmd_install_hook() {
   fi
 
   mkdir -p "$dest" || die "cannot create $dest"
-  cp -R "$dir/mcode-plugin/." "$dest/" || die "cannot copy the mcode plugin into $dest"
-  chmod +x "$dest/hooks/herdr-bootstrap.sh" 2>/dev/null || true
+  cp -R "$dir/$src/." "$dest/" || die "cannot copy the $src plugin into $dest"
+  chmod +x "$dest/$exec_rel" 2>/dev/null || true
 
   [ -f "$dest/.claude-plugin/plugin.json" ] || die "install finished but the manifest is missing at $dest."
 
-  log "minimax-code: installed the mcode SessionStart hook into $dest"
-  log "minimax-code: it registers a pane ONCE per session and never reports state;"
-  log "minimax-code: bin/mcode-watch.sh, which that registration starts, owns state from then on."
+  log "minimax-code: installed the $plugin mcode plugin into $dest"
 
   # Installed is not enabled. This is the step whose absence made the plugin look
   # broken: present on disk, listed by `mcode plugin list`, and never once fired.
@@ -1279,7 +1296,7 @@ cmd_install_hook() {
   # moves the failure from install time - where it is one clear line and a fixable
   # command - to session time, where it is indistinguishable from mcode being
   # broken. enable_mcode_plugin has already printed the state and the command.
-  enable_mcode_plugin ||
+  enable_mcode_plugin "$plugin" ||
     die "installed the files, but the plugin is NOT enabled: mcode would start and register nothing."
 
   log "minimax-code: install complete. Start mcode and the pane registers itself on SessionStart."
@@ -1300,8 +1317,18 @@ main() {
     uninstall-hook)
       cmd_uninstall_hook
       ;;
+    install-flock-stop)
+      cmd_install_hook flock-stop flock-stop-plugin flock-stop.sh
+      ;;
+    uninstall-flock-stop)
+      cmd_uninstall_hook flock-stop
+      ;;
+    install-all)
+      cmd_install_hook
+      cmd_install_hook flock-stop flock-stop-plugin flock-stop.sh
+      ;;
     *)
-      log "usage: mcode-plugin.sh start | ensure-watcher | install-hook | uninstall-hook"
+      log "usage: mcode-plugin.sh start | ensure-watcher | install-hook | uninstall-hook | install-flock-stop | uninstall-flock-stop | install-all"
       exit 2
       ;;
   esac

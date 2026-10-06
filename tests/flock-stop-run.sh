@@ -65,7 +65,10 @@ run_case() { # run_case <name> <fn>
   # the status instead of the flag makes a red case print FAIL and be tallied as
   # a pass — a suite that reports "all passed" while showing a FAIL line, and
   # exits 0, which is the one outcome worse than having no suite at all.
-  "$2" >/dev/null 2>&1 || true
+  # NOT redirected: a failing case that cannot say why is a suite that has to be
+  # re-run with an edit before it tells you anything. Each case already sends its
+  # own command output to files, so nothing leaks by letting stderr through.
+  "$2" || true
   if [ "$broke" -eq 0 ]; then
     printf 'ok   %s\n' "$1"
   else
@@ -278,6 +281,142 @@ case_fails_open_without_jq() {
   fi
 }
 
+# ---- the installer arm (#1699 item 3) --------------------------------------
+#
+# The hook is worthless if `bin/mcode-plugin.sh` cannot put it on a machine.
+# These cases drive the REAL installer against a fake mcode, exactly the way
+# tests/hook-run.sh drives the herdr-bootstrap arm, and assert on what the
+# installer actually asked mcode to do — a textual check for "plugin enable"
+# would pass on a comment.
+
+# fire_install <command> <enabled: true|false> [name-log]
+fire_install() {
+  local cmd="$1" enabled="$2" name_log="${3:-m6-flockstop}"
+  local fake="$WORK/inst-$name_log" data="$WORK/instdata-$name_log" out="$WORK/inst-$name_log.out"
+  mkdir -p "$fake" "$data" 2>/dev/null || return 1
+  cat > "$fake/mcode" <<'FAKEEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$M6_INST_LOG"
+case "${1:-} ${2:-}" in
+  "plugin enable") exit 0 ;;
+  "plugin list")
+    if [ "${M6_INST_JSON:-}" = "1" ]; then
+      if [ "${M6_INST_ENABLED:-true}" = "true" ]; then
+        printf '{"installed":[{"pluginId":"%s@local","enabled":true}]}\n' "$M6_INST_NAME"
+      else
+        printf '{"installed":[{"pluginId":"%s@local","enabled":false}]}\n' "$M6_INST_NAME"
+      fi
+    fi
+    printf '[-] %s@local\tenabled\n' "$M6_INST_NAME"
+    exit 0 ;;
+esac
+exit 0
+FAKEEOF
+  chmod +x "$fake/mcode"
+  export M6_INST_LOG="$WORK/inst-$name_log.calls"
+  export M6_INST_JSON=1 M6_INST_ENABLED="$enabled" M6_INST_NAME=flock-stop
+  : > "$M6_INST_LOG"
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$data" "$repo/bin/mcode-plugin.sh" "$cmd" > "$out" 2>&1
+  INST_RC=$?
+  unset M6_INST_LOG M6_INST_JSON M6_INST_ENABLED M6_INST_NAME
+  INST_OUT="$out"; INST_DATA="$data"
+  return 0
+}
+
+INST_RC=0; INST_OUT=""; INST_DATA=""
+inst_calls() { cat "$WORK/inst-$1.calls" 2>/dev/null; }
+
+case_install_flock_stop_enables_the_plugin() {
+  local log="enables"
+  fire_install install-flock-stop true "$log" || { note "harness setup failed"; return; }
+  if [ "$INST_RC" -ne 0 ]; then
+    note "install-flock-stop exited $INST_RC: $(head -3 "$INST_OUT" | tr '\n' '|')"
+    return
+  fi
+  if ! grep -q '^plugin enable flock-stop@local$' "$WORK/inst-$log.calls" 2>/dev/null; then
+    note "never ran 'mcode plugin enable flock-stop@local'; calls: $(inst_calls "$log" | tr '\n' '|')"
+  fi
+  if ! grep -q 'plugin list' "$WORK/inst-$log.calls" 2>/dev/null; then
+    note "enabled the plugin without ever checking whether it took"
+  fi
+  if ! grep -q 'mcode plugin list reports' "$INST_OUT" 2>/dev/null; then
+    note "did not print the plugin list line; a hint instead is how a disabled plugin was reported as an mcode bug"
+  fi
+  # The files really landed, and under the plugin's OWN name — not under
+  # herdr-bootstrap's, which would overwrite the other plugin on a machine that
+  # has both.
+  if [ ! -f "$INST_DATA/plugins/flock-stop/.claude-plugin/plugin.json" ]; then
+    note "the manifest did not land at plugins/flock-stop/"
+  fi
+  if [ ! -x "$INST_DATA/plugins/flock-stop/flock-stop.sh" ]; then
+    note "flock-stop.sh landed without the executable bit; mcode cannot run a non-executable hook"
+  fi
+  if [ -e "$INST_DATA/plugins/herdr-bootstrap" ]; then
+    note "installing flock-stop created a herdr-bootstrap directory; it must touch only its own"
+  fi
+}
+
+case_install_flock_stop_fails_when_mcode_says_disabled() {
+  # The other half, and the one that matters. A warn-and-return-success here moves
+  # the failure from install time to session time, where a user cannot tell a
+  # half-install from a broken mcode.
+  local log="disabled"
+  fire_install install-flock-stop false "$log" || { note "harness setup failed"; return; }
+  if [ "$INST_RC" -eq 0 ]; then
+    note "mcode reported the plugin disabled and install-flock-stop still exited 0;"
+    note "copying files into a directory is not an install"
+  fi
+  if ! grep -q 'NOT enabled' "$INST_OUT" 2>/dev/null; then
+    note "mcode reported the plugin disabled and the install did not say so: $(head -4 "$INST_OUT" | tr '\n' '|')"
+  fi
+  if ! grep -q 'mcode plugin enable flock-stop@local' "$INST_OUT" 2>/dev/null; then
+    note "did not name the command that would fix it"
+  fi
+}
+
+case_uninstall_flock_stop_removes_only_its_own() {
+  local log="uninstall"
+  # SAME case name for both calls: fire_install derives its data dir from it, so
+  # installing under one name and uninstalling under another would have the
+  # uninstall operate on an empty directory and pass for the wrong reason.
+  fire_install install-flock-stop true "$log" || { note "harness setup failed"; return; }
+  local data="$WORK/instdata-$log"
+  mkdir -p "$data/plugins/some-other-plugin" 2>/dev/null
+  printf 'neighbour' > "$data/plugins/some-other-plugin/keep.txt" 2>/dev/null
+
+  fire_install uninstall-flock-stop true "$log" || { note "harness setup failed"; return; }
+  if [ "$INST_RC" -ne 0 ]; then
+    note "uninstall-flock-stop exited $INST_RC: $(head -3 "$INST_OUT" | tr '\n' '|')"
+  fi
+  if [ -e "$data/plugins/flock-stop" ]; then
+    note "left the plugin directory behind; it would keep loading"
+  fi
+  if [ ! -e "$data/plugins/some-other-plugin/keep.txt" ]; then
+    note "removed a NEIGHBOURING plugin; it must touch only its own"
+  fi
+}
+
+# The guard has to be one that CAN fail. The uninstall path guard is built from
+# a string two lines earlier, so a path-string check can never fire. What can be
+# wrong is the CONTENT: a non-empty directory at our path holding no manifest is
+# somebody else's.
+case_uninstall_refuses_a_directory_that_is_not_ours() {
+  local foreign="$WORK/foreigndata"
+  mkdir -p "$foreign/plugins/flock-stop" 2>/dev/null
+  printf 'someone elses files\n' > "$foreign/plugins/flock-stop/important.txt" 2>/dev/null
+  local fake="$WORK/inst-foreign" out="$WORK/inst-foreign.out"
+  mkdir -p "$fake" 2>/dev/null || { note "harness setup failed"; return; }
+  printf '#!/bin/sh\nexit 0\n' > "$fake/mcode"; chmod +x "$fake/mcode"
+  PATH="$fake:$PATH" MINIMAX_DATA_DIR="$foreign" "$repo/bin/mcode-plugin.sh" uninstall-flock-stop > "$out" 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    note "removed a non-empty directory that is not this plugin's and exited 0; the content guard is not doing anything"
+  fi
+  if [ ! -e "$foreign/plugins/flock-stop/important.txt" ]; then
+    note "deleted a directory it did not own; the guard must refuse"
+  fi
+}
+
 # ---- wiring -----------------------------------------------------------------
 
 case_manifest_declares_the_stop_hook() {
@@ -334,6 +473,10 @@ CASES=(
   fails-open-on-unparseable-pctool-output:case_fails_open_on_unparseable_pctool_output
   fails-open-when-the-verb-is-missing:case_fails_open_when_the_verb_is_missing
   fails-open-without-jq:case_fails_open_without_jq
+  install-flock-stop-enables-the-plugin:case_install_flock_stop_enables_the_plugin
+  install-flock-stop-fails-when-mcode-says-disabled:case_install_flock_stop_fails_when_mcode_says_disabled
+  uninstall-flock-stop-removes-only-its-own:case_uninstall_flock_stop_removes_only_its_own
+  uninstall-refuses-a-directory-that-is-not-ours:case_uninstall_refuses_a_directory_that_is_not_ours
   manifest-declares-the-stop-hook:case_manifest_declares_the_stop_hook
   manifest-command-uses-braced-plugin-root:case_manifest_command_uses_braced_plugin_root
   manifest-command-actually-executes:case_manifest_command_actually_executes
