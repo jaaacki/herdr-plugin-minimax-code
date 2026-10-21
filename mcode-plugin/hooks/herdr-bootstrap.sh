@@ -16,6 +16,14 @@
 # PreToolUse or UserPromptSubmit handler, and why it has no release path at all.
 # The absence is the design, not an omission.
 #
+# THE ONE STATE THIS FILE DOES REPORT IS `working`, AND IT IS NOT A
+# UserPromptSubmit HANDLER. It is the state of the report that registers the
+# pane, and it is `working` because `SessionStart` is dispatched from `beginTurn`
+# - the hook runs at the START OF A TURN. The one-shot guard is keyed on the
+# session, so this still reports exactly once per session; the watcher owns every
+# state change after that. See the comment at the report itself for the
+# measurement.
+#
 # In particular there is NO `release-agent` call anywhere, including at Stop.
 # `release-agent` DELETES a registration rather than handing authority back
 # (measured on 0.9.3, recorded in bin/mcode-watch.sh), and Stop is a TURN
@@ -701,14 +709,41 @@ main() {
       ;;
   esac
 
-  # The single report, to the socket the ancestry proved. State is `idle`: the
-  # session has just started and no turn is running. From here the watcher owns
-  # state, and this hook never reports again.
+  # The single report, to the socket the ancestry proved.
+  #
+  # THE STATE IS `working`, AND THAT IS NOT A TYPO. This hook used to report
+  # `idle`, on the belief - stated right here for years - that "the session has
+  # just started and no turn is running". That belief is false, and it was
+  # false in a way that matters.
+  #
+  # WHEN SESSIONSTART ACTUALLY FIRES. Measured on mcode 0.6.12 (2026-10-21),
+  # chunk-47KWM23C.js: the `SessionStart` handlers are dispatched from the
+  # method `beginTurn`, immediately before the turn executes:
+  #
+  #   beginTurn -> runner.run(handlers, MV("SessionStart", t, {source}, source))
+  #             -> runner.run(handlers, MV("UserPromptSubmit", t, {prompt}))
+  #             -> ... -> execute() -> IZe() -> this.executeTurn(...)
+  #
+  # `MV` builds the hook payload, and its `event` field is the event NAME -
+  # the same "SessionStart" this manifest subscribes to. So the handler runs at
+  # the START OF A TURN, not when the session is created. The corroborating
+  # measurement is on this machine: an mcode left sitting at its start prompt
+  # produced no hook at all for minutes, and the hook fired the moment the
+  # first prompt created the session.
+  #
+  # SO THE TURN IS RUNNING when this reports. Reporting `idle` here tells
+  # herdr that an agent which is working is idle, and `herdr agent wait
+  # --until idle` answers a turn that has barely begun. The truth is one word
+  # away.
+  #
+  # WHY IT IS STILL ONE REPORT. The once-guard above is keyed on the SESSION,
+  # so this fires once per session however many turns the session runs. From
+  # here the watcher owns the state changes, and this hook never reports again.
   if h_ "$sock" pane report-agent "$pane_id" \
     --source "$AGENT_SOURCE" \
     --agent "$AGENT_LABEL" \
-    --state idle; then
-    log "registered pane $pane_id (source=$AGENT_SOURCE agent=$AGENT_LABEL state=idle); the watcher owns state from here."
+    --state working; then
+    log "registered pane $pane_id (source=$AGENT_SOURCE agent=$AGENT_LABEL state=working); the watcher owns state from here."
   else
     # Not fatal: herdr refused, and no registration is better than a wrong one.
     log "herdr REFUSED the registration for pane $pane_id; nothing was registered."

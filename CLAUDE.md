@@ -285,6 +285,58 @@ is optional**. A MINIMAX-format manifest did not produce a hook package at all �
 from `mcode plugin list` *and* from the hook cache — so the CLAUDE-format manifest is the
 form that works here, not a preference.
 
+### When `SessionStart` fires: at the START OF A TURN, not when the session is created
+
+This is the single most load-bearing fact about the hook, and it was wrong in this repo
+for a long time. Read it before changing anything about the hook's state.
+
+Measured on mcode 0.6.12 (2026-10-21), `chunk-47KWM23C.js`:
+
+| What | Where | What it says |
+|---|---|---|
+| `MV(e,t,n,r)` | the payload builder | returns `{event: e, sessionId, turnId, transcriptPath, cwd, model, …, payload: n}` — `event` is the event NAME |
+| `beginTurn` | the method that dispatches the session hooks | `runner.run(handlers, MV("SessionStart", t, {source}, source))` and then `runner.run(handlers, MV("UserPromptSubmit", t, {prompt}))` |
+| `IZe` | the function that runs the plugin hooks | called from `execute()` **immediately before** `this.executeTurn(...)` |
+| `finishTurn` | the method that dispatches the turn-end hook | `runner.run(handlers, MV("Stop", t, {stop_hook_active, last_assistant_message}))` |
+
+So `SessionStart` is dispatched from `beginTurn`, at the start of a turn. The corroborating
+measurement is on the machine: an mcode left sitting at its **start prompt** produced no
+hook at all for minutes, and the hook fired the moment the **first prompt** created the
+session. Two consequences, both of which this repo got wrong:
+
+1. **A session that has not been typed into never fires the hook.** There is no "session
+   created" event to wait for. That is the whole of issue #126, and the remedy is the
+   `register` action, not a better wait.
+2. **The hook's one report happens while a turn is RUNNING**, so the state it reports is
+   `working`. It used to report `idle`, on the belief that "the session has just started
+   and no turn is running" — a belief the code above refutes. `herdr agent wait --until
+   idle` answers a turn that has barely begun.
+
+### The hook events mcode 0.6.12 actually dispatches
+
+The manifest schema accepts this set (`$fe` in `chunk-47KWM23C.js`):
+
+```
+SessionStart  SessionEnd  UserPromptSubmit  PreToolUse  PermissionRequest
+PostToolUse   SubagentStart  SubagentStop  Stop  PreCompact  PostCompact
+```
+
+and the runtime dispatches all of them: `SessionStart`/`UserPromptSubmit` from `beginTurn`,
+`Stop` from `finishTurn`, and the tool, permission and compaction events around them.
+`SessionEnd` has a dispatch site too, but it has never been observed firing — see the
+measured fact above. Two consequences for this plugin:
+
+- **`Stop` is dispatched, and this plugin does not use it.** The exact turn end is
+  available; the watcher still infers it from the screen. Wiring `Stop` to `--state idle`
+  means the hook becomes a second writer of the same field the watcher owns, which is
+  precisely the fight the hook's header says this file exists to prevent. That is a design
+  change and wants its own issue and its own evidence — not a drive-by edit here.
+- **`PermissionRequest` is dispatched, but `blocked` stays unreachable for now.** The
+  runtime raises it only when a session is not at `Full access`, and this plugin has never
+  observed a real permission prompt, so there is no captured screen and no way to prove the
+  mapping from here. Claiming `blocked` without that proof is the "a rule that never fires
+  would be a lie in the code" failure the watcher already refuses.
+
 ## Ownership
 
 `PLAN.md` and `HANDOFF.md` are architect-only. The epic's file-ownership table is strict —

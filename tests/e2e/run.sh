@@ -1639,11 +1639,12 @@ STANDIN
   fi
 
   # THE STATE IS DELIBERATELY NOT ASSERTED, and reading that as an omission would be
-  # a mistake. The hook's one report is `--state idle`, but by the time this case
-  # reads the pane the watcher — started BY that report — has already classified the
+  # a mistake. The hook's one report is `--state working` — the hook fires at the
+  # START OF A TURN, so the turn is running when it reports — but by the time this
+  # case reads the pane the watcher — started BY that report — has already classified the
   # pane from its screen and owns the value. Measured here: `unknown`, because the
   # stand-in is not a real mcode screen. That is the design working, not a
-  # regression, and asserting `idle` would be asserting that the watcher had not yet
+  # regression, and asserting a state would be asserting that the watcher had not yet
   # run — i.e. asserting a race. What must hold is that the pane is registered under
   # the shared label and that exactly one watcher now owns it.
   local row

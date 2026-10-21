@@ -534,7 +534,7 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
   fi
 
   if [ -n "$launch_line" ]; then
-    log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. Its log is ${log}. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - MiniMax Code 0.6.2 exposes no hook a plugin can read, so idle/working/unknown is the whole range."
+    log "minimax-code: started the state watcher for pane ${pane}, so idle/working will follow the pane. Its log is ${log}. It stops by itself when the pane closes. Set MCODE_WATCH_AUTOSTART=0 to skip this next time; \`blocked\` is never reported - this plugin SHIPS a hook and reads it (the session hook above), but MiniMax Code 0.6.12 raises no permission prompt this plugin can observe, so idle/working/unknown is the whole range."
   fi
   return 0
 }

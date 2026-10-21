@@ -184,10 +184,20 @@ Everything ships inert until you run it, the same way
 a plugin you just enabled.
 
 **What it does, and just that:** on `SessionStart` the hook finds the Herdr pane that owns
-the session and registers it, once, as `idle`. That single registration fires
+the session and registers it, once, as `working`. That single registration fires
 `pane.agent_status_changed`, which is what starts the watcher described above — and the
 watcher owns every state change from then on. The hook never reports state again and
 never releases the registration, so there is exactly one writer per pane.
+
+**Why `working`, and not `idle`.** Because `SessionStart` is dispatched at the **start of
+a turn**, not when the session is created. Measured on mcode 0.6.12: the runtime runs the
+session hooks from `beginTurn`, immediately before the turn executes, and an `mcode` left
+sitting at its start prompt fires **no hook at all** until the first prompt. So a turn is
+running when the hook reports, and `idle` would tell Herdr that a working agent is idle —
+which `herdr agent wait --until idle` answers. The two consequences of the same fact:
+a session nobody has typed into never fires the hook (use the **register** action for
+that), and the hook's report is the one moment when the plugin knows the agent is busy
+rather than inferring it from the screen.
 
 **What is proven, and what is not.** On a real machine (mcode 0.6.2, Herdr 0.9.3,
 macOS arm64) six sessions fired the hook and six panes registered correctly — each

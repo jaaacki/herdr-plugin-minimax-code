@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the hook reported `idle` while the turn it fires in was running
+
+- **The session hook's one report said `idle`, at the exact moment a turn was
+  running.** The hook used to carry the belief — in its own comment — that "the
+  session has just started and no turn is running". That is false. Measured on
+  mcode 0.6.12 (2026-10-21), `chunk-47KWM23C.js`: the `SessionStart` handlers are
+  dispatched from `beginTurn`, immediately before the turn executes, and `IZe` —
+  the function that runs the plugin hooks — is called from `execute()` right
+  before `this.executeTurn(...)`. Corroborated on the machine: an `mcode` left
+  sitting at its start prompt fired **no hook at all** for minutes, and the hook
+  fired the moment the first prompt created the session. So the report is made
+  with a turn in flight, and it now says `working`. `herdr agent wait --until
+  idle` no longer answers a turn that has barely begun.
+- **The launcher told users that mcode "exposes no hook a plugin can read"**,
+  in the very message that starts this plugin's own hook-driven registration.
+  It does read one — this plugin ships it — and the line now says so. `blocked`
+  is still never reported: mcode raises no permission prompt this plugin can
+  observe, so there is nothing to report it from.
+
 ## 0.6.2 — one report per session, and the suites stop writing the real home
 
 A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.

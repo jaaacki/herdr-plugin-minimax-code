@@ -485,8 +485,25 @@ case_reports_once_with_the_shared_source() {
   if ! grep -q -- '--source herdr:minimax-code' "$FAKE_HOOK_LOG" 2>/dev/null; then
     note "the report did not carry --source herdr:minimax-code"
   fi
-  if ! grep -q -- '--state idle' "$FAKE_HOOK_LOG" 2>/dev/null; then
-    note "the bootstrap report should be --state idle; a session has just started"
+  # THE STATE IS `working`, NOT `idle`. This used to assert `idle`, on the belief
+  # that "a session has just started" and no turn is running. That belief is
+  # false: `SessionStart` is dispatched from `beginTurn`, so the handler runs at
+  # the START OF A TURN. Measured on mcode 0.6.12, chunk-47KWM23C.js:
+  # `beginTurn -> runner.run(handlers, MV("SessionStart", ...))` and `MV` builds
+  # the payload whose `event` field is the event name this manifest subscribes
+  # to. Corroborated on the machine: an mcode sitting at its start prompt fired
+  # no hook for minutes, and the hook fired when the first prompt created the
+  # session.
+  #
+  # So the turn IS running when this reports, and `idle` told herdr that a
+  # working agent was idle - which `herdr agent wait --until idle` answers.
+  if ! grep -q -- '--state working' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the bootstrap report should be --state working; the hook fires at the start of a turn"
+  fi
+  # And it must NOT say idle: a report that carried both states would be a
+  # report whose state depends on which line the grep found.
+  if grep -q -- '--state idle' "$FAKE_HOOK_LOG" 2>/dev/null; then
+    note "the bootstrap report said --state idle; a turn is running when this hook fires"
   fi
 }
 
