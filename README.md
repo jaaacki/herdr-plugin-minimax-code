@@ -64,6 +64,16 @@ In a workspace or a pane, open Herdr's action menu and choose
 **Start MiniMax Code in this worktree** (action id `minimax-code-start`). A new
 pane opens beside yours with `mcode` running in it.
 
+**The pane gets a temp directory of its own.** The launch runs
+`TMPDIR=<per-pane directory> mcode`, because mcode keeps every plugin hook's
+transcript in one shared directory and evicts files it does not own — one
+instance's housekeeping can delete another's live transcript, and that instance's
+next hook read fails with `ENOENT`, killing the turn with *The response failed*.
+A temp directory per instance means the eviction cannot cross sessions. It
+covers the panes this plugin launches; a `mcode` you start by hand, or that
+flock starts, still shares the system temp directory until whoever launches it
+does the same. See issue #135.
+
 Nothing happened? Herdr reports a failed action in its log rather than in the
 pane, so the failure is silent by default. Check it with:
 

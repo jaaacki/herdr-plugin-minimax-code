@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — one temp directory per mcode instance
+
+- **One mcode instance's housekeeping could delete another's live hook transcript
+  (#135).** Every instance writes its plugin hook transcripts into one shared
+  directory, `os.tmpdir()/minimax-plugin-hooks/transcripts`, and after each write
+  mcode evicts files it does not own — by age (24 h) and by total size (64 MB) —
+  while protecting only that instance's own two files. So with several instances
+  running, one instance's eviction deletes another instance's **live** transcript,
+  that instance's next hook read fails with `ENOENT`, and the turn dies with
+  *The response failed*, leaving the user on `Run /retry`. Measured on mcode
+  0.6.12 (2026-10-21), `chunk-47KWM23C.js`: `maintainDirectory()` passes
+  `protectedPaths: new Set([this.path, this.codexPath])`. The launcher now gives
+  each pane a `TMPDIR` of its own, so the eviction cannot cross sessions. It
+  covers the panes this plugin launches; a `mcode` started by hand, or by flock,
+  still shares the system temp directory — that needs the upstream change.
+
 ## 0.6.2 — one report per session, and the suites stop writing the real home
 
 A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.

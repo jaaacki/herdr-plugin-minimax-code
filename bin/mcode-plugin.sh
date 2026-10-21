@@ -803,8 +803,48 @@ cmd_start() {
   fi
 
   # 6. Run the launcher in the new pane.
-  if ! "$HERDR" pane run "$new_pane" "$mcode_bin"; then
-    die "\`${HERDR} pane run ${new_pane} ${mcode_bin}\` failed, so MiniMax Code was not started. Pane ${new_pane} exists but is empty; close it by hand with \`${HERDR} pane close ${new_pane}\`."
+  #
+  #    WITH A TMPDIR OF ITS OWN (issue #135).
+  #
+  #    mcode writes every plugin hook's transcript into ONE shared directory,
+  #    os.tmpdir()/minimax-plugin-hooks/transcripts, and after each write it
+  #    runs maintainDirectory(), which evicts by age (24 h) and by total size
+  #    (64 MB) while protecting ONLY that instance's own two files. So one
+  #    instance's maintenance can delete another instance's live transcript,
+  #    and that instance's next hook read fails with ENOENT - the turn dies
+  #    with "The response failed" and the user is left sitting on
+  #    "Run /retry".
+  #
+  #    Measured on mcode 0.6.12 (2026-10-21), chunk-47KWM23C.js:
+  #      maintainDirectory(){return Mst(this.directory,{nowMs:...,maxAgeMs:...,
+  #        maxDirectoryBytes:...,protectedPaths:new Set([this.path,this.codexPath])})}
+  #    The defaults are p2n=1440 minutes of age and h2n=64 MB of directory
+  #    budget, and `maxDirectoryBytes` is at least twice the per-file limit.
+  #    Observed on this machine: 9 concurrent sessions sharing one directory,
+  #    9.8 MB of transcripts, two files per session.
+  #
+  #    A TMPDIR of its own makes that directory per instance, so the eviction
+  #    cannot cross sessions at all.
+  #
+  #    SCOPE, STATED PLAINLY. This covers the panes THIS plugin launches. A
+  #    mcode started by hand, or by flock, still shares the system TMPDIR -
+  #    that needs either the upstream change (mcode's eviction must skip files
+  #    other live sessions hold) or the same per-instance TMPDIR applied by
+  #    whoever launches it. See issue #135.
+  #
+  #    `pane run` TYPES the command into the pane's shell, so the assignment is
+  #    a shell assignment and the shell sets it for the command it runs. The
+  #    value is quoted because a custom TMPDIR can contain spaces, and the
+  #    absolute path to mcode is still there so the launch does not depend on
+  #    the pane's PATH.
+  local mcode_tmpdir="" launch_cmd="$mcode_bin"
+  mcode_tmpdir="$(instance_tmpdir "$new_pane")"
+  if [ -n "$mcode_tmpdir" ]; then
+    launch_cmd="TMPDIR=$(quote_shell "$mcode_tmpdir") $mcode_bin"
+  fi
+
+  if ! "$HERDR" pane run "$new_pane" "$launch_cmd"; then
+    die "\`${HERDR} pane run ${new_pane} ${launch_cmd}\` failed, so MiniMax Code was not started. Pane ${new_pane} exists but is empty; close it by hand with \`${HERDR} pane close ${new_pane}\`."
   fi
 
   log "minimax-code: started ${mcode_bin} in pane ${new_pane}"
@@ -955,6 +995,42 @@ cmd_start() {
   #     outermost concern of the three - the pane exists, then it is registered,
   #     then it has identity, then its state is live.
   watcher_autostart "$new_pane" "$agent_name"
+}
+
+# instance_tmpdir PANE — create and print a TMPDIR of this pane's own.
+#
+# WHY PER PANE AND NOT PER MACHINE. Every mcode instance writes its hook
+# transcripts into os.tmpdir()/minimax-plugin-hooks/transcripts and evicts
+# files it does not own (issue #135). One TMPDIR per instance makes that
+# directory per instance, and the eviction cannot cross instances.
+#
+# WHY THE PANE ID. It is the one identifier the launcher has that is unique
+# per instance, and it is the same identifier the rest of this plugin already
+# keys state on — so the directory a pane's mcode uses is discoverable from
+# the pane id alone, with no extra bookkeeping. A relaunch in the same pane
+# reuses that pane's directory: the previous instance's transcripts are dead
+# by then, and the only eviction left in it is its own.
+#
+# BEST EFFORT. If the directory cannot be created, the launch proceeds on the
+# shared TMPDIR, which is the behaviour before this change. A missing temp
+# directory must not stop a launch.
+instance_tmpdir() { # instance_tmpdir <pane-id>
+  local pane="$1" dir
+  dir="${MCODE_INSTANCE_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/minimax-code-instances/${pane}"
+  if ! mkdir -p -- "$dir" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$dir"
+}
+
+# quote_shell VALUE — print VALUE quoted for a shell.
+#
+# The pane's shell is what interprets the launch command, so a path with a
+# space in it has to arrive as one argument. Single quotes are the only
+# quoting that survives every character a path can hold except the single
+# quote itself, which is closed, escaped and reopened: ' -> '\''.
+quote_shell() { # quote_shell <value>
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 # ---------------------------------------------------------------------------

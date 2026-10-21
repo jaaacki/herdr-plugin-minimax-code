@@ -353,6 +353,12 @@ setup_case() {
   # That is cross-case coupling through the filesystem, and it is the kind that
   # passes locally and flakes in CI. One case, one state dir.
   export MCODE_WATCH_LOG_DIR="$CASE_DIR/watch-state"
+  # Per-case root for the per-instance TMPDIR the launcher gives mcode
+  # (issue #135). The implementation resolves it from the system TMPDIR by
+  # default, and WITHOUT this every case would create a directory in the
+  # real TMPDIR - the same class of leak as MCODE_WATCH_LOG_DIR above, and
+  # the same isolation a case inherits instead of having to remember.
+  export MCODE_INSTANCE_TMPDIR_ROOT="$CASE_DIR/instance-tmp"
   # Neutralise ambient herdr context so a case only ever sees what it sets.
   unset HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_CONTEXT_JSON
   unset HERDR_PLUGIN_STATE_DIR
@@ -480,7 +486,16 @@ expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd
   newpane="$(expected_new_pane)"
   lines="$(printf 'pane\tget\t%s\n%s' "$src" "$(expected_split_line "$src" "$with_cwd")")"
   if [ -n "$mcode" ]; then
-    lines="$(printf '%s\npane\trun\t%s\t%s' "$lines" "$newpane" "$mcode")"
+    # The launch command carries a TMPDIR of the pane's own (issue #135), so
+    # mcode's hook transcripts do not share one directory with every other
+    # instance on the machine. The value is quoted, because the pane's shell
+    # is what reads it.
+    #
+    # ONE FIELD, not two: `pane run` takes the whole command line as a single
+    # argument, and the stub logs argv fields, so the assignment and the
+    # program are one space-separated field. Splitting them here would make
+    # this expectation disagree with a correct implementation.
+    lines="$(printf '%s\npane\trun\t%s\tTMPDIR=%s %s' "$lines" "$newpane" "$(expected_instance_tmpdir "$newpane")" "$mcode")"
   fi
   if [ "$registered" = "reported" ] || [ "$registered" = "full" ]; then
     lines="$(printf '%s\npane\treport-agent\t%s\t--source\therdr:minimax-code\t--agent\tmcode\t--state\tunknown' \
@@ -546,6 +561,16 @@ expected_agent_name() { # expected_agent_name
     *,agent-names-taken,*) printf 'mcode-3' ;;
     *)                   printf 'mcode' ;;
   esac
+}
+
+# expected_instance_tmpdir PANE — the TMPDIR the launch command must carry,
+# already quoted, as it appears in the typed command line.
+#
+# Derived the way the implementation derives it, so the expectation follows the
+# implementation rather than restating it: the root is MCODE_INSTANCE_TMPDIR_ROOT
+# (the suite points it at the case's own directory), and the leaf is the pane id.
+expected_instance_tmpdir() { # expected_instance_tmpdir <pane-id>
+  printf "'%s/minimax-code-instances/%s'" "${MCODE_INSTANCE_TMPDIR_ROOT:-${TMPDIR:-/tmp}}" "$1"
 }
 
 # watcher_path_for ENTRYPOINT - the absolute watcher path the entrypoint's hint
@@ -2347,7 +2372,47 @@ case_43() { # #120: two ensure-watcher calls at the same instant start one watch
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42 case-43)
+# --- case 44 ----------------------------------------------------------------
+# The launch gives mcode a TMPDIR of its own (issue #135).
+#
+# mcode writes every plugin hook's transcript into ONE shared directory,
+# os.tmpdir()/minimax-plugin-hooks/transcripts, and after each write it evicts
+# files it does not own - by age (24 h) and by total size (64 MB) - while
+# protecting only that instance's own two files. So one instance's maintenance
+# can delete another instance's live transcript, and that instance's next hook
+# read fails with ENOENT and the whole turn dies with "The response failed".
+#
+# A TMPDIR of its own makes that directory per instance, so the eviction cannot
+# cross sessions at all.
+case_44() { # #135: the launch command carries a per-instance TMPDIR
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local newpane want
+
+  run_entrypoint
+  assert_rc_zero "$RC"
+
+  newpane="$(expected_new_pane)"
+  want="TMPDIR=$(expected_instance_tmpdir "$newpane") $CASE_DIR/bin/mcode"
+  if ! grep -qF "pane"$'\t'"run"$'\t'"$newpane"$'\t'"$want" "$FAKE_HERDR_LOG"; then
+    note "the launch command does not carry a TMPDIR of the pane's own"
+    sed 's/^/          /' "$FAKE_HERDR_LOG"
+    return
+  fi
+  # And the directory is CREATED, not merely named. mcode's os.tmpdir() is
+  # that path, and a path that does not exist is not a temp dir.
+  if [ ! -d "$MCODE_INSTANCE_TMPDIR_ROOT/minimax-code-instances/$newpane" ]; then
+    note "the per-instance TMPDIR was named but never created"
+  fi
+  # And it is THIS pane's, not a shared one: two panes must never share a
+  # temp directory, because that is the whole failure.
+  if [ "$newpane" = "$SRC_PANE" ]; then
+    note "the new pane and the source pane are the same, so the TMPDIR cannot be per-instance"
+  fi
+}
+
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42 case-43 case-44)
+
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -2478,6 +2543,8 @@ for name in "${SELECTED[@]}"; do
     case-40) run_case case-40 case_40 ;;
     case-41) run_case case-41 case_41 ;;
     case-43) run_case case-43 case_43 ;;
+    case-44) run_case case-44 case_44 ;;
+
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done
