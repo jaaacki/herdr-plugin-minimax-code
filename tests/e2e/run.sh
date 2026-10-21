@@ -109,8 +109,10 @@ fail() {
 # This suite's founding rule is that a skipped e2e is a false assurance - which is
 # why it refuses to skip when herdr is missing. The one exception is the resume
 # case, gated behind MCODE_E2E_RESUME=1 by architect decision (issue #85): it is
-# red roughly a third of the time for a reason that is upstream of this plugin,
-# and a permanently-red case trains everyone to ignore the whole suite.
+# red roughly a third of the time for a cause that is NOT yet established (issue
+# #99). The report is not lost in transit - herdr does not log
+# `pane.report_agent_session` on success - so the log cannot testify to it.
+# A permanently-red case trains everyone to ignore the whole suite.
 #
 # So it skips BY DEFAULT, and a skip that could be mistaken for a pass is exactly
 # what must not happen here. Three things make it unmissable: the word `skip`
@@ -181,7 +183,7 @@ cleanup() {
   # different reasons, and the first time it failed the diagnosis was guessed
   # from an action log and a snapshot that cleanup had already deleted, which is
   # how a real refusal got reported as a lost record. Whatever comes next is
-  # upstream of this plugin, and "report back with the herdr log around the
+  # not yet established (issue #99), and "report back with the herdr log around the
   # clear" is unanswerable unless the log survives the run that produced it.
   #
   # Kept OUTSIDE the isolated root on purpose: that root is deleted below, and an
@@ -1123,7 +1125,7 @@ run_case_resume_restored() {
   # server, so it is also the only one that leaves debris if it dies.
   if [ "${MCODE_E2E_RESUME:-0}" != "1" ]; then
     skip "$name" \
-      "gated behind MCODE_E2E_RESUME=1. Known-flaky for a cause upstream of this plugin (issue #99): herdr returns 0 for a resume report while its own session log records no report. Run: MCODE_E2E_RESUME=1 ./tests/e2e/run.sh"
+      "gated behind MCODE_E2E_RESUME=1. Known-flaky for a cause not yet established (issue #99): herdr returns 0 for a resume report, but the session snapshot never gains the agent_resume. The server log cannot confirm or deny this: herdr does not log pane.report_agent_session on success, only on rejection. Run: MCODE_E2E_RESUME=1 ./tests/e2e/run.sh"
     return
   fi
 

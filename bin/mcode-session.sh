@@ -550,18 +550,41 @@ issue_session_report() { # issue_session_report <pane> <session-id>; 0 only if h
   # ACCEPTED IS NOT STORED. The comment here used to say "0 means recorded, and
   # neither needs a second source to confirm it", and #99 falsifies that: the
   # report goes to the CORRECT session socket with the real herdr binary, herdr
-  # returns 0, and that session's own log records no `pane.report_agent*` at all
-  # while its snapshot has no `agent_resume`. About one run in three.
+  # returns 0, and the session's snapshot has no `agent_resume`. About one run
+  # in three.
+  #
+  # The reason this comment used to give for that was WRONG, and it has been
+  # measured wrong. It said "that session's own log records no
+  # `pane.report_agent*` at all", as if the missing log line were evidence of a
+  # lost request. It is not: herdr does not log `pane.report_agent_session` on
+  # SUCCESS at all - the method only appears in `api.request.*` when it is
+  # REJECTED, before dispatch. Measured on herdr 0.9.5, a hand-issued report
+  # against a live isolated session reached the server and was refused there,
+  # and the refusal is what the log recorded:
+  #
+  #   api request completed outcome="error" method="pane.report_agent_session"
+  #
+  # So the absence of a log line carries no information about whether the
+  # request arrived. The only thing that does is the SNAPSHOT: the report is
+  # either in it or it is not.
+  #
+  # What survives as a live hypothesis, and the only one the evidence leaves
+  # standing, is a CAPTURE-TIME rejection: herdr re-checks the argv when it
+  # captures the snapshot and drops the resume if `validate_resume_argv` rejects
+  # it - an absolute path, or an argv containing an apostrophe or a control
+  # character. That check runs at CAPTURE time, not report time, and it produces
+  # exactly the observed shape: accepted at report time, absent from the
+  # snapshot afterwards. It is NOT confirmed - the failure did not reproduce in
+  # thirteen consecutive gated runs on herdr 0.9.5 - so it is a hypothesis, and
+  # it is the one to test next.
   #
   # So a 0 here is herdr's word and nothing more, and the line below is worded to
   # keep "accepted" and "kept" apart rather than to assert the second. Persistence
   # is a capture-time question this call does not answer, which is also why the
   # e2e case that would answer it is gated behind MCODE_E2E_RESUME=1.
   #
-  # A SECOND, INDEPENDENT reason a 0 does not prove storage: herdr re-checks the
-  # argv when it captures the snapshot and drops the resume if `validate_resume_argv`
-  # rejects it — an absolute path, or an argv containing an apostrophe or a control
-  # character. That check runs at CAPTURE time, not report time. The default
+  # A SECOND, INDEPENDENT reason a 0 does not prove storage: the same
+  # capture-time `validate_resume_argv` check. The default
   # (`mcode --continue`) is well inside what validates.
   #
   # The status is PASSED THROUGH, not swallowed. Both callers do `if ! issue_

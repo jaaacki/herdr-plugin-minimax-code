@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the e2e suite and the session reporter blamed the wrong layer for a failure nobody had root-caused
+
+- **Three places asserted that the resume flake's cause is "upstream of this
+  plugin".** The evidence for that was *"herdr returns 0 for a resume report
+  while its own session log records no request"*, and that evidence carries no
+  information: **herdr does not log `pane.report_agent_session` on success at
+  all**. The method appears in `api.request.*` only when it is *rejected*,
+  before dispatch. Measured on herdr 0.9.5, a hand-issued report against a
+  live isolated session reached the server and was refused there, and the log
+  recorded the refusal:
+
+  ```
+  api request completed outcome="error" method="pane.report_agent_session"
+  ```
+
+  So an absent log line says nothing about whether the request arrived, and
+  the only thing that does is the **snapshot**: the report is either in it or
+  it is not. The three claims in `tests/e2e/run.sh` now say "a cause that is
+  NOT yet established (issue #99)", and the session reporter's own comment
+  stops asserting a lost request and names the surviving hypothesis instead:
+  a **capture-time** `validate_resume_argv` rejection, which produces exactly
+  the observed shape — accepted at report time, absent from the snapshot
+  afterwards. It is not confirmed: the failure did not reproduce in thirteen
+  consecutive gated runs on herdr 0.9.5.
+
+  The case stays gated. A cause nobody has established is not a cause that can
+  be un-gated.
+
 ## 0.6.2 — one report per session, and the suites stop writing the real home
 
 A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.
