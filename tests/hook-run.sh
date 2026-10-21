@@ -1366,6 +1366,49 @@ case_suite_env_isolates_the_durable_log() {
   fi
 }
 
+# The hook records the pane -> session binding it has just PROVEN.
+#
+# The ancestry walk is the only thing in this plugin that knows which session
+# belongs to which pane, and `bin/mcode-drive.sh` needs exactly that: it
+# resolves a drive by asking "which session is this pane's", and without a
+# recorded answer it can only infer from the workspace - which is ambiguous the
+# moment two sessions share a directory, and then the drive refuses rather than
+# guess, because `mcode exec` has no cwd guard and the wrong session would
+# simply accept the turn.
+#
+# The format is the drive's own, and deliberately plain TSV so a human can read
+# it and hand-edit it:
+#   <pane_id>\t<session_id>\t<workspace>\t<recorded_at_ms>
+case_records_the_pane_session_binding() {
+  local pid file
+  spawn_pane alpha
+  pid="$(pane_pid alpha)"
+  if [ "$pid" = "0" ]; then note "could not start the stand-in pane shell"; return; fi
+  write_fixture "$(jq -nc --arg sa "$WORK/alpha.sock" --argjson pid "$pid" \
+    '{sessions:[{name:"alpha",socket:$sa,running:true,panes:[{pane_id:"w1:p1",shell_pid:$pid,fg_pgid:0,fg_pids:[]}]}]}')"
+  reset_log
+  release_pane alpha
+
+  file="${MINIMAX_DATA_DIR:-$HOME/.minimax}/drive-bindings.tsv"
+  if [ ! -f "$file" ]; then
+    note "no binding file was written at $file"
+    return
+  fi
+  # The pane the ancestry proved, the session the payload carried, and the
+  # workspace the session ran in - all three, because the drive needs the
+  # workspace to tell two sessions apart when it has to infer.
+  if ! grep -q "^w1:p1"$'\t'"m4-alpha"$'\t' "$file"; then
+    note "the binding file does not carry the proven pair (pane w1:p1 -> session m4-alpha)"
+    sed 's/^/          /' "$file"
+    return
+  fi
+  # And the stamp, or the file cannot say which of two lines is newer.
+  if ! awk -F'\t' '$1=="w1:p1" && $2=="m4-alpha" && $4 ~ /^[0-9]+$/ {found=1} END {exit !found}' "$file"; then
+    note "the binding line carries no numeric recorded_at_ms stamp"
+    sed 's/^/          /' "$file"
+  fi
+}
+
 CASES=(
   manifest-declares-only-session-start:case_manifest_declares_only_session_start
   handler-is-our-command-script:case_handler_is_our_command_script
@@ -1379,6 +1422,7 @@ CASES=(
   unproven-pane-refuses-and-reports-nothing:case_unproven_pane_refuses_and_reports_nothing
   never-releases-a-registration:case_never_releases_a_registration
   reports-once-with-the-shared-source:case_reports_once_with_the_shared_source
+  records-the-pane-session-binding:case_records_the_pane_session_binding
   one-report-per-session-across-repeated-sessionstart:case_one_report_per_session_across_repeated_sessionstart
   two-sessions-in-one-pane-both-report:case_two_sessions_in_one_pane_both_report
   a-refused-registration-is-retried-not-suppressed:case_a_refused_registration_is_retried_not_suppressed

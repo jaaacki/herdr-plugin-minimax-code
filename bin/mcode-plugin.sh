@@ -376,13 +376,15 @@ acquire_watcher_claim() { # acquire_watcher_claim <dir> — 0 when this process 
 # server with nobody reading its stderr, so anything it printed there would be
 # lost - which is the same reason the watcher itself now writes to a file.
 #
-# Both names are passed for the reason documented at the old autostart call
-# site: MCODE_AGENT_LABEL is the knob the other two reporters read, and
-# MCODE_WATCH_AGENT is the watcher's own override. Passing only one of them is
-# a real defect, and only the SECOND pane reveals it - on pane one the chosen
-# name is the literal `mcode` and both spellings produce the same string.
-ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
-  local pane="$1" agent_name="$2" launch_line="${3:-}"
+# The second argument is the agent LABEL - the kind, which every mcode pane
+# shares - and never the name. See bin/mcode-watch.sh for the measurement
+# behind that: reporting a pane under a label other than the one it was
+# registered with replaces its occupant, and herdr clears the name with it, so a
+# watcher that reports the name deletes the name the plugin gave the pane.
+# MCODE_AGENT_LABEL is the knob the watcher and the other two reporters read,
+# so one variable drives all three.
+ensure_watcher() { # ensure_watcher <pane-id> <agent-label> [launch-log-line]
+  local pane="$1" agent_label="$2" launch_line="${3:-}"
   local dir watcher logdir log claim="" claim_root="" child="" i=0
 
   if ! valid_pane_id "$pane"; then
@@ -488,7 +490,7 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
     trim_log "$log"
     printf -- '--- %s watching pane %s as agent %s (source %s) ---\n' \
       "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf 'unknown-time')" \
-      "$pane" "${agent_name:-mcode}" "${MCODE_AGENT_SOURCE:-herdr:minimax-code}" \
+      "$pane" "${agent_label:-mcode}" "${MCODE_AGENT_SOURCE:-herdr:minimax-code}" \
       >>"$log" 2>/dev/null || true
   fi
 
@@ -503,7 +505,7 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
   #
   # `disown` detaches it from this shell's job table so the caller's own exit
   # does not signal it. Harmless if it fails: nohup already ignores SIGHUP.
-  MCODE_AGENT_LABEL="$agent_name" MCODE_WATCH_AGENT="$agent_name" \
+  MCODE_AGENT_LABEL="$agent_label" \
     nohup "$watcher" "$pane" >>"$log" 2>&1 &
   child=$!
   disown 2>/dev/null || true
@@ -573,8 +575,8 @@ ensure_watcher() { # ensure_watcher <pane-id> <agent-name> [launch-log-line]
 # every failure below is a warning and exit 0 - and the warning says what is
 # lost, because "state is not tracked" with no remedy is how this gets
 # misdiagnosed.
-watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
-  local pane="$1" agent_name="$2"
+watcher_autostart() { # watcher_autostart <pane-id> <agent-label>
+  local pane="$1" agent_label="$2"
 
   # Opt-out, checked BEFORE anything else so it costs nothing and starts nothing.
   # Compared as the exact string "0" rather than "any non-empty value", so
@@ -597,7 +599,7 @@ watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
 
   # The third argument is the only difference between the launch path and the
   # event path, and it is a message rather than behaviour. See ensure_watcher.
-  ensure_watcher "$pane" "$agent_name" \
+  ensure_watcher "$pane" "$agent_label" \
     "launch"
 }
 
@@ -628,8 +630,8 @@ watcher_autostart() { # watcher_autostart <pane-id> <agent-name>
 # execute where they were designed to; (3) the day herdr gains `--kind
 # minimax-code`, the launch path already reports identity and resume works with
 # no further change here.
-session_report() { # session_report <pane-id> <agent-name>
-  local pane="$1" agent_name="$2"
+session_report() { # session_report <pane-id> <agent-label>
+  local pane="$1" agent_label="$2"
   local dir sibling
 
   dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
@@ -647,9 +649,14 @@ session_report() { # session_report <pane-id> <agent-name>
   # report-agent-session only, and this function runs after step 7's report-agent,
   # so the "reporter must already hold the pane" law is satisfied by the launcher.
   #
-  # MCODE_AGENT_LABEL is the name step 8 actually chose. Without it the sibling
-  # would fall back to its own default and report under a label this pane does not
-  # have — the same second-pane mismatch the watcher had, one file over.
+  # MCODE_AGENT_LABEL is the LABEL - the agent's kind, which every mcode pane
+  # shares - and it must be the label step 7 registered the pane under. Without
+  # it the sibling would fall back to its own default; with the NAME instead,
+  # the sibling's `pane report-agent-session --agent <name>` would report the
+  # pane under a label it was not registered with, which replaces its occupant
+  # and costs it the name step 8 installed (see bin/mcode-watch.sh for the
+  # measurement). The sibling also uses this label for its own
+  # `pane report-agent`, so this one variable keeps the two in step.
   #
   # stderr is INHERITED, not captured. The sibling's read-back line — "herdr 0.9.3
   # did not persist it" — is the only thing telling the operator their session was
@@ -660,7 +667,7 @@ session_report() { # session_report <pane-id> <agent-name>
   # talks to the same multiplexer. Set per-invocation, never exported: this
   # process's own HERDR_PANE_ID is the SOURCE pane and must not leak into a
   # reporter that would then report the wrong pane.
-  if HERDR_PANE_ID="$pane" HERDR_BIN_PATH="$HERDR" MCODE_AGENT_LABEL="$agent_name" \
+  if HERDR_PANE_ID="$pane" HERDR_BIN_PATH="$HERDR" MCODE_AGENT_LABEL="$agent_label" \
        "$sibling" attach; then
     return 0
   fi
@@ -910,10 +917,16 @@ cmd_start() {
   #    one that is invisible, so a failure here is a warning and exit 0 — and the
   #    warning says exactly which commands are lost, because "it half worked"
   #    with no consequence spelled out is how this gets misdiagnosed later.
-  # The name this pane ACTUALLY gets, hoisted so the two reporters spawned below can
-  # be told it rather than each guessing. `next_agent_name` is a pure function of
-  # the agent list, so calling it twice could return the same free slot twice; one
-  # call, one variable, and every reporter downstream uses that same string.
+  # The name this pane ACTUALLY gets. It is the pane's unique HANDLE, the thing
+  # `herdr agent get <name>` resolves - and it is NOT the label the reporters
+  # below use. The label is the agent's kind (`mcode`, shared by every mcode
+  # pane) and it is what `pane report-agent --agent` carries; the name is
+  # installed by `agent rename` and is what herdr clears when a pane is reported
+  # under a DIFFERENT label. Handing the name to the reporters is how the name
+  # used to get destroyed on every state transition - see bin/mcode-watch.sh.
+  # `next_agent_name` is a pure function of the agent list, so calling it twice
+  # could return the same free slot twice; one call, one variable, and the
+  # rename below is its only consumer.
   local agent_name=""
   if "$HERDR" pane report-agent "$new_pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state unknown; then
     agent_name=$(next_agent_name)
@@ -940,7 +953,11 @@ cmd_start() {
   #    the sibling re-asserts the agent state as its first act, so running it
   #    after a failed step 7 is a second chance at the registration rather than a
   #    wasted call. Best-effort inside: it warns and returns 0.
-  session_report "$new_pane" "$agent_name"
+  #
+  #    The LABEL, not the name: the sibling reports `pane report-agent-session
+  #    --agent <label>`, and a label other than the one step 7 registered
+  #    replaces the pane's occupant and costs it the name.
+  session_report "$new_pane" "$MCODE_BIN_NAME"
 
   # 10. Start the state watcher (issue #75), detached.
   #
@@ -954,7 +971,11 @@ cmd_start() {
   #     neither depends on the other. It is last simply because state is the
   #     outermost concern of the three - the pane exists, then it is registered,
   #     then it has identity, then its state is live.
-  watcher_autostart "$new_pane" "$agent_name"
+  #
+  #     The LABEL, not the name - the watcher reports `--agent <label>`, and a
+  #     report under any other label replaces the pane's occupant and clears the
+  #     name the rename just installed.
+  watcher_autostart "$new_pane" "$MCODE_BIN_NAME"
 }
 
 # ---------------------------------------------------------------------------
@@ -1016,48 +1037,35 @@ is_our_agent_label() { # is_our_agent_label <label>
   esac
 }
 
-# The agent's NAME - what `herdr agent get <name>` resolves - read back from
-# herdr rather than guessed, when herdr has one to give.
+# The agent's LABEL - the kind every mcode pane shares - is what a report
+# carries. The agent's NAME - what `herdr agent get <name>` resolves - is a
+# separate thing herdr holds, installed by `herdr agent rename`.
 #
-# THIS IS NOT AVAILABLE FOR EVERY PANE, and the difference is worth stating
-# precisely, because a review of this function (m4, on #93) measured one pane,
-# found no `name`, and concluded the field does not exist. Measured here on
-# 0.9.3, in an isolated instance, register-then-rename:
+# WHY THE LABEL MUST NOT BE THE NAME, MEASURED ON herdr 0.9.5 (2026-10-21).
+# Reporting a pane under a label other than the one it was registered with
+# replaces its occupant, and herdr clears the name with it:
 #
-#   agent get <pane>  BEFORE any rename   -> no `name` key at all
-#   agent rename <pane> mcode-3           -> {"name":"mcode-3", ...}
-#   agent get <pane>  AFTER the rename    -> {"name":"mcode-3", ...}
-#   agent list                             -> `.name` for renamed agents, absent
-#                                            for panes that were never renamed
+#   pane report-agent <pane> --agent mcode     -> {"name":null,"agent":"mcode"}
+#   agent rename <pane> mcode-2                -> {"name":"mcode-2","agent":"mcode"}
+#   pane report-agent <pane> --agent mcode-2   -> {"name":null,"agent":"mcode-2"}
+#   pane report-agent <pane> --agent mcode     -> {"name":null,"agent":"mcode"}
 #
-# So both shapes are real, and which one a pane has is the whole question:
+# The third line is the whole bug. It reports the pane under the NAME it already
+# has, which is a different label from the one it was registered with, so the
+# occupant is replaced and the name it was carrying is destroyed with it. The
+# fourth line shows the label is not the thing that carries the name: reporting
+# the ORIGINAL label leaves the name alone.
 #
-#   * a pane the LAUNCHER started was renamed by `agent rename`, so it HAS a
-#     name, and this read is what keeps the watcher from being handed the bare
-#     label `mcode` for what is actually `mcode-3` — the second-pane divergence
-#     CLAUDE.md records, and the reason this read exists.
-#   * a pane some other source registered may never have been renamed, so there
-#     is no name to read, and the event's own label is the honest thing to
-#     report. That is not a degraded guess; the label is what `report-agent`
-#     takes, and herdr keeps the name it was given regardless: measured, a pane
-#     renamed to `mcode-3` still resolved by that name after two further
-#     `report-agent` calls carrying `--agent minimax-code`.
+# So the rule is the opposite of what this function used to assume: the label is
+# the kind and is deliberately the SAME for every mcode pane, and the name is
+# what makes one pane addressable among them. The watcher, the session
+# reporter and this event handler must all report the label; only
+# `herdr agent rename` writes the name.
 #
-# WHY `agent get <pane>` AND NOT A SCAN OF `agent list`. Both carry the name for
-# a renamed agent, so this is about addressing rather than availability: the event
-# names a PANE, and `agent get <pane>` answers for exactly that pane, whereas
-# reading a list means matching the right row out of every agent in the session
-# and being certain the match was the intended one. A per-pane key cannot be
-# confused with a neighbour's.
-resolve_agent_name() { # resolve_agent_name <pane-id> <fallback-label>
-  local pane="$1" fallback="$2" name=""
-  name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"
-  if [ -n "$name" ]; then
-    printf '%s\n' "$name"
-    return 0
-  fi
-  printf '%s\n' "$fallback"
-}
+# The event payload carries that label in `.data.agent` - measured on 0.9.5, a
+# `pane.agent_status_changed` payload for a pane whose label was `mcode` and
+# whose name was `mcode-2` carried `"agent":"mcode"`. It is read straight from
+# the payload below, with no read-back needed.
 
 cmd_ensure_watcher() {
   local event_json="${HERDR_PLUGIN_EVENT_JSON:-}"
@@ -1097,7 +1105,13 @@ cmd_ensure_watcher() {
 
   # No third argument: this runs detached inside the herdr server, so a line on
   # stderr has no reader. The watcher's own log is the place for this story.
-  ensure_watcher "$pane" "$(resolve_agent_name "$pane" "$agent")"
+  #
+  # The LABEL, straight from the event payload - never the pane's name. The
+  # event's `.data.agent` IS the label (measured on 0.9.5), and a report under
+  # any other label replaces the pane's occupant and clears the name - which is
+  # how the watcher used to delete the name the plugin had installed, once per
+  # state transition, for every pane whose name was not the bare `mcode`.
+  ensure_watcher "$pane" "$agent"
 }
 
 # The mcode-side plugin, installed into mcode's own plugin directory so that every
@@ -1286,10 +1300,113 @@ cmd_install_hook() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# cmd_register - register a pane that is ALREADY running mcode.
+#
+# WHY THIS EXISTS. The launch path registers the pane it creates. The hook
+# registers the pane of every mcode session that fires SessionStart. Neither
+# covers the case a user hits most often by hand: a mcode that is ALREADY
+# running in a pane, in a directory, with no session record yet.
+#
+# mcode's SessionStart hook fires when the session is CREATED, which is on the
+# first prompt - measured on 2026-10-21 against herdr 0.9.5: an mcode left
+# sitting at its start prompt produced no hook at all for minutes, and the hook
+# fired the moment the first prompt created the session. Until then the pane is
+# invisible to herdr: `herdr agent list` does not show it, and nothing tracks
+# its state.
+#
+# The README's answer to that was "register it by hand with `herdr pane
+# report-agent`" - a command the user has to assemble themselves, with a
+# `--source` value, an agent label, a unique name, a resume command and a
+# watcher, all of which have to be right and all of which have to be in one
+# order. This action is that command, done properly.
+#
+# THE ORDER IS NOT OPTIONAL. `pane report-agent-session` is only accepted from
+# a reporter that already holds the pane, so the registration has to come
+# first. And the NAME is installed by `agent rename` alone: the label is the
+# agent's kind and every mcode pane shares it, so a report never carries the
+# name (see bin/mcode-watch.sh for why reporting one clears the other).
+#
+# It registers the pane the action was fired from, and nothing else.
+cmd_register() {
+  local pane
+  local src_rc=0
+  pane=$(resolve_source_pane) || src_rc=$?
+  if [ "$src_rc" -ne 0 ]; then
+    if [ "$src_rc" -eq 1 ]; then
+      die "\`${HERDR} pane current\` exited non-zero and HERDR_PANE_ID is unset, so no pane could be registered."
+    fi
+    die "\`${HERDR} pane current\` succeeded but its response carried no \`.result.pane.pane_id\`, and HERDR_PANE_ID is unset. No pane was registered."
+  fi
+
+  if ! valid_pane_id "$pane"; then
+    die "\`register\` resolved the target pane to $(printf '%q' "$pane"), which is not a pane id. Nothing was registered."
+  fi
+
+  # ALREADY REGISTERED IS NOT A FAILURE, AND IT IS NOT A SECOND REGISTRATION.
+  #
+  # The hook may have got here first - that is the normal case once the hook
+  # is installed. Renaming again would take the name the user already knows
+  # this pane by and hand it a different one, which is a surprise with no
+  # upside: the pane is already visible and already named. So this says what
+  # is true and leaves the name alone.
+  #
+  # The read is best-effort: a failed read is not proof of anything either
+  # way, and refusing to register on a failed read would make a transient
+  # herdr hiccup look like a refusal to do the work.
+  local existing_name=""
+  existing_name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"
+  if [ -n "$existing_name" ]; then
+    log "minimax-code: pane ${pane} is already registered as '${existing_name}', so it was left alone - the name was not changed and no second registration was made."
+    # The watcher is still worth starting: the pane may be registered with no
+    # watcher behind it, which is what leaves its state frozen.
+    watcher_autostart "$pane" "$MCODE_BIN_NAME"
+    log "minimax-code: pane ${pane} is registered as '${existing_name}' and its state is tracked."
+    return 0
+  fi
+
+  # 1. The registration. This is what establishes the claim on the pane, and
+  #    what makes the session report below acceptable.
+  if ! "$HERDR" pane report-agent "$pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state unknown; then
+    die "\`${HERDR} pane report-agent ${pane}\` was refused, so the pane was not registered. Nothing else was attempted: without the claim on the pane the session report would be refused too, and the watcher would have nothing to watch."
+  fi
+
+  # 2. The name. It is the pane's unique handle, and it is what
+  #    `herdr agent get <name>` resolves. The label is not a name and must
+  #    not be used as one: every mcode pane shares the label.
+  local agent_name=""
+  agent_name=$(next_agent_name)
+  if [ -z "$agent_name" ]; then
+    log "minimax-code: pane ${pane} is registered but could not be named, because no free name could be found. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${pane} instead. The registration itself succeeded."
+  elif ! "$HERDR" agent rename "$pane" "$agent_name"; then
+    log "minimax-code: pane ${pane} is registered but could not be renamed, so it has no name. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${pane} instead. The registration itself succeeded."
+  fi
+
+  # 3. The session identity and the resume command. Only accepted from the
+  #    reporter that already holds the pane, which step 1 established.
+  session_report "$pane" "$MCODE_BIN_NAME"
+
+  # 4. The watcher. The registration in step 1 fires the event that starts
+  #    one, and this makes sure it is running even if that event has not
+  #    arrived - the two are idempotent, and a pane with two watchers is
+  #    what the spawn lock exists to prevent.
+  watcher_autostart "$pane" "$MCODE_BIN_NAME"
+
+  if [ -n "$agent_name" ]; then
+    log "minimax-code: pane ${pane} is registered as '${agent_name}' and its state is tracked. \`herdr agent get ${agent_name}\` will resolve it."
+  else
+    log "minimax-code: pane ${pane} is registered and its state is tracked. Address it by the pane id ${pane}."
+  fi
+  return 0
+}
+
 main() {
   case "${1:-}" in
     start)
       cmd_start
+      ;;
+    register)
+      cmd_register
       ;;
     ensure-watcher)
       cmd_ensure_watcher
@@ -1301,7 +1418,7 @@ main() {
       cmd_uninstall_hook
       ;;
     *)
-      log "usage: mcode-plugin.sh start | ensure-watcher | install-hook | uninstall-hook"
+      log "usage: mcode-plugin.sh start | register | ensure-watcher | install-hook | uninstall-hook"
       exit 2
       ;;
   esac

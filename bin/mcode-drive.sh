@@ -182,8 +182,26 @@ binding_file() {
   elif [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
     printf '%s/mcode-drive/bindings.tsv\n' "${HERDR_PLUGIN_STATE_DIR}"
   else
-    printf '%s\n' "${MCODE_HOME}/drive-bindings.tsv"
+    canonical_binding_file
   fi
+}
+
+# canonical_binding_file - the machine-global binding file, and the one the
+# mcode-side hook writes to.
+#
+# THE HOOK IS THE ONLY WRITER THAT KNOWS THE TRUTH. It proves which session
+# belongs to which pane by walking the process ancestry, and records that pair
+# here after it registers the pane. The drive asks the same question - "which
+# session is this pane's" - and without this file it can only infer from the
+# workspace, which is ambiguous the moment two sessions share a directory; the
+# drive then refuses rather than guess, because `mcode exec` has no cwd guard
+# and the wrong session would simply accept the turn.
+#
+# MINIMAX_DATA_DIR leads, because that is the variable the hook resolves its own
+# data directory from, and the two have to land on the same file. MCODE_HOME is
+# the fallback for the case where mcode's data directory has not been moved.
+canonical_binding_file() {
+  printf '%s\n' "${MINIMAX_DATA_DIR:-$MCODE_HOME}/drive-bindings.tsv"
 }
 
 # read_binding PANE — print the bound session id for PANE, or nothing.
@@ -195,27 +213,38 @@ binding_file() {
 # human can read it and hand-edit it when a workspace turns out ambiguous, which
 # is exactly when someone will need to.
 read_binding() {
-  local file pane="$1" p s _ws ms best="" best_ms=-1
-  file="$(binding_file)"
-  [ -f "$file" ] || return 0
-  # A workspace path cannot contain a tab, so splitting on tabs is unambiguous
-  # where splitting on spaces would not be. `|| true` because a final line with
-  # no trailing newline makes `read` return non-zero on a perfectly good record.
-  while IFS=$'\t' read -r p s _ws ms || [ -n "$p" ]; do
-    [ "$p" = "$pane" ] || continue
-    [ -n "$s" ] || continue
-    # A missing or non-numeric stamp must not break the comparison; treat it as
-    # oldest so a well-stamped line always wins over an unstampable one.
-    case "$ms" in
-      ''|*[!0-9]*) ms=0 ;;
-    esac
-    # `>=` not `>`, so that on equal stamps the LATER line wins — which is the
-    # one just appended, since the file is append-only.
-    if [ "$ms" -ge "$best_ms" ]; then
-      best_ms="$ms"
-      best="$s"
-    fi
-  done <"$file"
+  local pane="$1" file p s _ws ms best="" best_ms=-1
+  # BOTH FILES, and the newest line across them wins.
+  #
+  # The two are written by different sides: the drive writes the file it
+  # resolves, and the hook writes the canonical one. A drive run as a plugin
+  # action resolves to the plugin's state directory and would otherwise never
+  # see the hook's answer, and a drive run by hand resolves to the canonical
+  # file and would never see its own earlier writes. Reading both, with the
+  # newest stamp winning, makes the two agree whichever way the drive is
+  # invoked - and reading the same file twice is harmless, because `>=` means
+  # the later line wins on a tie and both reads see the same lines.
+  for file in "$(binding_file)" "$(canonical_binding_file)"; do
+    [ -f "$file" ] || continue
+    # A workspace path cannot contain a tab, so splitting on tabs is unambiguous
+    # where splitting on spaces would not be. `|| true` because a final line with
+    # no trailing newline makes `read` return non-zero on a perfectly good record.
+    while IFS=$'\t' read -r p s _ws ms || [ -n "$p" ]; do
+      [ "$p" = "$pane" ] || continue
+      [ -n "$s" ] || continue
+      # A missing or non-numeric stamp must not break the comparison; treat it as
+      # oldest so a well-stamped line always wins over an unstampable one.
+      case "$ms" in
+        ''|*[!0-9]*) ms=0 ;;
+      esac
+      # `>=` not `>`, so that on equal stamps the LATER line wins — which is
+      # the one just appended, since the file is append-only.
+      if [ "$ms" -ge "$best_ms" ]; then
+        best_ms="$ms"
+        best="$s"
+      fi
+    done <"$file"
+  done
   if [ -n "$best" ]; then
     printf '%s\n' "$best"
   fi

@@ -259,6 +259,12 @@ setup_case() {
   # without this suite depending on where `mcode` happens to be installed.
   export MCODE_BIN_PATH="$FAKE_MCODE"
   export MCODE_HOME="$CASE_DIR/mcode-home"
+  # The canonical binding file - the one the mcode-side hook writes - is
+  # resolved from MINIMAX_DATA_DIR, so it has to be isolated here too or the
+  # suite would read the developer's real bindings and a case could pass on
+  # someone else's pane. Same reason as MCODE_HOME above, same knob the hook
+  # uses.
+  export MINIMAX_DATA_DIR="$CASE_DIR/minimax-data"
   # The database is a per-case file. Naming it explicitly means the suite never
   # queries the real 76 MB runtime store even if the implementation's default
   # path logic changes under us.
@@ -685,6 +691,42 @@ run_case() { # run_case <name> <function>
   fi
 }
 
+# The CANONICAL binding file - the one the mcode-side hook writes - is read as
+# well as the drive's own.
+#
+# The hook is the only thing that can PROVE which session belongs to which
+# pane: it walks the process ancestry, and it refuses to report when it cannot
+# prove one. The drive can only infer from the workspace, and the inference is
+# ambiguous the moment two sessions share a directory - which is the normal
+# case in a working directory. So the hook records the pair, and the drive has
+# to find it there.
+#
+# This is the shape that makes the drive usable at all in a shared directory:
+# two candidates in the same workspace, one binding written by the hook, and
+# the drive picks the bound one instead of refusing to guess. Measured on a
+# real machine on 2026-10-21, where three sessions shared one directory and the
+# drive could not tell them apart until the binding was written by hand.
+case_canonical_binding_written_by_the_hook_is_read() {
+  setup_case
+  # Two candidates in one workspace: without a binding the drive refuses as
+  # ambiguous (case_ambiguous_pane_dies_and_sends_nothing).
+  write_rows "$STARTED_SID" "started" 1791059999999
+  write_rows "$OTHER_SID"   "started" 1791059999998
+  # The hook's file, in the directory the hook resolves its data from.
+  mkdir -p "$MINIMAX_DATA_DIR"
+  printf '%s\t%s\t%s\t%s\n' "$PANE" "$BOUND_SID" "$CASE_DIR/project" 1791160000000 \
+    >>"$MINIMAX_DATA_DIR/drive-bindings.tsv"
+
+  run_drive "$PANE" "hi"
+
+  assert_rc_zero "$RC"
+  assert_exec_argv "$BOUND_SID" "$(cd -- "$CASE_DIR/project" && pwd -P)" "hi"
+  # The OTHER candidate must not have been driven: the binding picked one, and
+  # a drive that sent the turn to the wrong session would be worse than a
+  # refusal.
+  assert_stderr_lacks "$OTHER_SID"
+}
+
 CASES=(
   name-arg-resolves-and-bound-session-is-driven:case_name_arg_resolves_and_bound_session_is_driven
   pane-id-arg-skips-name-resolution:case_pane_id_arg_skips_name_resolution
@@ -699,6 +741,7 @@ CASES=(
   session-override-skips-resolution:case_session_override_skips_resolution
   rebinding-uses-the-newest-line-not-the-first:case_rebinding_uses_the_newest_line_not_the_first
   equal-stamps-take-the-later-line-and-junk-never-wins:case_equal_stamps_take_the_later_line_and_junk_never_wins
+  canonical-binding-written-by-the-hook-is-read:case_canonical_binding_written_by_the_hook_is_read
 )
 
 if [ ! -x "$FAKE_HERDR" ]; then

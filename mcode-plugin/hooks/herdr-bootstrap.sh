@@ -149,6 +149,45 @@ dlog() {
   return 0
 }
 
+# ---- the pane -> session binding ---------------------------------------------
+# record_binding PANE SID WORKSPACE — append the pair this hook has just
+# PROVEN, for bin/mcode-drive.sh to read.
+#
+# WHY THE HOOK IS THE ONLY WRITER THAT CAN. The ancestry walk is the one thing
+# in this plugin that knows which session belongs to which pane: it matches a
+# live mcode process to a live pane and refuses to report when it cannot.
+# `bin/mcode-drive.sh` asks exactly that question - "which session is this
+# pane's" - and without a recorded answer it can only infer from the
+# workspace, which is ambiguous the moment two sessions share a directory. The
+# drive then refuses rather than guess, because `mcode exec` has no cwd guard
+# and the wrong session would simply accept the turn.
+#
+# The format is the drive's own, and deliberately plain TSV so a human can read
+# it and hand-edit it:
+#   <pane_id>\t<session_id>\t<workspace>\t<recorded_at_ms>
+# Append-only, and the newest line for a pane wins, so a stale line can never
+# shadow a fresh one.
+#
+# NEVER FAILS THE HOOK, for the same reason the log never does: the
+# registration this accompanies has already happened, and a binding that could
+# not be written costs a drive an inference, not the user their agent.
+record_binding() { # record_binding <pane-id> <session-id> <workspace>
+  local pane="$1" sid="$2" ws="$3" dir file now_ms
+  dir="${MINIMAX_DATA_DIR:-$HOME/.minimax}"
+  file="$dir/drive-bindings.tsv"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  # Seconds x 1000 in shell arithmetic, rather than `date +%s%3N` which is
+  # GNU-only, and this has to work on the macOS runner too.
+  now_ms=$(date +%s 2>/dev/null || printf '0')
+  now_ms=$(( now_ms * 1000 ))
+  if ! printf '%s\t%s\t%s\t%s\n' "$pane" "$sid" "$ws" "$now_ms" >>"$file" 2>/dev/null; then
+    log "could not write the binding file $file, so pane $pane -> session $sid was NOT recorded; a drive for this pane will have to infer, and may refuse as ambiguous."
+    return 0
+  fi
+  log "recorded binding $file: $pane -> $sid"
+  return 0
+}
+
 # Chained onto the existing cleanup trap, not replacing it: the probe directory must
 # still be removed on the way out, and the exit code is the single most useful line
 # in the file when a run registers nothing.
@@ -709,6 +748,27 @@ main() {
     --agent "$AGENT_LABEL" \
     --state idle; then
     log "registered pane $pane_id (source=$AGENT_SOURCE agent=$AGENT_LABEL state=idle); the watcher owns state from here."
+    # Record the binding this hook just PROVED. The ancestry walk is the only
+    # thing in this plugin that knows which session belongs to which pane, and
+    # `bin/mcode-drive.sh` needs exactly that: it resolves a drive by asking
+    # "which session is this pane's", and without a binding it can only infer
+    # from the workspace - which is ambiguous the moment two sessions share a
+    # directory, and then the drive refuses rather than guess.
+    #
+    # The format is the drive's own, and deliberately plain TSV so a human can
+    # read it and hand-edit it:
+    #   <pane_id>\t<session_id>\t<workspace>\t<recorded_at_ms>
+    # The file is append-only and the newest line for a pane wins, so a stale
+    # line can never shadow a fresh one.
+    #
+    # BEST EFFORT, like everything else in this file. The registration has
+    # already succeeded and the drive can still infer; a binding that could not
+    # be written must not turn a successful registration into a failure.
+    if [ -n "${hook_sid:-}" ]; then
+      record_binding "$pane_id" "$hook_sid" "${hook_cwd:-}"
+    else
+      log "no session id in the payload, so no pane -> session binding was recorded for $pane_id."
+    fi
   else
     # Not fatal: herdr refused, and no registration is better than a wrong one.
     log "herdr REFUSED the registration for pane $pane_id; nothing was registered."

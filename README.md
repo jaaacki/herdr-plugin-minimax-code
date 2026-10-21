@@ -203,8 +203,26 @@ works; check.
 **Already-running sessions do not register.** `mcode` resolves plugin hooks per
 session and `SessionStart` is **one-shot** — it is not replayed. A `mcode` that was
 already running when you ran `install-hook` will not run the hook. Restart it, or
-register it by hand with `herdr pane report-agent`. This is mcode's behaviour, not a
-setting you can change.
+use the **Register this pane's MiniMax Code session with herdr** action, which
+registers the pane you are in, names it, records its resume command and starts its
+state watcher. This is mcode's behaviour, not a setting you can change.
+
+**A `mcode` that has not sent its first prompt yet does not register either.** The
+hook fires when the session is *created*, and the session is created by the first
+prompt — not when the TUI opens. So a `mcode` you started by hand and have not
+typed into yet is invisible to herdr: it is in no agent list, and nothing tracks
+its state. The same **Register** action covers this case, and it is the way to make
+a hand-started `mcode` visible before you use it.
+
+From the command line, that action is:
+
+```console
+$ herdr plugin action invoke jaaacki.minimax-code.minimax-code-register
+```
+
+It registers the pane you invoke it from, so run it in the pane where your
+`mcode` is running. It is idempotent — a pane that is already registered keeps
+the name it has.
 
 **If a session registers nothing, there is now a log.** mcode keeps the hook's stderr
 in its own diagnostics, which an interactive TUI does not surface — so before this
@@ -428,6 +446,13 @@ to be discovered. This script looks in two places:
    when Herdr sets `HERDR_PLUGIN_STATE_DIR`. Override the path with
    `MCODE_DRIVE_BINDING` if you want it somewhere else.
 
+   **The session hook writes here too.** It is the only thing in the plugin that
+   can *prove* which session belongs to which pane — it walks the process
+   ancestry — so when it registers a pane it records the pairing it proved, in
+   the same format. That is why a `mcode` started by hand and given its first
+   prompt is drivable without any manual work, and why the ambiguity below does
+   not apply to it.
+
    It is plain tab-separated text, one line per drive, and it is yours to edit:
 
    ```
@@ -446,12 +471,16 @@ to be discovered. This script looks in two places:
 
 When one workspace holds several live sessions — the normal case if you have more
 than one pane on a checkout — **this script stops and lists the candidates rather
-than picking one.** Nothing available to it can say which session belongs to which
-pane, and a wrong pick would deliver your prompt to someone else's session, which
-the exact-cwd check would not catch. Note it does not narrow by session `status`
-either: that tracks whether a session is *busy*, not whether a pane exists, so a
-pane sitting at its prompt is `idle` and narrowing on `started` can discard the
-very session you meant.
+than picking one.** A wrong pick would deliver your prompt to someone else's
+session, which the exact-cwd check would not catch. Note it does not narrow by
+session `status` either: that tracks whether a session is *busy*, not whether a
+pane exists, so a pane sitting at its prompt is `idle` and narrowing on `started`
+can discard the very session you meant.
+
+The exception is a pane whose binding the session hook recorded — which is every
+session it registered, because the hook proves the pairing by ancestry rather
+than inferring it. A pane that predates the hook, or one the hook could not
+prove, still lands here.
 
 Name the one you want:
 
@@ -511,8 +540,15 @@ Encountered in normal use, gathered here so you meet them before you go looking:
 | Trigger | Menu title | Kind | Does |
 |---|---|---|---|
 | `minimax-code-start` | Start MiniMax Code in this worktree | action | Launch `mcode` in a new pane for the active worktree |
+| `minimax-code-register` | Register this pane's MiniMax Code session with herdr | action | Make a hand-started `mcode` visible to herdr, named, and tracked |
+| `minimax-code-install-hook` | Install the MiniMax Code session hook | action | Register every `mcode` session's pane with herdr, including hand-started ones |
+| `minimax-code-uninstall-hook` | Uninstall the MiniMax Code session hook | action | Stop `mcode` sessions from self-registering; removes the shared plugin directory |
+| `pane.agent_status_changed` | — | event | Make sure the pane that changed has a state watcher |
 
-One action, offered in the `workspace` and `pane` contexts. No event hooks.
+The actions are offered in the `workspace` and `pane` contexts; the two hook
+actions are also offered in `global`. The event hook is the plugin's only
+subscriber to herdr's events — it exists so that a `mcode` this plugin never
+launched still gets a watcher.
 
 ## Development notes
 

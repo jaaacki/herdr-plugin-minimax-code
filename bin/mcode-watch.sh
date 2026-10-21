@@ -36,19 +36,34 @@
 set -euo pipefail
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
-# The agent label this watcher reports under. It MUST be the name the launcher
-# actually gave the pane, not a guess: the launcher picks the first free name in
-# its `mcode`, `mcode-2`, `mcode-3` sequence, so the first pane is `mcode` and
-# every pane after it is not.
+# The agent LABEL this watcher reports under.
 #
-# This was hard-coded to `mcode`, which was invisible while the watcher was
-# opt-in (an operator running it by hand was usually looking at pane one) and
-# wrong from the moment the launcher started spawning watchers itself (issue #75)
-# — pane two would have been reported under a name it does not have. MCODE_WATCH_AGENT
-# is how the launcher passes the real name; MCODE_AGENT_LABEL is the same knob the
-# other two reporters use, kept as the middle fallback so one variable can drive
-# all three; and `mcode` remains the default so a hand-run still works.
-AGENT_LABEL="${MCODE_WATCH_AGENT:-${MCODE_AGENT_LABEL:-mcode}}"
+# THE LABEL IS THE AGENT'S KIND, NOT ITS UNIQUE HANDLE. Every mcode pane shares
+# the label `mcode`, exactly as every claude pane shares `claude` and every
+# codex pane shares `codex`. The unique handle is the NAME herdr holds
+# separately, installed by `herdr agent rename` - that is what
+# `herdr agent get mcode-2` resolves.
+#
+# WHY THIS MATTERS: REPORTING UNDER A DIFFERENT LABEL DESTROYS THE NAME.
+# Measured on herdr 0.9.5 (2026-10-21): register a pane with `--agent mcode`,
+# rename it to `mcode-2`, then report it with `--agent mcode-2` and
+# `herdr agent get mcode-2` answers `agent_not_found` - herdr treated the pane's
+# occupant as replaced and cleared the name with it. Report the same pane again
+# with `--agent mcode` and the name survives.
+#
+# So a watcher that reports the NAME as the label destroys the name on every
+# state transition, and the agent stops being addressable by the name the plugin
+# gave it. That is what issue #75 introduced: it passed the launcher's chosen
+# name in as MCODE_WATCH_AGENT so the watcher would report "the name the pane
+# actually has". The symptom was invisible on pane one - whose name and label are
+# both `mcode` - and permanent from pane two onwards, which is every pane whose
+# name is `mcode-2` or later.
+#
+# MCODE_WATCH_AGENT is therefore gone: it carried the name, and a report does
+# not carry a name. MCODE_AGENT_LABEL is the same knob the other two reporters
+# read, so one variable drives all three, and `mcode` remains the default so a
+# hand-run still works.
+AGENT_LABEL="${MCODE_AGENT_LABEL:-mcode}"
 # --source namespace. Must match the other two reporters - bin/mcode-plugin.sh
 # and bin/mcode-session.sh - and follows herdr's own `herdr:<agent>` convention,
 # which is what the Claude integration hook uses. herdr uses this to tell

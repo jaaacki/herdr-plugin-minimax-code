@@ -184,6 +184,25 @@ fixture, and the bypass is announced on stderr. No knob is ever silently overrid
   they ever disagree again, so this cannot silently regress. A "did my release actually
   happen" check is `herdr agent list | grep -c <pane-id>`, because the call itself will not
   tell you.
+- **`--agent` carries the LABEL, not the name — and reporting under the wrong one DESTROYS
+  the name.** Herdr's agent model has two separate fields. The **label** (`--agent`) is the
+  agent's *kind*: every `mcode` pane shares `mcode`, exactly as every `claude` pane shares
+  `claude`. The **name** (`herdr agent rename`) is unique among live agents, and it is what
+  `herdr agent get <name>` resolves. Reporting a pane under a label other than the one it
+  was registered with replaces its occupant, and herdr clears the name with it. Measured on
+  0.9.5 (2026-10-21), on a pane renamed to `mcode-2`:
+
+  ```
+  pane report-agent <pane> --agent mcode    → {"name":null,"agent":"mcode"}
+  agent rename <pane> mcode-2               → {"name":"mcode-2","agent":"mcode"}
+  pane report-agent <pane> --agent mcode-2  → {"name":null,"agent":"mcode-2"}
+  ```
+
+  So a reporter handed the NAME deletes the name, once per state transition, and the agent
+  stops being addressable by the name the plugin gave it. All three reporters report the
+  label; only `herdr agent rename` writes the name. #75 introduced the opposite — the name
+  was passed in as the label — and the symptom was invisible on pane one, whose name and
+  label are both `mcode`, and permanent from pane two onwards.
 - **`bin/mcode-watch.sh` deliberately does not call `release-agent` at all.** It used to, on
   every exit path, and that was wrong: the call DELETES the registration rather than handing
   authority back, so panes vanished from `herdr agent list` as the watcher exited. There is no

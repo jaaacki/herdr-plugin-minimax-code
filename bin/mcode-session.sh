@@ -144,11 +144,19 @@
 # ---- THE LABEL DEFAULT, AND WHY IT USED TO BE WRONG --------------------------
 # This used to default to `minimax-code` while bin/mcode-plugin.sh and
 # bin/mcode-watch.sh both defaulted to `mcode`. Three reporters, two different
-# labels for one agent. It is invisible on a single pane — and wrong from the
-# second pane onwards, because the launch path hands the first pane a real name
-# from its `mcode`, `mcode-2`, `mcode-3` sequence and the watcher then reports
-# under a name the pane does not have. All three now default to `mcode`, and the
-# launcher passes the ACTUAL name it chose (issue #75).
+# labels for one agent. All three now default to `mcode`, and the launcher
+# passes that same label down.
+#
+# THE LABEL IS THE AGENT'S KIND, NOT ITS UNIQUE HANDLE. Every mcode pane shares
+# the label `mcode`, exactly as every claude pane shares `claude`; the unique
+# handle is the NAME herdr holds separately, installed by `herdr agent rename`.
+# So this verb reports the label, and the launcher passes the label - it used to
+# pass the NAME it had just chosen (issue #75), and that was a defect, because
+# reporting a pane under a label other than the one it was registered with
+# replaces its occupant and herdr clears the name with it. Measured on herdr
+# 0.9.5 (2026-10-21): rename a pane to `mcode-2`, then report it with
+# `--agent mcode-2`, and `herdr agent get mcode-2` answers `agent_not_found`.
+# The name is installed by the rename and only the rename may write it.
 #
 # `--source` is a separate axis and is NOT unified this way: it is the namespace
 # herdr uses to tell reporters apart, so it stays fixed and identical across all

@@ -25,6 +25,26 @@ description = "Launch `mcode` in a new pane for the active worktree"
 contexts = ["workspace", "pane"]
 command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" start"]
 
+# Register a pane that is ALREADY running mcode.
+#
+# The launch action covers a mcode this plugin starts, and the hook covers
+# every session that fires SessionStart. Neither covers a mcode that a person
+# started by hand and that has not yet sent a first prompt: mcode creates the
+# session - and fires the hook - on the first prompt, so until then the pane
+# is invisible to herdr.
+#
+# The README used to answer that with "register it by hand with `herdr pane
+# report-agent`", which leaves the user to assemble a --source value, an agent
+# label, a unique name, a resume command and a watcher, in the one order herdr
+# accepts. This action is that command, done properly, and it is idempotent:
+# a pane that is already registered is left alone rather than renamed.
+[[actions]]
+id = "minimax-code-register"
+title = "Register this pane's MiniMax Code session with herdr"
+description = "Make a hand-started mcode visible to herdr, named, and tracked"
+contexts = ["workspace", "pane"]
+command = ["/bin/sh", "-c", "\"$HERDR_PLUGIN_ROOT/bin/mcode-plugin.sh\" register"]
+
 # Install the mcode-side SessionStart hook (issue #118).
 #
 # This is the only way a mcode that a person started BY HAND ever becomes visible

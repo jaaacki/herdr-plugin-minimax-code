@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the agent's name was being destroyed
+
+- **The watchers, the session reporter and the event path reported the agent's
+  NAME where herdr expects its LABEL.** Herdr's agent model has two separate fields.
+  The **label** (`--agent`) is the agent's kind — every `mcode` pane shares `mcode`,
+  exactly as every `claude` pane shares `claude`. The **name**
+  (`herdr agent rename`) is unique among live agents, and it is what
+  `herdr agent get <name>` resolves. Reporting a pane under a label other than the
+  one it was registered with replaces its occupant, and herdr clears the name with
+  it. Measured on 0.9.5 (2026-10-21), on a pane renamed to `mcode-2`:
+
+  ```
+  pane report-agent <pane> --agent mcode    → {"name":null,"agent":"mcode"}
+  agent rename <pane> mcode-2               → {"name":"mcode-2","agent":"mcode"}
+  pane report-agent <pane> --agent mcode-2  → {"name":null,"agent":"mcode-2"}
+  ```
+
+  #75 introduced the belief that a report carries the pane's handle, and the three
+  reporters have been handed the name ever since. The symptom was invisible on pane
+  one — whose name and label are both `mcode` — and permanent from pane two
+  onwards, which is every pane whose name is `mcode-2` or later. The event path
+  made it self-perpetuating: the watcher reported the name as the label, which
+  cleared the name, and the next event re-spawned the watcher from the payload.
+  Observed live: a registered and renamed pane read `{"name":null,"agent":"mcode-2"}`
+  one state change after the rename, and `herdr agent get mcode-2` answered
+  `agent_not_found`. All three reporters now report the label; only
+  `herdr agent rename` writes the name. `MCODE_WATCH_AGENT` is gone — it carried
+  the name, and a report does not carry a name.
+
+### Added
+
+- **A `Register this pane's MiniMax Code session with herdr` action.** The launch
+  action covers a `mcode` this plugin starts, and the `SessionStart` hook covers
+  every session that fires it — but the hook fires when the session is *created*,
+  and the session is created by the first prompt, not when the TUI opens. A
+  hand-started `mcode` that has not been typed into yet is therefore invisible to
+  herdr: it is in no agent list and nothing tracks its state. The new action
+  registers the pane you are in, names it, records its resume command and starts
+  its state watcher, in the one order herdr accepts. It is idempotent: a pane that
+  is already registered is left alone rather than renamed.
+- **The session hook records the pane→session pairing it proved.** The hook's
+  ancestry walk is the only thing in this plugin that can prove which session
+  belongs to which pane, and `bin/mcode-drive.sh` needs exactly that: it resolves
+  a drive by asking "which session is this pane's", and without a recorded answer
+  it can only infer from the workspace — ambiguous the moment two sessions share a
+  directory, which is the normal case on a checkout. The drive then refuses
+  rather than guess, because `mcode exec` has no cwd guard and the wrong session
+  would simply accept the turn. The pair is now recorded in the drive's own
+  format, and the drive reads it from there as well as from its own file.
+
 ## 0.6.2 — one report per session, and the suites stop writing the real home
 
 A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.
