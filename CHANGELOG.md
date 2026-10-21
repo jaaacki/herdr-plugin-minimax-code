@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Two upstream proposals, written here for review before they are sent
+  anywhere.** `docs/upstream/` now holds the ask for **herdrdev/herdr** on
+  MiniMax Code, in two files: one for the general proposal and one for the
+  short, concrete one. Nothing is posted to another project from this
+  repository — the external send is the owner's decision, and these files are
+  the reviewable record of what would be sent and what it is based on.
+  - `minimax-code-acp-support.md` (#37): **mcode already speaks ACP**, and
+    richly — `session/activate` is the "active agent" herdr's `--kind` enum
+    cannot mint, `session/prompt` answers with an exact `stopReason:
+    "end_turn"`, and `session/list` is the session manifest over a protocol.
+    The file carries the verbatim `initialize` response, the measured method
+    table, the on-disk session manifest, and the state of the ACP discussion
+    upstream (herdrdev/herdr#4567 was closed without implementation).
+  - `minimax-code-agent-kind.md` (#73): the concrete version of the same
+    problem — add `minimax-code` to `herdr agent start --kind`, with the
+    measured surface and the control runs against `opencode` and `grok` that
+    rule out a machine-level misconfiguration.
+
 ## 0.6.2 — one report per session, and the suites stop writing the real home
 
 A patch release. No new capability. One behaviour change, plus the isolation fixes that landed on dev since 0.6.1.
